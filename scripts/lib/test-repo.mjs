@@ -22,20 +22,31 @@ export const siblingAbsentMessage = (dir) =>
 export const spawnFailedMessage = (file) => `${file} could not be started.`;
 
 const DROPPED = /^(GIT_AUTHOR_|GIT_COMMITTER_|GIT_CONFIG_KEY_|GIT_CONFIG_VALUE_)/;
+const SCRUBBED = [
+  'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
+  'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_EDITOR',
+];
+
+function scrub(env) {
+  for (const name of Object.keys(env)) {
+    if (DROPPED.test(name)) delete env[name];
+  }
+  for (const name of SCRUBBED) delete env[name];
+  return env;
+}
 
 // The environment every test command runs in: no session markers, no identity,
 // no injected git configuration, and no prompt. Tests that spawn an installed
 // command directly, not through repo.git, pass this as its env.
 export function testEnv() {
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
-  for (const name of Object.keys(env)) {
-    if (DROPPED.test(name)) delete env[name];
-  }
-  for (const name of [
-    'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
-    'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_EDITOR',
-  ]) delete env[name];
-  return env;
+  return scrub({ ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+}
+
+// Installed modules take the caller's git environment (a hook's GIT_DIR and
+// GIT_INDEX_FILE), so a test that calls them in-process clears this process's
+// copy first. Call it once at the top of such a test file.
+export function isolateProcessEnv() {
+  scrub(process.env);
 }
 
 function run(file, argv, cwd) {

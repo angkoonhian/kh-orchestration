@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, symlinkSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { makeRepo } from './test-repo.mjs';
+import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import {
-  StateError, appendJournal, corruptMessage, isOff, readState, stateDir, unknownNameMessage, writeFailedMessage, writeState,
+  StateError, appendJournal, corruptMessage, invalidValueMessage, isOff, readState, stateDir, unknownNameMessage, writeFailedMessage, writeState,
 } from '../../assets/scripts/ko-state.mjs';
+
+// The modules take the caller's git environment; a test must not inherit a hook's.
+isolateProcessEnv();
 
 function withRepo(body) {
   const repo = makeRepo();
@@ -121,5 +124,41 @@ test('appendJournal appends one JSON line per entry and keeps earlier lines', ()
     assert.equal(lines[2], '');
     assert.deepEqual(JSON.parse(lines[0]), { event: 'first', note: 'two\nlines' });
     assert.deepEqual(JSON.parse(lines[1]), { event: 'second' });
+  });
+});
+
+test('readState throws for a dangling symlink and for a symlink to a valid file, never the fallback', () => {
+  withRepo((repo) => {
+    const dir = stateDir(repo.root);
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(dir, 'missing-target'), join(dir, 'approvals.json'));
+    assert.throws(() => readState(repo.root, 'approvals.json', { digests: [] }), { name: 'StateError', message: corruptMessage('approvals.json') });
+    writeFileSync(join(dir, 'real.json'), '{}');
+    symlinkSync(join(dir, 'real.json'), join(dir, 'waivers.json'));
+    assert.throws(() => readState(repo.root, 'waivers.json', []), { name: 'StateError', message: corruptMessage('waivers.json') });
+  });
+});
+
+test('writeState rejects a value that does not serialise to JSON that parses back, and writes nothing', () => {
+  withRepo((repo) => {
+    const circular = {};
+    circular.self = circular;
+    writeState(repo.root, 'waivers.json', { old: true });
+    for (const value of [undefined, () => 1, 10n, circular, Symbol('s')]) {
+      assert.throws(() => writeState(repo.root, 'waivers.json', value), { name: 'StateError', message: invalidValueMessage('waivers.json') });
+    }
+    assert.deepEqual(readState(repo.root, 'waivers.json', null), { old: true });
+    assert.deepEqual(readdirSync(stateDir(repo.root)), ['waivers.json']);
+    assert.throws(() => writeState(repo.root, 'approvals.json', undefined), { name: 'StateError' });
+    assert.equal(existsSync(join(stateDir(repo.root), 'approvals.json')), false);
+  });
+});
+
+test('appendJournal rejects an entry that does not serialise, and appends nothing', () => {
+  withRepo((repo) => {
+    appendJournal(repo.root, { event: 'first' });
+    assert.throws(() => appendJournal(repo.root, undefined), { name: 'StateError', message: invalidValueMessage('journal.jsonl') });
+    assert.throws(() => appendJournal(repo.root, { n: 1n }), { name: 'StateError', message: invalidValueMessage('journal.jsonl') });
+    assert.equal(readFileSync(join(stateDir(repo.root), 'journal.jsonl'), 'utf8'), '{"event":"first"}\n');
   });
 });

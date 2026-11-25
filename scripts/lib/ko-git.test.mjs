@@ -1,13 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeRepo } from './test-repo.mjs';
+import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import {
-  SPAWN_FAILED, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
+  OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
   listTree, readBlob, repoRoot, tidy,
 } from '../../assets/scripts/ko-git.mjs';
+
+// The modules take the caller's git environment; a test must not inherit a hook's.
+isolateProcessEnv();
 
 function withRepo(options, body) {
   const repo = makeRepo(options);
@@ -232,7 +235,7 @@ test('tidy ignores what is staged and committed', () => {
   });
 });
 
-test('readBlob returns the exact bytes of a file in a tree, and null for an absent path or a directory', () => {
+test('readBlob returns the exact bytes of a file in a tree, null for an absent path, and throws for a directory', () => {
   withRepo({}, (repo) => {
     const bytes = Buffer.from([0x00, 0xff, 0x0d, 0x0a, 0x41]);
     writeFileSync(join(repo.root, 'bin.dat'), bytes);
@@ -242,7 +245,7 @@ test('readBlob returns the exact bytes of a file in a tree, and null for an abse
     assert.deepEqual(readBlob(repo.root, tree, 'bin.dat'), bytes);
     assert.equal(readBlob(repo.root, tree, 'd/empty.txt').length, 0);
     assert.equal(readBlob(repo.root, tree, 'missing.txt'), null);
-    assert.equal(readBlob(repo.root, tree, 'd'), null);
+    assert.throws(() => readBlob(repo.root, tree, 'd'), { message: notBlobMessage('d') });
   });
 });
 
@@ -261,5 +264,80 @@ test('listTree lists the files under a prefix, all files for an empty prefix, an
     assert.deepEqual(listTree(repo.root, tree, ''), ['a.txt', 'docs/deep/y.md', 'docs/x.md', 'other/z.md']);
     assert.deepEqual(listTree(repo.root, tree, 'nothing/'), []);
     assert.throws(() => listTree(repo.root, 'not-a-tree', ''), { message: gitFailedMessage('list the tree') });
+  });
+});
+
+test('readBlob throws, never null, when the blob object is missing', () => {
+  withRepo({ files: { 'a.txt': 'unique content for a\n' } }, (repo) => {
+    const tree = headTree(repo.root);
+    const sha = repo.git('rev-parse', 'HEAD:a.txt').stdout.trim();
+    rmSync(join(repo.root, '.git', 'objects', sha.slice(0, 2), sha.slice(2)));
+    assert.deepEqual(listTree(repo.root, tree, ''), ['a.txt']);
+    assert.throws(() => readBlob(repo.root, tree, 'a.txt'), { message: gitFailedMessage('read the file') });
+  });
+});
+
+test('readBlob throws for a tree object that git cannot read', () => {
+  withRepo({}, (repo) => {
+    assert.throws(() => readBlob(repo.root, 'not-a-tree', 'a.txt'), { message: gitFailedMessage('read the file') });
+  });
+});
+
+test('readBlob throws naming the path for a gitlink', () => {
+  withRepo({}, (repo) => {
+    const sha = head(repo);
+    repo.git('update-index', '--add', '--cacheinfo', `160000,${sha},sub`);
+    const tree = indexTree(repo.root);
+    assert.throws(() => readBlob(repo.root, tree, 'sub'), { message: notBlobMessage('sub') });
+  });
+});
+
+test('baseOf throws when the base branch ref exists but does not resolve', () => {
+  withRepo({}, (repo) => {
+    repo.git('checkout', '-q', '-b', 'feature');
+    repo.git('pack-refs', '--all');
+    const packed = join(repo.root, '.git', 'packed-refs');
+    writeFileSync(packed, readFileSync(packed, 'utf8').replace(/^[0-9a-f]{40} refs\/heads\/main$/m, `${'1'.repeat(40)} refs/heads/main`));
+    assert.throws(() => baseOf(repo.root, 'main'), { message: gitFailedMessage('read a branch') });
+  });
+});
+
+test('a damaged HEAD is not an unborn one', () => {
+  withRepo({}, (repo) => {
+    writeFileSync(join(repo.root, '.git', 'HEAD'), 'garbage\n');
+    assert.throws(() => headTree(repo.root), { message: gitFailedMessage('read HEAD') });
+    assert.throws(() => baseOf(repo.root, 'main'), { message: gitFailedMessage('read HEAD') });
+  });
+});
+
+test('a HEAD naming a branch whose object is missing is not an unborn one', () => {
+  withRepo({}, (repo) => {
+    repo.git('pack-refs', '--all');
+    const packed = join(repo.root, '.git', 'packed-refs');
+    writeFileSync(packed, readFileSync(packed, 'utf8').replace(/^[0-9a-f]{40} refs\/heads\/main$/m, `${'1'.repeat(40)} refs/heads/main`));
+    assert.throws(() => headTree(repo.root), { message: gitFailedMessage('read a branch') });
+  });
+});
+
+test('paths that end in whitespace are returned exactly', () => {
+  const container = realpathSync(mkdtempSync(join(tmpdir(), 'ko-test-')));
+  try {
+    const root = join(container, 'trail ');
+    mkdirSync(root);
+    assert.equal(git(root, ['init', '-q', '-b', 'main']).status, 0);
+    assert.equal(repoRoot(root), root);
+    assert.equal(commonDir(root), join(root, '.git'));
+    assert.equal(existsSync(commonDir(root)), true);
+  } finally {
+    rmSync(container, { recursive: true, force: true });
+  }
+});
+
+test('output beyond the limit has its own fixed text', () => {
+  withRepo({}, (repo) => {
+    writeFileSync(join(repo.root, 'big.bin'), Buffer.alloc(65 * 1024 * 1024, 0x61));
+    const sha = repo.git('hash-object', '-w', 'big.bin').stdout.trim();
+    const result = git(repo.root, ['cat-file', 'blob', sha]);
+    assert.deepEqual(result, { status: 127, stdout: '', stderr: OUTPUT_TOO_LARGE });
   });
 });

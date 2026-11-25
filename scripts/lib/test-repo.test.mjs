@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readdirSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { makeRepo, installKhHarness, siblingAbsentMessage, spawnFailedMessage, testEnv, KH_HARNESS_DIR, KIT_VERSION } from './test-repo.mjs';
+import { makeRepo, installKhHarness, siblingAbsentMessage, spawnFailedMessage, testEnv, isolateProcessEnv, KH_HARNESS_DIR, KIT_VERSION } from './test-repo.mjs';
 
 test('a made repository has one commit on main', () => {
   const repo = makeRepo({ files: { 'a.txt': 'one\n' } });
@@ -165,4 +165,30 @@ test('a failed git init throws its message and leaves nothing behind', () => {
     assert.throws(() => makeRepo({ baseBranch: 'bad..name' }), { message: /^git init failed: / });
   });
   assert.deepEqual(left, []);
+});
+
+test('isolateProcessEnv removes git location, identity and session variables from this process', () => {
+  const planted = { GIT_DIR: '/x', GIT_WORK_TREE: '/x', GIT_INDEX_FILE: '/x', GIT_PREFIX: 'x/', GIT_AUTHOR_NAME: 'x', CLAUDECODE: '1' };
+  const saved = Object.fromEntries(Object.keys(planted).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, planted);
+  try {
+    isolateProcessEnv();
+    for (const name of Object.keys(planted)) assert.equal(process.env[name], undefined, name);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('testEnv drops GIT_PREFIX', () => {
+  const saved = process.env.GIT_PREFIX;
+  process.env.GIT_PREFIX = 'x/';
+  try {
+    assert.equal(testEnv().GIT_PREFIX, undefined);
+  } finally {
+    if (saved === undefined) delete process.env.GIT_PREFIX;
+    else process.env.GIT_PREFIX = saved;
+  }
 });
