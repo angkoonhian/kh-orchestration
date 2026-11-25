@@ -4,43 +4,41 @@
 // of its hashed bytes, so it has no file location and cannot reach a sibling.
 // `ko-digest.mjs` and the gate import its helpers, never the reverse.
 //
-// `preToolUse(payload)` blocks the ways round the commit gate from inside a
-// session (decision 15 as amended, decisions 13 and 16). It is synchronous,
-// starts no process, writes nothing, and never throws: any failure inside it
-// is a block with fixed text. A tool other than Bash and the edit tools is
-// allowed at once without touching the filesystem.
+// `preToolUse(payload)` stops a session taking a ONE-LINE way round the commit
+// gate (decision 15 as replaced after Task 8's review; decisions 13 and 16),
+// without blocking ordinary work. It is synchronous, starts no process, writes
+// nothing and never throws: any failure inside it is a block with fixed text.
+// A tool other than Bash and the edit tools is allowed at once, without
+// touching the filesystem. The code below follows the rule set's order:
+// words, the guarded area, git commands, owner-only commands, structure that
+// cannot be seen, then the edit tools.
 //
 // Bash commands are read by `splitWords`, a small shell-word splitter, not a
-// shell. It removes quotes and backslashes (including $'...' escapes), splits
-// at ; && || | |& & ( ) and newlines, skips comments, keeps redirections and
-// leading NAME=value assignments apart from the words, and reads here-document
-// bodies. It looks into $( ), backticks, <( ), >( ) and ${ } (each parsed as
-// commands of their own), into an unquoted here-document's substitutions, and
-// into the script given to a shell by -c, a here-document, a here-string or
-// env -S. It expands nothing else: no variable, no glob (a word with a glob
-// or a brace is matched against the guarded paths as a pattern, and braces
-// are expanded up to 64 variants), no alias, no command substitution's output.
-// What it cannot see into counts, under "when in doubt block", only when the
-// command mentions git, ko.mjs, kh-orchestration or hooksPath: an unsplittable
-// command, eval and trap, inline code for an interpreter (node -e, python -c,
-// awk, ...), a script piped to a shell or an interpreter, a command word that
-// is a variable or a substitution, and find -exec.
+// shell. It removes quotes and backslashes (with $'...' escapes), splits at
+// ; && || | |& & ( ) and newlines, reads function bodies and case arms, keeps
+// redirections and leading NAME=value assignments apart from the words, and
+// reads here-document bodies. It parses $( ), backticks, <( ), >( ) and ${ }
+// as commands of their own, an unquoted here-document's substitutions too,
+// and the script a shell gets from -c. It expands nothing else: no variable,
+// no glob (a word with a glob is matched against `.git` as a pattern), no
+// alias; braces are expanded up to 64 variants, `{a,b}` and `{x..y}`.
 //
-// Known NOT caught, by design (the commit gate and the digest are the
-// backstop, and decision 13 says this guards against a skipped step, not
-// against an agent set on cheating):
-// - a variable or a substitution's output used as a git argument
-//   (`F=--no-verify; git commit $F`, `git commit $(echo -n)`), and eval of
-//   such a variable in a command that does not mention git;
-// - a script written to disk and then run (`bash x.sh`, `node x.mjs`,
-//   `source x.sh`), and a git alias already configured (`git ci -n`);
-// - a command that runs its arguments as a command other than the wrappers
-//   named below (`ssh`, `su -c`, `watch`, `parallel`, `flock`, `script -c`);
-// - a path reached by changing directory first (`cd .git && rm hooks/x`) or
-//   through a link made earlier, and a write to `.git/config` from Bash
-//   (an include.path that sets hooksPath);
-// - commits made without the pre-commit hook by other commands (`git am`,
-//   `rebase`, `cherry-pick`, `hash-object -t commit` with `update-ref`).
+// Stated limits, by design: the commit gate, the digest and verify-branch are
+// the backstop for each of these.
+// - eval, and variables holding flags or paths (`F=--no-verify; git commit $F`
+//   outside commit, merge and pull; `D=.git; cd $D`); a script written to disk
+//   and then run; string concatenation in inline code (`'.gi'+'t/hooks'`).
+// - git options that run a command (`rebase -x`, `bisect run`, `submodule
+//   foreach`, `-c core.pager=...`), and an alias already configured.
+// - commits git never hooks: cherry-pick, revert, am, rebase, fast-forward
+//   merges, stash and update-ref plumbing, a clone then pull (verify-branch is
+//   the remedy).
+// - copying or unpacking over the git directory through its parent in ways
+//   the word rules do not see, and a path reached through a link made earlier.
+// - .claude/settings.local.json changed through the shell (the gate's
+//   contract check is the backstop).
+// - an unreadable officers.json leaves officer scripts and `protected` globs
+//   unguarded for edits until the digest refuses the commit.
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 
@@ -193,31 +191,36 @@ export function readOfficers(officersJsonText) {
   return { officerCandidates, protectedGlobs: [...globs] };
 }
 
+
 // ---------------------------------------------------------------------------
-// The hook: messages
+// Messages
 
 const RUN = 'node .claude/kh-orchestration/scripts/ko.mjs run';
-const doubt = (reason) => `This command could not be checked (${reason}) and it mentions git, the git hooks, the kh-orchestration state or ko.mjs, so it is blocked. Run it as plain commands the hook can read.`;
+const unseen = (reason) => `This command's structure cannot be seen (${reason}) and its text holds a way round the commit gate (no-verify, hooksPath, a .git path, an owner-only ko.mjs command), so it is blocked. Run it as plain commands.`;
 
 // Every text the hook returns. Each is one line of at most 300 characters with no `<` or `>`,
 // so kh-harness's cleaning leaves it as it is.
 export const MESSAGES = Object.freeze({
   noVerify: `git may not skip the commit gate from a session. Run the officers with ${RUN}, then commit without --no-verify or -n.`,
+  hiddenOption: 'A word in an option position of git commit, merge or pull holds a variable or a substitution, which could turn the hooks off, so it is blocked. Write the options out literally.',
   commitTree: `git commit-tree makes a commit without the commit gate and is not run from a session. Run ${RUN}, then git commit.`,
-  hooksPath: 'core.hooksPath is not set, unset or overridden from a session: it would switch the commit gate off. The owner changes it in their own terminal; to read it, run git config --get core.hooksPath.',
-  alias: 'A git alias is not defined from a session: an alias can hide a way round the commit gate. The owner defines aliases in their own terminal; to read one, run git config --get alias.NAME.',
-  gitConfigEnv: 'A GIT_CONFIG_* variable is not set from a session: it can change which hooks git runs. Run the git command without it.',
-  guardedPath: `The git hooks folder and the kh-orchestration shared state are not changed from a session; ls, cat, grep and the like may read them. To record a verdict, run ${RUN}.`,
+  gitConfig: 'Git configuration that redirects or turns off hooks (core.hooksPath, include, includeIf, alias, branch.*.mergeOptions) is not changed from a session. The owner changes it in their own terminal; reading it with git config --get is allowed.',
+  gitEnv: 'GIT_CONFIG_*, HOME, XDG_CONFIG_HOME and GIT_EXEC_PATH (or --exec-path) are not set for git from a session: they change which configuration and hooks git uses. Run the git command without them.',
+  xargs: 'A git command or ko.mjs run through xargs takes words the hook cannot see, so it is blocked. Run the command directly, with its subcommand and options written out.',
+  guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
+  gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
   ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code. Ask the owner to run node .claude/kh-orchestration/scripts/ko.mjs ${command}.`,
-  xargs: 'git commit, merge, pull or config run through xargs takes arguments the hook cannot see, so it is blocked. Run the git command directly.',
-  unsplittable: doubt('it cannot be split into words'),
-  runsCode: doubt('it runs a string as code'),
-  hiddenCommand: doubt('its command word is a variable or a substitution'),
-  feedsScript: doubt('it feeds a script to a shell or an interpreter'),
+  sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
+  unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
+  feedsScript: unseen('it feeds a script to a shell or an interpreter'),
+  runsCode: unseen('it runs a string as code'),
+  hiddenCommand: unseen('its command word is a variable or a substitution'),
   tooLong: 'This command is longer than 100,000 characters, too long to check, so it is blocked. Split it into shorter commands.',
-  noCommand: 'This Bash call carries no command text to check, so it is blocked.',
+  pathTooLong: 'The working directory, the project directory or a path in this call is longer than 4,096 characters, so the call is blocked. Use a shorter path.',
+  noCommand: 'This Bash call carries no command text to check, so it is blocked. Send the command as a string in the command field.',
   noTarget: 'This edit names no file path the hook can resolve, so it is blocked. Give the file\'s absolute path.',
   protectedEdit: 'This file decides what passes the commit gate and is not edited from a session. The owner can open this worktree for proposals by running node .claude/kh-orchestration/scripts/ko.mjs propose in their own terminal here.',
+  localSettingsEdit: '.claude/settings.local.json can switch the hooks off and, being untracked, no approval can cover it, so it is never edited from a session. The owner edits it in their own editor.',
   gitDirEdit: `Files inside the git directory (its hooks, its config, the kh-orchestration shared state) are not edited from a session. Use git commands for git's own files, and ${RUN} for a verdict.`,
   stateUnreadable: 'The .git of this repository is neither a directory nor a readable gitdir file, so the commit gate\'s state cannot be found and this call is blocked. Repair .git outside this session.',
   internal: 'The kh-orchestration extension failed while checking this call, so the call is blocked. Ask the owner to reinstall kh-orchestration.',
@@ -234,11 +237,12 @@ const refuse = (message) => {
 };
 
 // ---------------------------------------------------------------------------
-// The word splitter
+// Words: the splitter
 
 // The longest Bash command read; a longer one is blocked unread.
 export const MAX_COMMAND_LENGTH = 100_000;
-// How deeply substitutions and scripts for a shell may nest before the command counts as unsplittable.
+// How deeply substitutions, ${ } and scripts for a shell may nest before the command counts as
+// one whose structure cannot be seen.
 const MAX_DEPTH = 16;
 // Thrown inside the splitter for text a shell would not accept, or that nests too deeply.
 const UNPARSEABLE = Symbol('unparseable');
@@ -248,9 +252,12 @@ const unparseable = () => {
 
 // A word: its text with quotes removed; `plain`, how many leading characters were unquoted
 // literals (so `"A"=1` is no assignment); `quoted`; `expands`, whether a variable or a
-// substitution is in it; `special`, whether an unquoted glob or brace character is.
-const newWord = () => ({ text: '', plain: 0, quoted: false, expands: false, special: false });
-const newCommand = (pipe) => ({ assignments: [], words: [], redirects: [], heredocs: [], pipe });
+// substitution is in it, and `spans`, where each one sits in `text`; `special`, whether an
+// unquoted glob or brace character is in it.
+const newWord = () => ({ text: '', plain: 0, quoted: false, expands: false, spans: [], special: false, name: undefined });
+// A simple command: `raw`, its text as written; `pipe`, whether its input is a pipe, and
+// `pipedFrom`/`pipedTo`, the commands on either side of that pipe.
+const newCommand = (pipedFrom, pipe) => ({ assignments: [], words: [], redirects: [], heredocs: [], pipe, pipedFrom, pipedTo: null, start: null, raw: '' });
 
 function addLiteral(word, char) {
   if (word.plain === word.text.length) word.plain++;
@@ -262,6 +269,7 @@ function addQuoted(word, text) {
   word.quoted = true;
 }
 function addExpansion(word, raw) {
+  word.spans.push([word.text.length, word.text.length + raw.length]);
   word.text += raw;
   word.expands = true;
 }
@@ -271,22 +279,36 @@ function isAssignment(word) {
   const match = ASSIGNMENT.exec(word.text);
   return match !== null && match[0].length <= word.plain;
 }
+const isKeyword = (word, keyword) => !word.quoted && !word.expands && word.text === keyword;
+const endsWord = (char) => char === undefined || ' \t\n;&|)'.includes(char);
 
 const OUTPUT_OPERATORS = ['>>', '>|', '>&', '>'];
 const INPUT_OPERATORS = ['<<<', '<<-', '<<', '<>', '<&', '<'];
+const FUNCTION_NAME = /^[A-Za-z_][A-Za-z0-9_.:-]*$/;
 
 // Parses commands from p.src at p.pos into p.out until the end of the text or, when `nested`,
 // until the `)` that closes a substitution. A substitution's commands reach p.out before the
-// command holding it, the order a shell runs them.
+// command holding it, the order a shell runs them. `name() {` drops the name and reads the
+// body as commands; `case WORD in` drops its header and patterns and reads each arm's commands.
 function parseList(p, nested) {
   if (p.depth > MAX_DEPTH) unparseable();
   const { src } = p;
-  let command = newCommand(false);
+  let command = newCommand(null, false);
   let word = null;
   let redirect = null;
   let heredocs = [];
   let parens = 0;
-  const current = () => (word ??= newWord());
+  const cases = [];
+  const mark = () => {
+    command.start ??= p.pos;
+  };
+  const current = () => {
+    if (word === null) {
+      mark();
+      word = newWord();
+    }
+    return word;
+  };
   const endWord = () => {
     if (word === null) return;
     if (redirect !== null) {
@@ -297,24 +319,46 @@ function parseList(p, nested) {
       command.assignments.push(word);
     } else {
       command.words.push(word);
+      if (command.words.length === 3 && isKeyword(command.words[0], 'case') && isKeyword(word, 'in')) {
+        command = newCommand(null, false);
+        cases.push('pattern');
+      }
     }
     word = null;
   };
   const endCommand = (pipeNext) => {
     endWord();
     if (redirect !== null) unparseable();
-    if (command.assignments.length + command.words.length + command.redirects.length > 0) p.out.push(command);
-    command = newCommand(pipeNext);
+    const ended = command;
+    ended.raw = src.slice(ended.start ?? p.pos, p.pos);
+    let kept = ended.assignments.length + ended.words.length + ended.redirects.length > 0;
+    if (kept && cases.length > 0 && ended.words.length > 0 && isKeyword(ended.words[0], 'esac')) {
+      cases.pop();
+      kept = false;
+    }
+    if (kept) p.out.push(ended);
+    command = newCommand(pipeNext && kept ? ended : null, pipeNext);
+    if (command.pipedFrom !== null) ended.pipedTo = command;
   };
   const startRedirect = (op, base) => {
     if (redirect !== null) unparseable();
+    mark();
     redirect = { op, base };
     p.pos += base.length;
   };
   while (p.pos < src.length) {
     const char = src[p.pos];
     const next = src[p.pos + 1];
-    if (char === ' ' || char === '\t') {
+    if (cases.length > 0 && cases[cases.length - 1] === 'pattern' && word === null && redirect === null) {
+      if (char === ' ' || char === '\t' || char === '\n') p.pos++;
+      else if (src.startsWith('esac', p.pos) && endsWord(src[p.pos + 4])) {
+        p.pos += 4;
+        cases.pop();
+      } else {
+        skipCasePattern(p);
+        cases[cases.length - 1] = 'body';
+      }
+    } else if (char === ' ' || char === '\t') {
       endWord();
       p.pos++;
     } else if (char === '\n') {
@@ -326,7 +370,9 @@ function parseList(p, nested) {
       while (p.pos < src.length && src[p.pos] !== '\n') p.pos++;
     } else if (char === ';') {
       endCommand(false);
-      p.pos += next === ';' || next === '&' ? 2 : 1;
+      const width = src.startsWith(';;&', p.pos) ? 3 : next === ';' || next === '&' ? 2 : 1;
+      if (width > 1 && cases.length > 0) cases[cases.length - 1] = 'pattern';
+      p.pos += width;
     } else if (char === '&' && next === '&') {
       endCommand(false);
       p.pos += 2;
@@ -346,6 +392,10 @@ function parseList(p, nested) {
       p.pos++;
       nestedList(p);
       addExpansion(word, src.slice(start, p.pos));
+    } else if (char === '(' && word !== null && word.plain === word.text.length && FUNCTION_NAME.test(word.text) && /^\(\s*\)/.test(src.slice(p.pos, p.pos + 64))) {
+      // `name()`: the function's name goes; its body follows as commands.
+      word = null;
+      p.pos = src.indexOf(')', p.pos) + 1;
     } else if (char === '(') {
       if (word !== null) unparseable();
       endCommand(false);
@@ -359,9 +409,10 @@ function parseList(p, nested) {
       else unparseable();
     } else if ((char === '<' || char === '>') && next === '(') {
       const start = p.pos;
+      const target = current();
       p.pos += 2;
       nestedList(p);
-      addExpansion(current(), src.slice(start, p.pos));
+      addExpansion(target, src.slice(start, p.pos));
     } else if (char === '<' || char === '>') {
       let fd = '';
       if (word !== null && word.plain === word.text.length && /^[0-9]+$/.test(word.text)) {
@@ -387,9 +438,10 @@ function parseList(p, nested) {
       addQuoted(current(), src.slice(p.pos + 1, end));
       p.pos = end + 1;
     } else if (char === '"') {
+      const target = current();
       p.pos++;
-      current().quoted = true;
-      scanDouble(p, word, '"');
+      target.quoted = true;
+      scanDouble(p, target, '"');
     } else if (char === '$') {
       parseDollar(p, current(), false);
     } else if (char === '`') {
@@ -399,7 +451,7 @@ function parseList(p, nested) {
       p.pos++;
     }
   }
-  if (nested || parens > 0) unparseable();
+  if (nested || parens > 0 || cases.length > 0) unparseable();
   endCommand(false);
   for (const heredoc of heredocs) heredoc.command.heredocs.push('');
 }
@@ -408,6 +460,37 @@ function nestedList(p) {
   p.depth++;
   parseList(p, true);
   p.depth--;
+}
+
+// A case pattern, `x|y)` or `(x)`, up to and past its closing parenthesis.
+function skipCasePattern(p) {
+  const { src } = p;
+  if (src[p.pos] === '(') p.pos++;
+  let depth = 0;
+  for (;;) {
+    if (p.pos >= src.length) unparseable();
+    const char = src[p.pos];
+    if (char === '\\') {
+      p.pos += 2;
+    } else if (char === "'") {
+      const end = src.indexOf("'", p.pos + 1);
+      if (end === -1) unparseable();
+      p.pos = end + 1;
+    } else if (char === '"') {
+      p.pos++;
+      scanDouble(p, newWord(), '"');
+    } else if (char === '$') {
+      parseDollar(p, newWord(), false);
+    } else if (char === '(') {
+      depth++;
+      p.pos++;
+    } else if (char === ')') {
+      p.pos++;
+      if (depth-- === 0) return;
+    } else {
+      p.pos++;
+    }
+  }
 }
 
 // Reads the text inside double quotes into `word` up to the closing quote; with `terminator`
@@ -486,16 +569,19 @@ function parseDollar(p, word, inDouble) {
   }
 }
 
-// The inside of ${ ... } up to its closing brace; substitutions inside are parsed.
+// The inside of ${ ... } up to its closing brace; substitutions inside are parsed. Each ${ is
+// one level of nesting, counted like a substitution's.
 function scanBraced(p, inDouble) {
   const { src } = p;
+  p.depth++;
+  if (p.depth > MAX_DEPTH) unparseable();
   let depth = 1;
   for (;;) {
     if (p.pos >= src.length) unparseable();
     const char = src[p.pos];
     if (char === '}') {
       p.pos++;
-      if (--depth === 0) return;
+      if (--depth === 0) break;
     } else if (char === '{') {
       depth++;
       p.pos++;
@@ -516,6 +602,7 @@ function scanBraced(p, inDouble) {
       p.pos++;
     }
   }
+  p.depth--;
 }
 
 // `...`: the text up to the next unescaped backtick, with \` \\ \$ unescaped, parsed as commands.
@@ -608,7 +695,8 @@ function readHeredocs(p, heredocs) {
   }
 }
 
-// The commands of a script, each with word objects, or null when a shell would not accept it.
+// The commands of a script, each with word objects, or null when a shell would not accept it
+// or it nests deeper than MAX_DEPTH.
 function parseScript(src, depth) {
   const p = { src, pos: 0, depth, out: [] };
   try {
@@ -626,12 +714,13 @@ function parseScript(src, depth) {
  * where `assignments` are the leading NAME=value words, `op` is a redirection operator with
  * any file descriptor before it (`2>`, `<<<`), `heredocs` the bodies of its here-documents,
  * and `pipe` whether its standard input is the previous command's output. The commands inside
- * a substitution come before the command that holds them. Null when quotes, substitutions or
- * parentheses do not balance, a redirection has no target, or nesting is deeper than 16.
- * See the header comment for what it does not expand.
+ * a substitution come before the command that holds them; a function definition's name and a
+ * case statement's header and patterns are left out. Null for a value that is not a string, and
+ * when quotes, substitutions, parentheses or a case do not balance, a redirection has no target,
+ * or nesting is deeper than 16. See the header comment for what it does not expand.
  */
 export function splitWords(command) {
-  const commands = parseScript(command, 0);
+  const commands = typeof command === 'string' ? parseScript(command, 0) : null;
   return commands === null ? null : commands.map((entry) => ({
     assignments: entry.assignments.map((word) => word.text),
     words: entry.words.map((word) => word.text),
@@ -642,8 +731,10 @@ export function splitWords(command) {
 }
 
 // ---------------------------------------------------------------------------
-// The git directory, without starting a process (decision 16)
+// Paths and the git directory, without starting a process (decision 16)
 
+// The longest working directory, project directory or edit target read; longer blocks.
+const MAX_PATH_LENGTH = 4096;
 const MAX_GIT_FILE_BYTES = 4096;
 const MAX_STATE_BYTES = 1024 * 1024;
 
@@ -709,12 +800,43 @@ export function sharedStateDirSync(root) {
   return dirs === null ? null : join(dirs.commonDir, 'kh-orchestration');
 }
 
-// The nearest directory from `start` upward that holds a `.git` entry, or null.
+// The deepest existing ancestor of an absolute path (itself included), found by halving: if
+// a path exists so do its ancestors, so this takes a number of lstat calls logarithmic in the
+// path's depth. Returns it with the rest of the path's segments after it.
+function deepestExisting(path) {
+  const root = resolve(sep);
+  const parts = path.slice(root.length).split(sep).filter((part) => part !== '');
+  const prefix = (count) => join(root, ...parts.slice(0, count));
+  let low = 0;
+  let high = parts.length;
+  while (low < high) {
+    const middle = (low + high + 1) >> 1;
+    if (lstatOrNull(prefix(middle)) !== null) low = middle;
+    else high = middle - 1;
+  }
+  return { existing: prefix(low), tail: parts.slice(low) };
+}
+
+// The real path of `path`'s deepest existing ancestor, with the rest of `path` after it; a
+// dangling link at that ancestor is kept as a name. Null when no real path can be had.
+function realOfDeepest(path) {
+  const { existing, tail } = deepestExisting(path);
+  for (const [base, rest] of [[existing, tail], [dirname(existing), [basename(existing), ...tail]]]) {
+    try {
+      return join(realpathSync(base), ...rest);
+    } catch {
+      // a dangling link: try its directory
+    }
+  }
+  return null;
+}
+
+// The nearest directory from `start` upward that holds a `.git` entry, or null. It starts at
+// the deepest existing ancestor, since a directory that does not exist holds nothing.
 function findRoot(start) {
-  let dir = start;
+  let dir = deepestExisting(start).existing;
   for (let steps = 0; steps <= start.length; steps++) {
-    const stats = lstatOrNull(join(dir, '.git'));
-    if (stats !== null) return dir;
+    if (lstatOrNull(join(dir, '.git')) !== null) return dir;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -737,34 +859,44 @@ const isInside = (path, dir) => {
   return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep);
 };
 
-// The directory the session works in: the call's `cwd`, else CLAUDE_PROJECT_DIR; null without either.
-function sessionDir(payload) {
+// Whether a directory is shaped like a git directory: HEAD, objects/ and refs/ in it.
+const isGitDirShaped = (dir) => lstatOrNull(join(dir, 'HEAD'))?.isFile() === true
+  && lstatOrNull(join(dir, 'objects'))?.isDirectory() === true && lstatOrNull(join(dir, 'refs'))?.isDirectory() === true;
+
+// A path word as git and the kernel read it: `//` and `/./` collapsed, a leading `./` dropped.
+const normalizePath = (text) => text.replace(/\/{2,}/g, '/').replace(/\/(?:\.\/)+/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/\.$/, '');
+
+// The directories a call is made from: the call's `cwd`, else CLAUDE_PROJECT_DIR, and that
+// project directory. Either over MAX_PATH_LENGTH blocks.
+function sessionDirs(payload) {
   for (const dir of [payload.cwd, process.env.CLAUDE_PROJECT_DIR]) {
-    if (typeof dir === 'string' && isAbsolute(dir)) return dir;
+    if (typeof dir === 'string' && dir.length > MAX_PATH_LENGTH) refuse(MESSAGES.pathTooLong);
   }
-  return null;
+  const absolute = (dir) => (typeof dir === 'string' && isAbsolute(dir) ? dir : null);
+  const project = absolute(process.env.CLAUDE_PROJECT_DIR);
+  return { cwd: absolute(payload.cwd) ?? project, project };
 }
 
 // ---------------------------------------------------------------------------
-// Bash
+// Bash, words: wrappers, the command word, text values
 
-const READ_ONLY = new Set(['ls', 'cat', 'head', 'tail', 'stat', 'file', 'wc', 'grep', 'rg', 'test', '[', 'diff', 'cmp', 'sha256sum', 'less']);
-const WRITES_TO_FILES = new Set(['>', '>>', '>|', '&>', '&>>', '<>', '>&']);
-const OWNER_ONLY = new Set(['approve', 'propose', 'waive', 'exempt', 'off', 'on']);
+// Reserved words skipped before a command word.
 const RESERVED = new Set(['!', '{', '}', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', 'coproc']);
-const MENTION = /\bgit\b|ko\.mjs|kh-orchestration|hookspath/i;
-const GIT_CONFIG_NAME = /^GIT_CONFIG[A-Za-z0-9_]*\+?=/i;
-const MAX_BRACE_VARIANTS = 64;
-const MAX_BRACE_WORD = 4096;
 
-// The name a word runs as: its last path segment, lower-cased, without `.exe`.
-function commandName(text) {
+// The name a word runs as: its last path segment, lower-cased, without `.exe`, and without the
+// `=` or `{` zsh allows in front of a command word.
+function commandName(word) {
+  if (word.name !== undefined) return word.name;
+  let text = word.text;
+  if (word.plain > 0 && (text[0] === '=' || text[0] === '{')) text = text.slice(1);
   const name = text.slice(text.lastIndexOf('/') + 1).toLowerCase();
-  return name.endsWith('.exe') ? name.slice(0, -4) : name;
+  word.name = name.endsWith('.exe') ? name.slice(0, -4) : name;
+  return word.name;
 }
 
 // Skips a wrapper's options: `valued` short letters and `longValued` long names take the next
-// word as their value; `positional` further words (timeout's duration) come before the command.
+// word as their value (or the rest of the word); `positional` words (timeout's duration,
+// repeat's count) come before the command.
 function optionSkipper({ valued = '', longValued = [], assignments = false, positional = 0 } = {}) {
   return (words, index) => {
     let i = index;
@@ -791,67 +923,214 @@ function optionSkipper({ valued = '', longValued = [], assignments = false, posi
   };
 }
 
+// The wrappers skipped to find the command word (env is read by readEnv below).
 const WRAPPERS = {
-  env: optionSkipper({ valued: 'uCS', longValued: ['--unset', '--chdir', '--split-string'], assignments: true }),
   command: optionSkipper(),
   builtin: optionSkipper(),
-  sudo: optionSkipper({ valued: 'ugpCDrtUTh', longValued: ['--user', '--group', '--prompt', '--close-from', '--chdir', '--role', '--type', '--other-user', '--command-timeout', '--host'], assignments: true }),
-  doas: optionSkipper({ valued: 'uC' }),
+  sudo: optionSkipper({ valued: 'ugpCDrtUThR', longValued: ['--user', '--group', '--prompt', '--close-from', '--chdir', '--role', '--type', '--other-user', '--command-timeout', '--host', '--chroot'], assignments: true }),
+  doas: optionSkipper({ valued: 'uCa' }),
   nice: optionSkipper({ valued: 'n', longValued: ['--adjustment'] }),
-  ionice: optionSkipper({ valued: 'cn', longValued: ['--class', '--classdata'] }),
+  ionice: optionSkipper({ valued: 'cnpPu', longValued: ['--class', '--classdata', '--pid', '--pgid', '--uid'] }),
   time: optionSkipper({ valued: 'fo', longValued: ['--format', '--output'] }),
-  xargs: optionSkipper({ valued: 'IdaELnPs', longValued: ['--arg-file', '--delimiter', '--max-args', '--max-lines', '--max-procs', '--max-chars'] }),
+  xargs: optionSkipper({ valued: 'IdaELnPs', longValued: ['--arg-file', '--delimiter', '--max-args', '--max-lines', '--max-procs', '--max-chars', '--process-slot-var'] }),
   exec: optionSkipper({ valued: 'a' }),
   nohup: optionSkipper(),
   timeout: optionSkipper({ valued: 'sk', longValued: ['--signal', '--kill-after'], positional: 1 }),
   stdbuf: optionSkipper({ valued: 'ioe', longValued: ['--input', '--output', '--error'] }),
   setsid: optionSkipper(),
+  noglob: optionSkipper(),
+  nocorrect: optionSkipper(),
+  '-': optionSkipper(),
+  repeat: optionSkipper({ positional: 1 }),
+  busybox: optionSkipper(),
 };
 
-// The strings env -S or --split-string gives as a command line.
-function envScripts(words, from, to) {
-  const scripts = [];
-  for (let i = from; i < to; i++) {
-    const text = words[i].text;
-    if (text === '-S' || text === '--split-string') scripts.push(words[i + 1]?.text ?? '');
-    else if (text.startsWith('--split-string=')) scripts.push(text.slice('--split-string='.length));
-    else if (/^-[^-]*S/.test(text)) scripts.push(text.slice(text.indexOf('S') + 1) || (words[i + 1]?.text ?? ''));
+// env's options. Its short `u C a S` and long `--unset --chdir --argv0 --split-string` take a
+// value; a lone `-` is -i. The string of -S is split into words and JOINED with the words after
+// it, then read again as env's own, as env does. Returns the words (rebuilt for -S), the index
+// after env's options, its assignments and the names it unsets; `unseen` holds a -S string
+// that cannot be split.
+const ENV_VALUED = 'uCaS';
+const ENV_LONG_VALUED = new Set(['--unset', '--chdir', '--argv0', '--split-string']);
+function readEnv(words, from) {
+  const result = { words, next: from, assignments: [], unsets: [], unseen: null };
+  let i = from;
+  for (let splits = 0; i < result.words.length;) {
+    const word = result.words[i];
+    const text = word.text;
+    if (text === '--') {
+      i++;
+      break;
+    }
+    if (text === '-') {
+      i++;
+      continue;
+    }
+    if (ASSIGNMENT.test(text)) {
+      result.assignments.push(word);
+      i++;
+      continue;
+    }
+    if (!text.startsWith('-')) break;
+    let option = null;
+    let value;
+    let width = 1;
+    if (text.startsWith('--')) {
+      const equals = text.indexOf('=');
+      option = equals === -1 ? text : text.slice(0, equals);
+      if (equals !== -1) value = text.slice(equals + 1);
+      else if (ENV_LONG_VALUED.has(option)) {
+        value = result.words[i + 1]?.text;
+        width = 2;
+      }
+    } else {
+      const k = [...text].findIndex((char, index) => index > 0 && ENV_VALUED.includes(char));
+      if (k !== -1) {
+        option = text[k];
+        value = text.slice(k + 1) || result.words[i + 1]?.text;
+        width = text.slice(k + 1) === '' ? 2 : 1;
+      }
+    }
+    if (option === 'u' || option === '--unset') result.unsets.push(value ?? '');
+    if (option === 'S' || option === '--split-string') {
+      const split = splits++ < MAX_DEPTH ? parseScript(value ?? '', 1) : null;
+      if (split === null || split.length > 1 || (split.length === 1 && split[0].redirects.length > 0)) {
+        result.unseen = value ?? '';
+        i += width;
+        break;
+      }
+      const inserted = split.length === 0 ? [] : [...split[0].assignments, ...split[0].words];
+      result.words = [...result.words.slice(0, i), ...inserted, ...result.words.slice(i + width)];
+      continue;
+    }
+    i += width;
   }
-  return scripts;
+  result.next = i;
+  return result;
 }
 
-// The command a simple command runs, past reserved words and the wrappers above:
-// { index, word, name, wrappers, scripts } with `word` undefined when there is none.
+// The command a simple command runs, past reserved words, `function NAME` and the wrappers:
+// { words, index, word, name, wrappers, envAssignments, unsets, unseen } with `word`
+// undefined when there is none. `words` is the command's words, with env -S strings joined in.
 function resolveCommand(command) {
-  const { words } = command;
-  const wrappers = [];
-  const scripts = [];
+  const resolved = { words: command.words, index: 0, word: undefined, name: '', wrappers: [], envAssignments: [], unsets: [], unseen: null };
   let index = 0;
-  while (index < words.length) {
-    const word = words[index];
+  for (let steps = 0; index < resolved.words.length && steps <= resolved.words.length * 2 + MAX_DEPTH; steps++) {
+    const word = resolved.words[index];
     if (word.expands) break;
     if (!word.quoted && RESERVED.has(word.text)) {
       index++;
       continue;
     }
-    if (!word.quoted && word.text === 'function') {
-      index += 2;
+    if (isKeyword(word, 'function')) {
+      const name = resolved.words[index + 1];
+      index += name !== undefined && !RESERVED.has(name.text) ? 2 : 1;
       continue;
     }
-    const name = commandName(word.text);
-    const skip = Object.hasOwn(WRAPPERS, name) ? WRAPPERS[name] : undefined;
-    if (skip === undefined) break;
-    wrappers.push(name);
-    const next = skip(words, index + 1);
-    if (name === 'env') scripts.push(...envScripts(words, index + 1, next));
-    index = Math.max(next, index + 1);
+    const name = commandName(word);
+    if (name === 'env') {
+      const env = readEnv(resolved.words, index + 1);
+      resolved.words = env.words;
+      resolved.envAssignments.push(...env.assignments);
+      resolved.unsets.push(...env.unsets);
+      resolved.unseen ??= env.unseen;
+      resolved.wrappers.push(name);
+      index = env.next;
+      continue;
+    }
+    if (!Object.hasOwn(WRAPPERS, name)) break;
+    resolved.wrappers.push(name);
+    index = Math.max(WRAPPERS[name](resolved.words, index + 1), index + 1);
   }
-  const word = words[index];
-  return { index, word, name: word === undefined ? '' : commandName(word.text), wrappers, scripts };
+  resolved.index = index;
+  resolved.word = resolved.words[index];
+  resolved.name = resolved.word === undefined ? '' : commandName(resolved.word);
+  return resolved;
 }
 
-// Brace expansion of a word, at most MAX_BRACE_VARIANTS results; null when there would be more
-// or the word is too long to expand. Every brace counts, quoted or not: more variants, never fewer.
+// Text values: words that are a message, a body, a search pattern or echo's output, never a
+// path or a flag. `git` is the command's git invocation, or null.
+const MESSAGE_SUBCOMMANDS = new Set(['commit', 'tag', 'merge', 'stash', 'notes']);
+const SEARCH_SUBCOMMANDS = new Set(['log', 'show', 'shortlog', 'whatchanged', 'rev-list']);
+const PATTERN_COMMANDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'gawk', 'mawk', 'nawk']);
+const PATTERN_OPTIONS = new Set(['-e', '--regexp', '--expression', '-f', '--file']);
+
+// The words of `args` that are values of the options named: separate (`--grep x`), after `=`
+// (`--grep=x`), or attached to a short one (`-Sx`, `-am x` for a letter in `shortLetters`).
+function optionValues(args, longNames, shortLetters) {
+  const values = new Set();
+  for (let i = 0; i < args.length; i++) {
+    const text = args[i].text;
+    if (text === '--') break;
+    if (text.startsWith('--')) {
+      const name = text.split('=', 1)[0];
+      if (!longNames.includes(name)) continue;
+      if (text.includes('=')) values.add(args[i]);
+      else if (args[i + 1] !== undefined) values.add(args[++i]);
+    } else if (/^-[A-Za-z]/.test(text)) {
+      const k = [...text].findIndex((char, index) => index > 0 && shortLetters.includes(char));
+      if (k === -1) continue;
+      if (k < text.length - 1) values.add(args[i]);
+      else if (args[i + 1] !== undefined) values.add(args[++i]);
+    }
+  }
+  return values;
+}
+
+// The first operand of a search command (its pattern), unless -e or -f gave the pattern.
+function firstOperand(args) {
+  if (args.some((word) => PATTERN_OPTIONS.has(word.text.split('=', 1)[0]))) return null;
+  return args.find((word) => !word.text.startsWith('-')) ?? null;
+}
+
+const NO_VALUES = new Set();
+
+function textValues(resolved, git, outputReadOnly) {
+  const args = resolved.words.slice(resolved.index + 1);
+  const { name } = resolved;
+  if ((name === 'echo' || name === 'printf') && outputReadOnly) return new Set(args);
+  if (git !== null) {
+    const values = new Set();
+    if (MESSAGE_SUBCOMMANDS.has(git.sub)) for (const word of optionValues(git.rest, ['--message'], 'm')) values.add(word);
+    if (SEARCH_SUBCOMMANDS.has(git.sub)) for (const word of optionValues(git.rest, ['--grep', '--author', '--committer'], 'SG')) values.add(word);
+    if (git.sub === 'grep') {
+      for (const word of optionValues(git.rest, ['--regexp'], 'e')) values.add(word);
+      const pattern = firstOperand(git.rest);
+      if (pattern !== null) values.add(pattern);
+    }
+    return values;
+  }
+  if (name === 'gh') return optionValues(args, ['--body', '--title', '--notes'], 'bt');
+  if (name === 'node') return optionValues(args, ['--test-name-pattern', '--test-skip-pattern'], '');
+  if (PATTERN_COMMANDS.has(name)) {
+    const values = optionValues(args, ['--regexp', '--expression'], 'e');
+    const pattern = firstOperand(args);
+    if (pattern !== null) values.add(pattern);
+    return values;
+  }
+  return NO_VALUES;
+}
+
+// ---------------------------------------------------------------------------
+// Bash, the guarded area: the whole git directory
+
+const READ_ONLY = new Set(['ls', 'cat', 'head', 'tail', 'stat', 'file', 'wc', 'grep', 'rg', 'test', '[', 'diff', 'cmp', 'sha256sum', 'less', 'jq', 'echo', 'printf', 'find']);
+const READ_ONLY_GIT = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'rev-parse', 'cat-file', 'grep', 'blame']);
+// Options with which a read-only command writes or runs something after all.
+const WRITING_OPTIONS = {
+  find: /^-(delete|exec|execdir|ok|okdir|fprint.*|fls)$/,
+  rg: /^--pre/,
+  less: /^(-[oO]|--log-file|--LOG-FILE)/,
+  file: /^(-C|--compile)$/,
+  git: /^(--output(=|$)|-O|--open-files-in-pager)/,
+};
+const WRITES_TO_FILES = new Set(['>', '>>', '>|', '&>', '&>>', '<>', '>&']);
+const MAX_BRACE_VARIANTS = 64;
+const MAX_BRACE_WORD = 4096;
+
+// Brace expansion of a word, `{a,b}` and `{x..y}` (single characters or small integers), at
+// most MAX_BRACE_VARIANTS results; null when there would be more or the word is too long.
+// Every brace counts, quoted or not: more variants, never fewer.
 function braceVariants(text) {
   if (text.length > MAX_BRACE_WORD) return null;
   const done = [];
@@ -859,19 +1138,35 @@ function braceVariants(text) {
   for (let steps = 0; pending.length > 0; steps++) {
     if (steps > 4 * MAX_BRACE_VARIANTS) return null;
     const item = pending.pop();
-    const alternation = firstAlternation(item);
-    if (alternation === null) {
+    const brace = firstBrace(item);
+    if (brace === null) {
       done.push(item);
       if (done.length > MAX_BRACE_VARIANTS) return null;
     } else {
-      for (const option of alternation.options) pending.push(alternation.before + option + alternation.after);
+      if (brace.options.length > MAX_BRACE_VARIANTS) return null;
+      for (const option of brace.options) pending.push(brace.before + option + brace.after);
     }
   }
   return done;
 }
 
-// The first `{a,b}` in a text whose braces balance and which holds a comma at its own level.
-function firstAlternation(text) {
+// The options of a sequence `x..y`, or null when it is not one.
+function sequenceOptions(inner) {
+  const match = /^(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])$/.exec(inner);
+  if (match === null) return null;
+  const numeric = /[0-9]/.test(match[1]);
+  if (numeric !== /[0-9]/.test(match[2])) return null;
+  const from = numeric ? Number(match[1]) : match[1].charCodeAt(0);
+  const to = numeric ? Number(match[2]) : match[2].charCodeAt(0);
+  if (Math.abs(to - from) > MAX_BRACE_VARIANTS) return [...Array(MAX_BRACE_VARIANTS + 1)].map(() => '');
+  const step = from <= to ? 1 : -1;
+  const options = [];
+  for (let value = from; value !== to + step; value += step) options.push(numeric ? String(value) : String.fromCharCode(value));
+  return options;
+}
+
+// The first `{a,b}` or `{x..y}` in a text whose braces balance.
+function firstBrace(text) {
   for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
     let depth = 0;
     const commas = [];
@@ -879,9 +1174,15 @@ function firstAlternation(text) {
       if (text[k] === '{') depth++;
       else if (text[k] === ',' && depth === 1) commas.push(k);
       else if (text[k] === '}' && --depth === 0) {
-        if (commas.length === 0) break;
-        const cuts = [start, ...commas, k];
-        return { before: text.slice(0, start), options: cuts.slice(1).map((cut, n) => text.slice(cuts[n] + 1, cut)), after: text.slice(k + 1) };
+        const before = text.slice(0, start);
+        const after = text.slice(k + 1);
+        if (commas.length > 0) {
+          const cuts = [start, ...commas, k];
+          return { before, options: cuts.slice(1).map((cut, n) => text.slice(cuts[n] + 1, cut)), after };
+        }
+        const sequence = sequenceOptions(text.slice(start + 1, k));
+        if (sequence !== null) return { before, options: sequence, after };
+        break;
       }
     }
   }
@@ -891,148 +1192,378 @@ function firstAlternation(text) {
 // The texts a word stands for after brace expansion; null when that is too many to list.
 const variantsOf = (word) => (word.special ? braceVariants(word.text) : [word.text]);
 
-// Whether some `.git` segment of a glob pattern is followed by a `hooks` or `kh-orchestration`
-// one, matching `*` and `?` (and `[...]`, read as `?`) by the glob segment rules.
-function patternNamesGuarded(lower) {
-  const segments = lower.replace(/\[[^\]/]*\]/g, '?').split('/');
-  for (let k = 0; k + 1 < segments.length; k++) {
-    if (segmentMatches(segments[k], '.git') && (segmentMatches(segments[k + 1], 'hooks') || segmentMatches(segments[k + 1], 'kh-orchestration'))) return true;
+// The real git directories of the session's repository and of the project's, lower-cased,
+// read once per call and only for a word that is an absolute path.
+function gitDirTexts(context) {
+  if (context.gitDirTexts === undefined) {
+    const texts = [];
+    for (const dir of [context.cwd, context.project]) {
+      const real = dir === null ? null : realOfDeepest(dir);
+      const dirs = real === null ? null : gitDirsAround(real);
+      if (dirs !== null) texts.push(dirs.gitDir.toLowerCase(), dirs.commonDir.toLowerCase());
+    }
+    context.gitDirTexts = texts;
   }
-  return false;
+  return context.gitDirTexts;
 }
 
-// Whether `.git/` is followed, anywhere later, by a `/kh-orchestration` segment.
-function namesSharedState(lower) {
-  const git = lower.indexOf('.git/');
-  if (git === -1) return false;
-  for (let at = lower.indexOf('/kh-orchestration', git + 4); at !== -1; at = lower.indexOf('/kh-orchestration', at + 1)) {
-    const after = lower[at + '/kh-orchestration'.length];
-    if (after === undefined || after === '/') return true;
-  }
-  return false;
-}
-
-// The resolved shared paths of the session's repository, lower-cased, read once per call.
-function guardTexts(context) {
-  if (context.guards === undefined) {
-    const dirs = context.cwd === null ? null : gitDirsAround(context.cwd);
-    context.guards = dirs === null ? [] : [join(dirs.commonDir, 'hooks'), join(dirs.commonDir, 'kh-orchestration')].map((dir) => dir.toLowerCase());
-  }
-  return context.guards;
-}
-
-// Whether a text names a path under the git directory's hooks/ or kh-orchestration/.
+// Whether a text, as a path, is in the git directory: a `.git` segment (a pattern segment
+// starting with `.` that can match `.git` counts), or an absolute path inside the real git
+// directories of the session's repository. Each whitespace-separated part is matched (xargs and
+// a shell split a word there), as written and after its first `=`.
 function guardedText(text, pattern, context) {
-  const lower = text.toLowerCase();
-  if (lower.includes('.git/hooks') || namesSharedState(lower) || (pattern && patternNamesGuarded(lower))) return true;
-  if (!lower.includes('hooks') && !lower.includes('kh-orchestration')) return false;
-  return guardTexts(context).some((guard) => lower.includes(guard));
-}
-
-function guardedWord(word, context) {
-  const variants = variantsOf(word);
-  if (variants === null) return /hooks|kh-orchestration/i.test(word.text);
-  return variants.some((text) => guardedText(text, word.special, context));
-}
-
-// Whether a command that names a guarded path only reads it: one of READ_ONLY, run directly
-// (no assignment, no wrapper), with none of its own ways to run or write something, and no
-// redirection that writes to a guarded path.
-function onlyReads(command, resolved, context) {
-  if (command.assignments.length > 0 || resolved.wrappers.length > 0 || resolved.word === undefined || resolved.word.expands) return false;
-  if (!READ_ONLY.has(resolved.name)) return false;
-  const args = command.words.slice(resolved.index + 1).map((word) => word.text);
-  if (resolved.name === 'rg' && args.some((text) => text.startsWith('--pre'))) return false;
-  if (resolved.name === 'less' && args.some((text) => /^(-[oO]|--log-file|--LOG-FILE)/.test(text))) return false;
-  return !command.redirects.some((redirect) => WRITES_TO_FILES.has(redirect.base)
-    && !(redirect.base === '>&' && /^([0-9]+|-)$/.test(redirect.target.text)) && guardedWord(redirect.target, context));
-}
-
-const isNoVerify = (text) => text.length >= 6 && '--no-verify'.startsWith(text);
-
-const COMMIT_SHORT_VALUED = 'mFCct';
-const COMMIT_SHORT_OPTIONAL = 'uS';
-const COMMIT_LONG_VALUED = new Set(['--message', '--file', '--author', '--date', '--template', '--reuse-message', '--reedit-message', '--fixup', '--squash', '--cleanup', '--trailer', '--pathspec-from-file']);
-
-// One argument of git commit: whether it turns the hooks off, and whether it takes the next word as its value.
-function commitOption(text) {
-  if (text.startsWith('--')) return { skips: isNoVerify(text), takesNext: !text.includes('=') && COMMIT_LONG_VALUED.has(text) };
-  if (!text.startsWith('-') || text.length < 2) return { skips: false, takesNext: false };
-  for (let k = 1; k < text.length; k++) {
-    if (text[k] === 'n') return { skips: true, takesNext: false };
-    if (COMMIT_SHORT_VALUED.includes(text[k])) return { skips: false, takesNext: k === text.length - 1 };
-    if (COMMIT_SHORT_OPTIONAL.includes(text[k])) break;
+  // Without a `.` or a leading `/` no part can hold a `.git` segment or be an absolute path.
+  if (!text.includes('.') && !text.includes('/')) return false;
+  const parts = /\s/.test(text) ? text.split(/\s+/) : [text];
+  for (const part of parts.flatMap((part) => (part.includes('=') ? [part, part.slice(part.indexOf('=') + 1)] : [part]))) {
+    const lower = normalizePath(part).toLowerCase();
+    for (const segment of lower.split('/')) {
+      if (segment === '.git' || (pattern && segment.startsWith('.') && segmentMatches(segment.replace(/\[[^\]]*\]/g, '?'), '.git'))) return true;
+    }
+    if (lower.startsWith('/') && gitDirTexts(context).some((dir) => lower === dir || lower.startsWith(`${dir}/`))) return true;
   }
-  return { skips: false, takesNext: false };
+  return false;
 }
 
-// Whether git commit's arguments hold --no-verify (or an abbreviation) or -n, values and what follows `--` aside.
-function commitSkipsHooks(args) {
-  for (let i = 0; i < args.length; i++) {
-    const variants = variantsOf(args[i]);
-    if (variants === null) return true;
-    if (variants.length > 1) {
-      if (variants.some((text) => commitOption(text).skips)) return true;
-    } else {
-      if (variants[0] === '--') return false;
-      const { skips, takesNext } = commitOption(variants[0]);
-      if (skips) return true;
-      if (takesNext) i++;
+// Whether an expansion in a word is followed by a `/hooks` or `/kh-orchestration` segment
+// (`"$(git rev-parse --git-common-dir)/hooks"`, `$D/kh-orchestration/off`).
+function expansionBeforeGuardedSegment(word) {
+  for (const [, end] of word.spans) {
+    let at = end;
+    if (word.text[at] !== '/') continue;
+    while (word.text[at] === '/' || (word.text[at] === '.' && word.text[at + 1] === '/')) at++;
+    const next = word.text.slice(at, at + 17).toLowerCase();
+    for (const name of ['hooks', 'kh-orchestration']) {
+      if (next.startsWith(name) && (next.length === name.length || next[name.length] === '/')) return true;
     }
   }
   return false;
 }
 
-// For any other git command (merge, pull, an alias): whether a word before `--` is --no-verify or an abbreviation of it.
-function argsSkipHooks(args) {
-  for (const word of args) {
-    const variants = variantsOf(word);
-    if (variants === null) return true;
-    if (variants.length === 1 && variants[0] === '--') return false;
-    if (variants.some(isNoVerify)) return true;
+// A substitution asking git where its directory is (`$(git rev-parse --git-path hooks)`).
+const GIT_DIR_QUERY = /\brev-parse\b[^)`]*?--(?:git-dir|git-common-dir|absolute-git-dir|git-path)\b/;
+
+function guardedWord(word, context) {
+  if (expansionBeforeGuardedSegment(word) || word.spans.some(([start, end]) => GIT_DIR_QUERY.test(word.text.slice(start, end)))) return true;
+  const variants = variantsOf(word);
+  if (variants === null) return /\.g/i.test(word.text);
+  return variants.some((text) => guardedText(text, word.special, context));
+}
+
+// Whether a command's own word only reads: its command word is read-only (git with a
+// read-only subcommand), run directly (no assignment, no wrapper), with none of the options
+// by which such a command writes or runs something.
+function readsOnly(command, resolved, git) {
+  if (command.assignments.length > 0 || resolved.wrappers.length > 0 || resolved.word === undefined || resolved.word.expands) return false;
+  const args = resolved.words.slice(resolved.index + 1).map((word) => word.text);
+  if (git !== null) return READ_ONLY_GIT.has(git.sub) && !args.some((text) => WRITING_OPTIONS.git.test(text));
+  if (!READ_ONLY.has(resolved.name)) return false;
+  const writing = WRITING_OPTIONS[resolved.name];
+  return writing === undefined || !args.some((text) => writing.test(text));
+}
+
+// Whether a command and every command its output is piped into read only. Each command's
+// answer is kept on it, so a long pipeline is walked once.
+function pipelineReadsOnly(command) {
+  const chain = [];
+  for (let at = command; at !== null && at.pipelineReadsOnly === undefined; at = at.pipedTo) chain.push(at);
+  for (let k = chain.length - 1; k >= 0; k--) {
+    const at = chain[k];
+    const resolved = resolveCommand(at);
+    at.pipelineReadsOnly = readsOnly(at, resolved, gitInvocation(resolved)) && (at.pipedTo === null || at.pipedTo.pipelineReadsOnly);
   }
-  return false;
+  return command.pipelineReadsOnly;
 }
 
-const CONFIG_READS = new Set(['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--get-color', '--get-colorbool', '-l', '--list']);
+const writesTo = (redirect) => WRITES_TO_FILES.has(redirect.base) && !(redirect.base === '>&' && /^([0-9]+|-)$/.test(redirect.target.text));
 
-function configWritesAlias(args) {
-  const texts = args.map((word) => word.text);
-  const action = texts.find((text) => !text.startsWith('-'));
-  const reads = texts.some((text) => CONFIG_READS.has(text)) || action === 'get' || action === 'list';
-  return !reads && texts.some((text) => text.toLowerCase().startsWith('alias.'));
+// `rm -f .git/index.lock`, exactly: the one write to the git directory allowed (a stale lock).
+function removesIndexLock(command) {
+  const texts = command.words.map((word) => normalizePath(word.text));
+  return command.assignments.length === 0 && command.redirects.length === 0 && texts.length === 3
+    && texts[0] === 'rm' && texts[1] === '-f' && texts[2] === '.git/index.lock';
 }
 
+// Whether the session's working directory is inside a git directory: a `.git` segment in its
+// real path, or an ancestor shaped like a git directory (a bare or separate one).
+function cwdInGitDir(context) {
+  if (context.inGitDir === undefined) {
+    const real = context.cwd === null ? null : realOfDeepest(context.cwd) ?? context.cwd;
+    let inside = real !== null && real.toLowerCase().split(sep).includes('.git');
+    for (let dir = real, steps = 0; !inside && dir !== null && steps <= real.length; steps++) {
+      inside = isGitDirShaped(dir);
+      const parent = dirname(dir);
+      dir = parent === dir ? null : parent;
+    }
+    context.inGitDir = inside;
+  }
+  return context.inGitDir;
+}
+
+// git rev-parse printing the git directory names it: its output may only be piped into reading commands.
+const printsGitDir = (git) => git?.sub === 'rev-parse' && git.rest.some((word) => /^--(git-dir|git-common-dir|absolute-git-dir|git-path)$/.test(word.text));
+
+// find that writes or runs something, with a name or path pattern that could match a hook,
+// the state or the git directory (`find . -name pre-commit -delete`, `-path '*hooks/*'`).
+const FIND_PATTERNS = new Set(['-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '-lname', '-ilname']);
+const GUARDED_NAMES = ['.git', 'hooks', 'kh-orchestration', 'pre-commit', 'pre-merge-commit'];
+function findPatternGuarded(resolved) {
+  if (resolved.name !== 'find') return false;
+  const args = resolved.words.slice(resolved.index + 1);
+  if (!args.some((word) => WRITING_OPTIONS.find.test(word.text))) return false;
+  return args.some((word, index) => index > 0 && FIND_PATTERNS.has(args[index - 1].text) && (() => {
+    const lower = word.text.toLowerCase();
+    const last = lower.slice(lower.lastIndexOf('/') + 1).replace(/\[[^\]]*\]/g, '?');
+    return GUARDED_NAMES.some((name) => lower.includes(name) || segmentMatches(last, name));
+  })());
+}
+
+function judgeGuardedArea(command, resolved, git, values, context) {
+  const reads = readsOnly(command, resolved, git) && (command.pipedTo === null || pipelineReadsOnly(command.pipedTo));
+  if (!reads || command.redirects.some((redirect) => writesTo(redirect) && !redirect.target.text.startsWith('/'))) {
+    if (cwdInGitDir(context)) refuse(MESSAGES.gitDirCwd);
+  }
+  const named = [...command.assignments, ...resolved.envAssignments, ...resolved.words.filter((word, index) => index !== resolved.index && !values.has(word))]
+    .some((word) => guardedWord(word, context));
+  const redirected = command.redirects.filter((redirect) => guardedWord(redirect.target, context));
+  if (!named && redirected.length === 0 && !printsGitDir(git) && !findPatternGuarded(resolved)) return;
+  if (removesIndexLock(command)) return;
+  if (!reads || redirected.some(writesTo)) refuse(MESSAGES.guardedPath);
+}
+
+// ---------------------------------------------------------------------------
+// Bash, git commands
+
+// git's global options that take the next word as their value.
 const GIT_VALUED = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env', '--attr-source']);
+// Subcommands whose hooks are the commit gate's; and those that take --no-verify harmlessly.
+const GATED = new Set(['commit', 'merge', 'pull']);
+const HARMLESS_NO_VERIFY = new Set(['push', 'rebase', 'am', 'fetch']);
+// Subcommands that, run through xargs, take words from its input the hook cannot see.
+const XARGS_HIDDEN = new Set(['commit', 'merge', 'pull', 'config', 'commit-tree']);
+// Environment that changes git's configuration or programs: on any command for GIT_CONFIG*,
+// on a git command for the rest.
+const GIT_CONFIG_ENV = /^GIT_CONFIG[A-Za-z0-9_]*\+?=/i;
+const GIT_ENV = /^(HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH)\+?=/i;
 
-function judgeGit(args, resolved) {
+// The git invocation a resolved command is, or null: git by its basename, or git-<sub> read as
+// git <sub>. { sub, rest, configs, execPath }: the subcommand, the words after it, the k=v of
+// each -c and --config-env, and whether --exec-path= names a directory.
+function gitInvocation(resolved) {
+  const args = resolved.words.slice(resolved.index + 1);
+  if (resolved.name.startsWith('git-') && resolved.name.length > 4) return { sub: resolved.name.slice(4), rest: args, configs: [], execPath: false };
+  if (resolved.name !== 'git') return null;
+  const configs = [];
+  let execPath = false;
   let i = 0;
   while (i < args.length && args[i].text.startsWith('-')) {
     const text = args[i].text;
-    const override = text === '-c' || text === '--config-env' ? args[i + 1]?.text : text.startsWith('--config-env=') ? text.slice('--config-env='.length) : undefined;
-    if (override?.toLowerCase().startsWith('alias.')) refuse(MESSAGES.alias);
+    if (text === '-c' || text === '--config-env') configs.push(args[i + 1]?.text ?? '');
+    else if (text.startsWith('--config-env=')) configs.push(text.slice('--config-env='.length));
+    else if (text.startsWith('-c')) configs.push(text.slice(2));
+    else if (text.startsWith('--exec-path=')) execPath = true;
     i += GIT_VALUED.has(text) ? 2 : 1;
   }
-  const sub = args[i]?.text;
-  if (sub === undefined) return;
-  const rest = args.slice(i + 1);
-  if (sub === 'commit-tree') refuse(MESSAGES.commitTree);
-  if (sub === 'config' && configWritesAlias(rest)) refuse(MESSAGES.alias);
-  if (sub === 'commit' ? commitSkipsHooks(rest) : argsSkipHooks(rest)) refuse(MESSAGES.noVerify);
-  if (resolved.wrappers.includes('xargs') && ['commit', 'merge', 'pull', 'config'].includes(sub)) refuse(MESSAGES.xargs);
+  return { sub: args[i]?.text, rest: args.slice(i + 1), configs, execPath };
 }
 
-// `git config --get core.hooksPath` exactly, the one command that may name hooksPath.
-function readsHooksPath(command) {
-  const texts = command.words.map((word) => word.text);
-  return command.assignments.length === 0 && texts.length === 4 && !command.words.some((word) => word.expands)
-    && texts[0] === 'git' && texts[1] === 'config' && texts[2] === '--get' && texts[3].toLowerCase() === 'core.hookspath';
+// A configuration key that redirects or turns off hooks.
+function hookKey(key) {
+  const lower = key.toLowerCase();
+  return lower === 'core.hookspath' || lower.startsWith('include.') || lower.startsWith('includeif.') || lower.startsWith('alias.') || /^branch\..*\.mergeoptions$/.test(lower);
 }
+// A section whose renaming or removal can do the same.
+const hookSection = (name) => /^(core|include|includeif.*|alias|branch.*)$/i.test(name);
+
+const CONFIG_VALUED = new Set(['-f', '--file', '--blob', '--type', '--default', '--comment', '--value']);
+const CONFIG_READS = new Set(['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--get-color', '--get-colorbool', '-l', '--list']);
+const CONFIG_WRITES = new Set(['--add', '--replace-all', '--unset', '--unset-all']);
+const CONFIG_SECTIONS = new Set(['--rename-section', '--remove-section', 'rename-section', 'remove-section']);
+const CONFIG_ACTIONS = new Set(['get', 'set', 'unset', 'list', 'edit', 'rename-section', 'remove-section', 'get-color', 'get-colorbool']);
+
+// git config: a write (old or new syntax) of a hook key, a section change of a hook section, or --edit.
+function configChangesHooks(rest) {
+  const options = [];
+  const operands = [];
+  for (let i = 0; i < rest.length; i++) {
+    const text = rest[i].text;
+    if (text.startsWith('-') && operands.length === 0) {
+      options.push(text.split('=', 1)[0]);
+      if (CONFIG_VALUED.has(text)) i++;
+    } else operands.push(text);
+  }
+  const action = CONFIG_ACTIONS.has(operands[0]) ? operands.shift() : null;
+  if (action === 'edit' || options.includes('--edit') || options.includes('-e')) return true;
+  if (CONFIG_SECTIONS.has(action) || options.some((option) => CONFIG_SECTIONS.has(option))) return operands.some(hookSection);
+  const writes = action !== null ? action === 'set' || action === 'unset'
+    : options.some((option) => CONFIG_WRITES.has(option)) || (!options.some((option) => CONFIG_READS.has(option)) && operands.length >= 2);
+  return writes && operands.length > 0 && hookKey(operands[0]);
+}
+
+const isNoVerify = (text) => text.length >= 6 && '--no-verify'.startsWith(text);
+
+// Each gated subcommand's options that take a value: short letters, and long names that take
+// the next word when written without `=`.
+const VALUED_OPTIONS = {
+  commit: { short: 'mFCct', optional: 'uS', long: new Set(['--message', '--file', '--author', '--date', '--template', '--reuse-message', '--reedit-message', '--fixup', '--squash', '--cleanup', '--trailer', '--pathspec-from-file']) },
+  merge: { short: 'mFsX', optional: 'S', long: new Set(['--message', '--file', '--strategy', '--strategy-option', '--into-name', '--cleanup']) },
+  pull: { short: 'sXo', optional: 'Sr', long: new Set(['--strategy', '--strategy-option', '--depth', '--deepen', '--shallow-since', '--shallow-exclude', '--upload-pack', '--server-option', '--negotiation-tip']) },
+};
+
+// One option word of a gated subcommand: whether it turns the hooks off, and whether it takes
+// the next word as its value. `-n` turns them off for commit only (merge -n is --no-stat).
+function gatedOption(sub, text) {
+  const { short, optional, long } = VALUED_OPTIONS[sub];
+  if (text.startsWith('--')) return { skips: isNoVerify(text), takesNext: !text.includes('=') && long.has(text) };
+  if (!text.startsWith('-') || text.length < 2) return { skips: false, takesNext: false };
+  for (let k = 1; k < text.length; k++) {
+    if (text[k] === 'n' && sub === 'commit') return { skips: true, takesNext: false };
+    if (short.includes(text[k])) return { skips: false, takesNext: k === text.length - 1 };
+    if (optional.includes(text[k])) break;
+  }
+  return { skips: false, takesNext: false };
+}
+
+// Where an expansion first begins in a word is a value, not an option: after `--name=` or
+// after a short option that takes one (`-m"$MSG"`).
+function expansionIsValue(sub, word) {
+  const prefix = word.text.slice(0, word.spans[0][0]);
+  if (prefix.startsWith('--')) return prefix.includes('=');
+  return prefix.length > 1 && prefix.startsWith('-') && gatedOption(sub, prefix).takesNext;
+}
+
+// git commit, merge or pull: --no-verify (or an abbreviation), commit's -n, or an option-position
+// word holding an expansion, before `--`. Values of options are skipped, never read as flags.
+function judgeGated(sub, rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const word = rest[i];
+    const variants = variantsOf(word);
+    if (variants === null) refuse(MESSAGES.noVerify);
+    if (variants.length === 1 && variants[0] === '--') return;
+    if (word.expands && !expansionIsValue(sub, word)) refuse(MESSAGES.hiddenOption);
+    if (variants.some((text) => gatedOption(sub, text).skips)) refuse(MESSAGES.noVerify);
+    if (variants.length === 1 && gatedOption(sub, variants[0]).takesNext) i++;
+  }
+}
+
+function judgeGitEnvironment(command, resolved, git) {
+  const assignments = [...command.assignments, ...resolved.envAssignments];
+  const exported = resolved.words.filter((word) => GIT_CONFIG_ENV.test(word.text));
+  if (assignments.some((word) => GIT_CONFIG_ENV.test(word.text)) || exported.length > 0) refuse(MESSAGES.gitEnv);
+  if (git !== null && (git.execPath || assignments.some((word) => GIT_ENV.test(word.text)))) refuse(MESSAGES.gitEnv);
+}
+
+function judgeGit(resolved, git, values) {
+  if (git.configs.some((config) => hookKey(config.split('=', 1)[0]))) refuse(MESSAGES.gitConfig);
+  if (git.sub === undefined) {
+    if (resolved.wrappers.includes('xargs')) refuse(MESSAGES.xargs);
+    return;
+  }
+  if (git.sub === 'commit-tree') refuse(MESSAGES.commitTree);
+  if (git.sub === 'config' && configChangesHooks(git.rest)) refuse(MESSAGES.gitConfig);
+  if (GATED.has(git.sub)) judgeGated(git.sub, git.rest);
+  else if (!HARMLESS_NO_VERIFY.has(git.sub)) {
+    for (const word of git.rest) {
+      if (word.text === '--') break;
+      const variants = values.has(word) ? [] : variantsOf(word);
+      if (variants === null || variants.some(isNoVerify)) refuse(MESSAGES.noVerify);
+    }
+  }
+  if (resolved.wrappers.includes('xargs') && XARGS_HIDDEN.has(git.sub)) refuse(MESSAGES.xargs);
+}
+
+// ---------------------------------------------------------------------------
+// Bash, owner-only commands and the session's marks
+
+const OWNER_ONLY = ['approve', 'propose', 'waive', 'exempt', 'off', 'on'];
+const SESSION_NAMES = new Set(['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID']);
+const SESSION_EMPTIED = /^(CLAUDECODE|CLAUDE_CODE_SESSION_ID)=$/;
+// node's options that take the next word, so that its script operand is found.
+// (One string: the self-containment check reads a quoted word after that option's name as an import.)
+const NODE_VALUED = new Set(('-r --require --import --loader --experimental-loader -C --conditions --input-type --env-file --test-name-pattern '
+  + '--test-skip-pattern --test-reporter --test-reporter-destination --inspect-port --title --watch-path --test-concurrency').split(' '));
+
+// Whether a word matches `name` as written, by a brace variant, or as a glob pattern.
+function couldBe(word, name) {
+  if (!word.special) return word.text.toLowerCase() === name;
+  const variants = variantsOf(word) ?? [word.text];
+  return variants.some((text) => {
+    const lower = text.toLowerCase();
+    return lower === name || (word.special && segmentMatches(lower.replace(/\[[^\]]*\]/g, '?'), name));
+  });
+}
+const basenameWord = (word) => (word.text.includes('/') ? { ...word, text: word.text.slice(word.text.lastIndexOf('/') + 1) } : word);
+
+// The script word a command runs: node's first operand, or the command word itself.
+function scriptWord(resolved) {
+  if (resolved.name !== 'node' && resolved.name !== 'nodejs') return resolved.index;
+  for (let i = resolved.index + 1; i < resolved.words.length; i++) {
+    const text = resolved.words[i].text;
+    if (!text.startsWith('-')) return i;
+    if (NODE_VALUED.has(text)) i++;
+  }
+  return -1;
+}
+
+function judgeOwner(command, resolved) {
+  const unsets = [...resolved.unsets, ...(resolved.name === 'unset' ? resolved.words.slice(resolved.index + 1).map((word) => word.text) : [])];
+  if ([...command.assignments, ...resolved.envAssignments].some((word) => SESSION_EMPTIED.test(word.text)) || unsets.some((name) => SESSION_NAMES.has(name))) refuse(MESSAGES.sessionEnv);
+  const at = scriptWord(resolved);
+  if (at === -1 || resolved.words[at] === undefined || !couldBe(basenameWord(resolved.words[at]), 'ko.mjs')) return;
+  // The subcommand is the first word that is not an option; a word right after an option
+  // may be that option's value, so the word after it is read too. A word holding an expansion
+  // may be an option.
+  let afterOption = false;
+  let seen = false;
+  for (let i = at + 1; i < resolved.words.length; i++) {
+    const word = resolved.words[i];
+    if (word.text === '--') {
+      afterOption = false;
+      continue;
+    }
+    if (word.text.startsWith('-') || word.expands) {
+      afterOption = !word.text.includes('=');
+      continue;
+    }
+    seen = true;
+    const owner = OWNER_ONLY.find((name) => couldBe(word, name));
+    if (owner !== undefined) refuse(MESSAGES.ownerOnly(owner));
+    if (!afterOption) return;
+    afterOption = false;
+  }
+  if (!seen && resolved.wrappers.includes('xargs')) refuse(MESSAGES.xargs);
+}
+
+// ---------------------------------------------------------------------------
+// Bash, when structure cannot be seen: the raw text is scanned for danger tokens
+
+const DANGER = [
+  /no-verif/i, /hookspath/i, /commit-tree/i, /mergeoptions/i, /include\.path/i, /git_config/i, /claudecode/i, /claude_code_session_id/i,
+  /(?:^|[^a-z0-9_.-])\.git\/(?:hooks|config|kh-orchestration)/i,
+  /ko\.mjs[\s\S]{0,40}?(?<![a-z0-9-])(?:approve|propose|waive|exempt|off|on)(?![a-z0-9-])/i,
+  /commit[\s\S]{0,20}?(?<![^\s'"(;&|=`])-[a-zA-Z]*n(?![a-zA-Z0-9_-])/,
+];
+
+// Whether a text holds a danger token, as written or with quotes, backslashes and parentheses
+// (zsh's glob groups, `.git/h(o)oks`) taken out.
+function holdsDanger(...texts) {
+  return texts.some((text) => {
+    const normal = normalizePath(text);
+    const stripped = normal.replace(/['"\\()]/g, '');
+    return DANGER.some((pattern) => pattern.test(normal) || pattern.test(stripped));
+  });
+}
+const scanned = (message, ...texts) => {
+  if (holdsDanger(...texts)) refuse(message);
+};
 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'yash', 'fish']);
 const SHELL_VALUED = new Set(['-o', '+o', '-O', '+O', '--rcfile', '--init-file']);
+// Commands whose arguments are code: eval and trap's string, an alias's value, awk's program, find's -exec.
+const ALWAYS_CODE = new Set(['eval', 'trap', 'alias', 'awk', 'gawk', 'mawk', 'nawk']);
 const FIND_EXEC = new Set(['-exec', '-execdir', '-ok', '-okdir']);
-const ALWAYS_CODE = new Set(['eval', 'trap', 'awk', 'gawk', 'mawk', 'nawk']);
+// Commands whose -c or --command value is a command line for a shell.
+const COMMAND_STRING = new Set(['su', 'script', 'runuser']);
 
 // The short letters and long options with which an interpreter runs code given on its command line.
 function inlineOptionsOf(name) {
@@ -1044,46 +1575,26 @@ function inlineOptionsOf(name) {
   return null;
 }
 
-const readsStdinScript = (command) => command.pipe || command.heredocs.length > 0 || command.redirects.some((redirect) => redirect.base === '<<<');
+// Whether a script operand is standard input in disguise: `-`, /dev/stdin, a process substitution.
+const stdinOperand = (word) => word.text === '-' || word.text === '/dev/stdin' || word.text.startsWith('<(');
+const hasHereString = (command) => command.redirects.some((redirect) => redirect.base === '<<<');
 
-// Whether a text mentions git, ko.mjs, kh-orchestration, hooksPath or the resolved shared paths.
-function mentionsText(text, context) {
-  const lower = text.toLowerCase();
-  return MENTION.test(text) || ((lower.includes('hooks') || lower.includes('kh-orchestration')) && guardTexts(context).some((guard) => lower.includes(guard)));
+// A script fed on standard input: from a pipe the whole command line is the script's source;
+// from a here-document or a here-string, the command and its bodies.
+function scanFedScript(command, context) {
+  if (command.pipe) scanned(MESSAGES.feedsScript, context.command);
+  if (command.heredocs.length > 0 || hasHereString(command)) scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
 }
 
-// Whether the whole command mentions them, with quotes and backslashes taken out.
-function mentions(context) {
-  context.mentioned ??= mentionsText(context.command.replace(/[\\'"]/g, ''), context);
-  return context.mentioned;
-}
-
-// Blocks with `message` when the command mentions them.
-const doubtful = (context, message) => {
-  if (mentions(context)) refuse(message);
-};
-
-// Blocks with `message` when the code in `words` mentions them; a word holding a variable or
-// a substitution could be anything the command holds, so then the whole command is asked.
-function doubtfulCode(words, context, message) {
-  if (words.some((word) => word.expands) ? mentions(context) : words.some((word) => mentionsText(word.text, context))) refuse(message);
-}
-
-// A script given on a command line or a standard input: its commands are judged as the command's own.
-function judgeScript(text, context, depth) {
-  const commands = depth + 1 > MAX_DEPTH ? null : parseScript(text, depth + 1);
-  if (commands === null) doubtful(context, MESSAGES.unsplittable);
-  else judgeCommands(commands, context, depth + 1);
-}
-
+// A shell: its -c script is parsed and judged as commands; a script from standard input,
+// /dev/stdin or a process substitution is scanned; a script on disk is not read.
 function judgeShell(command, args, context, depth) {
   let i = 0;
   let inline = false;
   let stdin = false;
   while (i < args.length) {
     const text = args[i].text;
-    if (text === '--' || text === '-') {
-      if (text === '-') stdin = true;
+    if (text === '--') {
       i++;
       break;
     }
@@ -1099,57 +1610,86 @@ function judgeShell(command, args, context, depth) {
     if (i < args.length) judgeScript(args[i].text, context, depth);
     return;
   }
-  if (i < args.length && !stdin) return;
-  for (const body of command.heredocs) judgeScript(body, context, depth);
-  for (const redirect of command.redirects) if (redirect.base === '<<<') judgeScript(redirect.target.text, context, depth);
-  if (command.pipe) doubtful(context, MESSAGES.feedsScript);
+  if (i < args.length && !stdin && !stdinOperand(args[i])) return;
+  if (i < args.length && stdinOperand(args[i])) scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
+  scanFedScript(command, context);
 }
 
-// An interpreter runs code from its command line (node -e, python -c) or, with no script operand,
-// from its standard input when that is a pipe, a here-document or a here-string.
 function judgeInterpreter(command, args, inlineOptions, context) {
-  let operand = false;
+  let operand = null;
   let inline = false;
   for (const word of args) {
     const text = word.text;
     if (!text.startsWith('-') || text === '-') {
-      operand = text !== '-';
+      operand = word;
       break;
     }
     const long = inlineOptions.long.some((option) => text === option || text.startsWith(`${option}=`));
     const short = /^-[A-Za-z]+$/.test(text) && [...inlineOptions.short].some((letter) => text.includes(letter));
     if (long || short) inline = true;
   }
-  if (inline) doubtfulCode(args, context, MESSAGES.runsCode);
-  else if (!operand && readsStdinScript(command)) doubtful(context, MESSAGES.feedsScript);
+  if (inline) scanned(MESSAGES.runsCode, command.raw, ...command.heredocs);
+  else if (operand === null || stdinOperand(operand)) scanFedScript(command, context);
 }
 
-function judgeCommand(command, context, depth) {
-  const every = [...command.assignments, ...command.words, ...command.redirects.map((redirect) => redirect.target)];
-  if (command.assignments.some((word) => GIT_CONFIG_NAME.test(word.text)) || command.words.some((word) => GIT_CONFIG_NAME.test(word.text))) refuse(MESSAGES.gitConfigEnv);
-  if (every.some((word) => word.text.toLowerCase().includes('hookspath')) && !readsHooksPath(command)) refuse(MESSAGES.hooksPath);
-  const resolved = resolveCommand(command);
-  if (every.some((word) => guardedWord(word, context)) && !onlyReads(command, resolved, context)) refuse(MESSAGES.guardedPath);
-  for (let k = 0; k < command.words.length; k++) {
-    if (commandName(command.words[k].text) !== 'ko.mjs') continue;
-    const sub = command.words.slice(k + 1).find((word) => !word.text.startsWith('-'))?.text.toLowerCase();
-    if (OWNER_ONLY.has(sub)) refuse(MESSAGES.ownerOnly(sub));
-  }
-  for (const script of resolved.scripts) judgeScript(script, context, depth);
+function judgeUnseen(command, resolved, context, depth) {
+  if (resolved.unseen !== null) scanned(MESSAGES.unsplittable, resolved.unseen);
   if (resolved.word === undefined) return;
   if (resolved.word.expands) {
-    doubtful(context, MESSAGES.hiddenCommand);
+    scanned(MESSAGES.hiddenCommand, command.raw);
     return;
   }
   const { name } = resolved;
-  const args = command.words.slice(resolved.index + 1);
-  if (name === 'git') judgeGit(args, resolved);
-  const runsCode = ALWAYS_CODE.has(name) || (name === 'find' && args.some((word) => FIND_EXEC.has(word.text))) || (name === 'deno' && args[0]?.text === 'eval');
-  if (runsCode) doubtfulCode(args, context, MESSAGES.runsCode);
+  const args = resolved.words.slice(resolved.index + 1);
+  if (ALWAYS_CODE.has(name) || (name === 'find' && args.some((word) => FIND_EXEC.has(word.text))) || (name === 'deno' && args[0]?.text === 'eval')) scanned(MESSAGES.runsCode, command.raw);
   if (SHELLS.has(name)) judgeShell(command, args, context, depth);
-  if ((name === 'source' || name === '.') && readsStdinScript(command)) doubtful(context, MESSAGES.feedsScript);
+  if (COMMAND_STRING.has(name)) {
+    const at = args.findIndex((word) => word.text === '-c' || word.text === '--command');
+    if (at !== -1 && args[at + 1] !== undefined) judgeScript(args[at + 1].text, context, depth);
+  }
+  if ((name === 'source' || name === '.') && (args.length === 0 || stdinOperand(args[0]))) {
+    scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
+    scanFedScript(command, context);
+  }
   const inlineOptions = inlineOptionsOf(name);
   if (inlineOptions !== null) judgeInterpreter(command, args, inlineOptions, context);
+}
+
+// ---------------------------------------------------------------------------
+// Bash, judging a command
+
+// A script given on a command line: parsed and judged as the command's own; one that cannot
+// be split is scanned.
+function judgeScript(text, context, depth) {
+  const commands = depth + 1 > MAX_DEPTH ? null : parseScript(text, depth + 1);
+  if (commands === null) scanned(MESSAGES.unsplittable, text);
+  else judgeCommands(commands, context, depth + 1);
+}
+
+function judgeCommand(command, context, depth) {
+  const resolved = resolveCommand(command);
+  const git = gitInvocation(resolved);
+  const outputReadOnly = command.pipedTo === null || pipelineReadsOnly(command.pipedTo);
+  const values = textValues(resolved, git, outputReadOnly);
+  judgeGuardedArea(command, resolved, git, values, context);
+  judgeGitEnvironment(command, resolved, git);
+  if (git !== null) judgeGit(resolved, git, values);
+  judgeOwner(command, resolved);
+  judgeInnerCommand(resolved, values);
+  judgeUnseen(command, resolved, context, depth);
+}
+
+// A git or node word after the command word, behind a wrapper the tables above do not know
+// (ssh, strace, npx, a coproc's name, sh -c '"$@"' _ git ...), is judged as a command word too.
+const INNER_COMMANDS = new Set(['git', 'node', 'nodejs']);
+function judgeInnerCommand(resolved, values) {
+  const at = resolved.words.findIndex((word, index) => index > resolved.index && !values.has(word) && !word.expands
+    && (INNER_COMMANDS.has(commandName(word)) || commandName(word).startsWith('git-')));
+  if (at === -1) return;
+  const inner = { ...resolved, index: at, word: resolved.words[at], name: commandName(resolved.words[at]) };
+  const git = gitInvocation(inner);
+  if (git !== null) judgeGit(inner, git, textValues(inner, git, true));
+  else judgeOwner({ assignments: [] }, inner);
 }
 
 function judgeCommands(commands, context, depth) {
@@ -1160,9 +1700,9 @@ function judgeBash(payload) {
   const command = payload.tool_input?.command;
   if (typeof command !== 'string') refuse(MESSAGES.noCommand);
   if (command.length > MAX_COMMAND_LENGTH) refuse(MESSAGES.tooLong);
-  const context = { command, cwd: sessionDir(payload), guards: undefined, mentioned: undefined };
+  const context = { command, ...sessionDirs(payload), gitDirTexts: undefined, inGitDir: undefined };
   const commands = parseScript(command, 0);
-  if (commands === null) doubtful(context, MESSAGES.unsplittable);
+  if (commands === null) scanned(MESSAGES.unsplittable, command);
   else judgeCommands(commands, context, 0);
 }
 
@@ -1171,34 +1711,17 @@ function judgeBash(payload) {
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const TARGET_KEYS = ['file_path', 'notebook_path'];
-const MAX_PATH_LENGTH = 4096;
 const MAX_LINK_HOPS = 40;
 const OFFICERS_PATH = '.claude/kh-orchestration/officers.json';
 const RULES_FOLDED = 'docs/harness/rules.md';
-
-// The real path of the deepest existing ancestor of `path`, with the rest of `path` after it.
-function realOfDeepest(path) {
-  const tail = [];
-  let existing = path;
-  for (let steps = 0; steps <= path.length; steps++) {
-    try {
-      return join(realpathSync(existing), ...tail);
-    } catch (error) {
-      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') refuse(MESSAGES.noTarget);
-    }
-    const parent = dirname(existing);
-    if (parent === existing) break;
-    tail.unshift(basename(existing));
-    existing = parent;
-  }
-  return refuse(MESSAGES.noTarget);
-}
+const LOCAL_SETTINGS_FOLDED = '.claude/settings.local.json';
 
 // Where a write to `path` lands: links followed, a dangling one too.
 function realTarget(path) {
   let current = path;
   for (let hops = 0; hops < MAX_LINK_HOPS; hops++) {
     const real = realOfDeepest(current);
+    if (real === null) refuse(MESSAGES.noTarget);
     if (lstatOrNull(real)?.isSymbolicLink() !== true) return real;
     current = resolve(dirname(real), readlinkSync(real));
   }
@@ -1237,16 +1760,20 @@ function openForProposals(root) {
   return Array.isArray(worktrees) && worktrees.every((entry) => typeof entry === 'string') && worktrees.includes(realpathSync(root));
 }
 
-function judgeTarget(path, cwd, sessionDirs) {
+// Judged as written and where the write lands: the git directory of the target's repository or
+// of the session's always blocks; settings.local.json always blocks; RULES.md is always allowed;
+// another protected file blocks unless this worktree is open for proposals.
+function judgeTarget(path, cwd, sessionGitDirs) {
   if (!isAbsolute(path) && cwd === null) refuse(MESSAGES.noTarget);
   const lexical = resolve(cwd ?? sep, path);
   for (const candidate of new Set([lexical, realTarget(lexical)])) {
-    if (sessionDirs !== null && (isInside(candidate, sessionDirs.gitDir) || isInside(candidate, sessionDirs.commonDir))) refuse(MESSAGES.gitDirEdit);
+    if (sessionGitDirs !== null && (isInside(candidate, sessionGitDirs.gitDir) || isInside(candidate, sessionGitDirs.commonDir))) refuse(MESSAGES.gitDirEdit);
     const dirs = gitDirsAround(dirname(candidate));
     if (dirs === null) continue;
     const rel = relative(dirs.root, candidate).split(sep).join('/');
     const folded = rel.toLowerCase();
     if (folded === '.git' || folded.startsWith('.git/') || isInside(candidate, dirs.gitDir) || isInside(candidate, dirs.commonDir)) refuse(MESSAGES.gitDirEdit);
+    if (folded === LOCAL_SETTINGS_FOLDED) refuse(MESSAGES.localSettingsEdit);
     if (folded !== RULES_FOLDED && protectedHere(rel, dirs.root) && !openForProposals(dirs.root)) refuse(MESSAGES.protectedEdit);
   }
 }
@@ -1254,10 +1781,12 @@ function judgeTarget(path, cwd, sessionDirs) {
 function judgeEdit(payload) {
   const input = payload.tool_input;
   const paths = input !== null && typeof input === 'object' ? TARGET_KEYS.filter((key) => Object.hasOwn(input, key)).map((key) => input[key]) : [];
-  if (paths.length === 0 || !paths.every((path) => typeof path === 'string' && path !== '' && path.length <= MAX_PATH_LENGTH && !path.includes('\0'))) refuse(MESSAGES.noTarget);
-  const cwd = sessionDir(payload);
-  const sessionDirs = cwd === null ? null : gitDirsAround(cwd);
-  for (const path of paths) judgeTarget(path, cwd, sessionDirs);
+  if (paths.length === 0 || !paths.every((path) => typeof path === 'string' && path !== '' && !path.includes('\0'))) refuse(MESSAGES.noTarget);
+  if (paths.some((path) => path.length > MAX_PATH_LENGTH)) refuse(MESSAGES.pathTooLong);
+  const { cwd } = sessionDirs(payload);
+  const real = cwd === null ? null : realOfDeepest(cwd);
+  const sessionGitDirs = real === null ? null : gitDirsAround(real);
+  for (const path of paths) judgeTarget(path, cwd, sessionGitDirs);
 }
 
 /**

@@ -22,6 +22,7 @@
 // takes every one of `file_path` and `notebook_path` that a call carries, for every edit tool.
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import fs, { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -260,105 +261,204 @@ test('a Bash command over the cap is blocked unread; one at the cap is read', ()
   assert.deepEqual(bash(`${atCap}x`), blocked(MESSAGES.tooLong));
 });
 
-// [command, expected message]. The brief's table, the amended decision 15's constructs (each
-// blocked at least once beside an allowed near miss), Review Focus 5, and the splitter's own rows.
+// [command, expected message]. Decision 15 as replaced after Task 8's review ("the rule set
+// after Task 8's review" in amendments.md), in its order: words, the guarded area, git
+// commands, owner-only commands, structure that cannot be seen. Each construct is blocked at
+// least once beside an allowed near miss (ALLOWED below).
+const KO = 'node .claude/kh-orchestration/scripts/ko.mjs';
 const BLOCKED = [
-  // the brief
+  // the brief's rows
   ['git commit --no-verify', MESSAGES.noVerify], ['git commit -n -m x', MESSAGES.noVerify], ['git commit -an', MESSAGES.noVerify],
-  ['git merge --no-verify x', MESSAGES.noVerify], ['git -c core.hooksPath=/x commit', MESSAGES.hooksPath], ['git config core.hooksPath /x', MESSAGES.hooksPath],
+  ['git merge --no-verify x', MESSAGES.noVerify], ['git -c core.hooksPath=/x commit', MESSAGES.gitConfig], ['git config core.hooksPath /x', MESSAGES.gitConfig],
   ['git commit-tree abc', MESSAGES.commitTree], ['env X=1 git commit --no-verify', MESSAGES.noVerify], ['cd a && git commit -n', MESSAGES.noVerify],
-  ['node .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['echo x > .git/hooks/pre-commit', MESSAGES.guardedPath],
-  ['rm -rf .git/kh-orchestration/verdicts', MESSAGES.guardedPath], ['git commit -m "unbalanced', MESSAGES.unsplittable],
-  // abbreviated --no-verify: six characters or more
-  ['git commit --no-ver', MESSAGES.noVerify], ['git commit --no-v', MESSAGES.noVerify], ['git merge --no-verif x', MESSAGES.noVerify], ['git pull --no-verify', MESSAGES.noVerify],
-  ['git ci --no-verify', MESSAGES.noVerify],
-  // git by basename, behind wrappers, with global options
-  ['/usr/bin/git commit -n', MESSAGES.noVerify], ['command git commit -n', MESSAGES.noVerify], ['sudo -u me git commit -n', MESSAGES.noVerify],
-  ['nice -n 5 git commit -n', MESSAGES.noVerify], ['time git commit -n', MESSAGES.noVerify], ['exec git commit -n', MESSAGES.noVerify],
-  ['nohup git commit -n', MESSAGES.noVerify], ['timeout 5 git commit -n', MESSAGES.noVerify], ['timeout -k 1 -s KILL 5 git commit -n', MESSAGES.noVerify],
-  ['env -i -u HOME PATH=/bin git commit -n', MESSAGES.noVerify], ['X=1 Y=2 git commit -n', MESSAGES.noVerify],
-  ['git -C sub commit -n', MESSAGES.noVerify], ['git --git-dir=.git --work-tree=. commit -n', MESSAGES.noVerify], ['git --git-dir .git -p --no-pager commit -n', MESSAGES.noVerify],
-  ['git --namespace x --exec-path=/x commit --no-verify', MESSAGES.noVerify], ['echo x | xargs git commit -m', MESSAGES.xargs], ['xargs -0 git commit', MESSAGES.xargs],
-  // commit's short options
-  ['git commit -nm x', MESSAGES.noVerify], ['git commit -a -n', MESSAGES.noVerify], ['git commit -vn', MESSAGES.noVerify], ['git commit -m x -n', MESSAGES.noVerify],
-  // hooksPath, alias, GIT_CONFIG_*
-  ['git --config-env=core.hooksPath=H commit', MESSAGES.hooksPath], ['git config --unset core.HOOKSPATH', MESSAGES.hooksPath], ['echo hookspath', MESSAGES.hooksPath],
-  ['git config --get core.hooksPath x', MESSAGES.hooksPath], ['sudo git config --get core.hooksPath', MESSAGES.hooksPath],
-  ['git -c alias.ci=commit ci', MESSAGES.alias], ['git config alias.ci "commit -n"', MESSAGES.alias], ['git config --global alias.x y', MESSAGES.alias],
-  ['git config set alias.x y', MESSAGES.alias], ['git --config-env=alias.x=E x', MESSAGES.alias],
-  ['GIT_CONFIG_COUNT=1 git status', MESSAGES.gitConfigEnv], ['env GIT_CONFIG_GLOBAL=/x git commit', MESSAGES.gitConfigEnv], ['export GIT_CONFIG_PARAMETERS=x', MESSAGES.gitConfigEnv],
-  ['git_config_count=1 git status', MESSAGES.gitConfigEnv],
-  // the guarded paths
-  ['cp a .git/hooks/', MESSAGES.guardedPath], ['cat x > .git/hooks/pre-commit', MESSAGES.guardedPath], ['ls .git/hooks >> .git/kh-orchestration/x', MESSAGES.guardedPath],
-  ['find .git/hooks -delete', MESSAGES.guardedPath], ['git add .git/hooks', MESSAGES.guardedPath], ['rm .GIT/HOOKS/pre-commit', MESSAGES.guardedPath],
-  ['rm .gi?/hooks/pre-commit', MESSAGES.guardedPath], ['rm .g*/h*/pre-commit', MESSAGES.guardedPath], ['rm .gi[t]/hooks/pre-commit', MESSAGES.guardedPath],
-  ['rm {.git,x}/hooks/pre-commit', MESSAGES.guardedPath], ['rm -rf .git/kh-orchestration', MESSAGES.guardedPath], ['rm -rf ../main/.git/worktrees/../kh-orchestration/', MESSAGES.guardedPath],
+  [`${KO} approve`, MESSAGES.ownerOnly('approve')], ['echo x > .git/hooks/pre-commit', MESSAGES.guardedPath], ['rm -rf .git/kh-orchestration/verdicts', MESSAGES.guardedPath],
+
+  // words: wrappers, env in every form, git by basename and as git-<sub>, zsh's = and {
+  ['env - git commit -n -m x', MESSAGES.noVerify], ['env - PATH=/usr/bin git commit -n -m x', MESSAGES.noVerify], ['env -a x git commit -n -m x', MESSAGES.noVerify],
+  ['env --argv0 x git commit -n -m x', MESSAGES.noVerify], ['env --argv0=x git commit -n', MESSAGES.noVerify], ['env -S "git commit" -n -m x', MESSAGES.noVerify],
+  ["env -S 'git commit -n'", MESSAGES.noVerify], ['env "-S git commit -n"', MESSAGES.noVerify], ['env -iS "git commit -n"', MESSAGES.noVerify],
+  ['env --split-string="git commit -n"', MESSAGES.noVerify], ['env -C . -u X -i git commit -n', MESSAGES.noVerify], ['env -- git commit -n', MESSAGES.noVerify],
+  ['/usr/bin/git commit -n', MESSAGES.noVerify], ['/usr/lib/git-core/git-commit -n -m x', MESSAGES.noVerify], ['git-commit-tree abc', MESSAGES.commitTree],
+  ['=git commit -n -m x', MESSAGES.noVerify], ['{git commit -n -m x}', MESSAGES.noVerify], ['noglob git commit -n -m x', MESSAGES.noVerify],
+  ['nocorrect git commit -n', MESSAGES.noVerify], ['repeat 1 git commit -n -m x', MESSAGES.noVerify], ['command git commit -n', MESSAGES.noVerify],
+  ['sudo -u me git commit -n', MESSAGES.noVerify], ['sudo -R /x git commit -n', MESSAGES.noVerify], ['sudo --chroot /x git commit -n', MESSAGES.noVerify],
+  ['doas -a style git commit -n', MESSAGES.noVerify], ['ionice -p 1 git commit -n', MESSAGES.noVerify], ['xargs --process-slot-var V git commit -n', MESSAGES.noVerify],
+  ['nice -n 5 git commit -n', MESSAGES.noVerify], ['time -p git commit -n', MESSAGES.noVerify], ['exec -a x git commit -n', MESSAGES.noVerify],
+  ['nohup git commit -n', MESSAGES.noVerify], ['timeout -k 1 -s KILL 5 git commit -n', MESSAGES.noVerify], ['X=1 Y=2 git commit -n', MESSAGES.noVerify],
+  ['git -C sub commit -n', MESSAGES.noVerify], ['git --namespace x -p --no-pager commit -n', MESSAGES.noVerify], ['git --git-dir .git commit -m x', MESSAGES.guardedPath], ['git -C. commit -n', MESSAGES.noVerify],
+  ['echo commit -n -m x | xargs git', MESSAGES.xargs], ['echo commit-tree abc | xargs git', MESSAGES.xargs], ['echo -n | xargs git commit -m x', MESSAGES.xargs],
+  ['echo approve | xargs node .claude/kh-orchestration/scripts/ko.mjs', MESSAGES.xargs],
+
+  // the guarded area: the whole git directory, paths normalised, expansions before /hooks
+  ['chmod -x .git//hooks/pre-commit', MESSAGES.guardedPath], ['chmod -x .git/./hooks/pre-commit', MESSAGES.guardedPath], ['echo x > .git//hooks/pre-commit', MESSAGES.guardedPath],
+  ['chmod -x /abs/repo/.git//hooks/pre-commit', MESSAGES.guardedPath], ['rm .git/x/../hooks/pre-commit', MESSAGES.guardedPath], ['rm ./.git/./kh-orchestration', MESSAGES.guardedPath],
+  ['chmod -x "$(git rev-parse --git-common-dir)/hooks/pre-commit"', MESSAGES.guardedPath], ['touch "$(git rev-parse --git-common-dir)/kh-orchestration/off"', MESSAGES.guardedPath],
+  ['rm $D/hooks/pre-commit', MESSAGES.guardedPath], ['ls .git/hooks/pre-commit | xargs chmod -x', MESSAGES.guardedPath],
+  ['ls -d .git/kh-orchestration | xargs -I{} touch {}/off', MESSAGES.guardedPath], ['ls .git/hooks | while read f; do chmod -x "$f"; done', MESSAGES.guardedPath],
+  ['cat .git/hooks/pre-commit | grep x | xargs rm', MESSAGES.guardedPath], ['cd .git/hooks && chmod -x pre-commit', MESSAGES.guardedPath], ['cd .git && mv kh-orchestration x', MESSAGES.guardedPath],
+  ['pushd .git/hooks', MESSAGES.guardedPath], ["printf '[core]\\n\\thooksPath = /nonexistent\\n' >> .git/config", MESSAGES.guardedPath],
+  ['chmod -x .git/hook{s..s}/pre-commit', MESSAGES.guardedPath], ['mv .git/kh-orchestratio{n..n} /tmp/x', MESSAGES.guardedPath], ['rm .gi{t..t}/hooks/x', MESSAGES.guardedPath],
+  ['find .git -name pre-commit -delete', MESSAGES.guardedPath], ['find .git -name x -exec rm {} +', MESSAGES.guardedPath], ['find .git -fprint /tmp/x', MESSAGES.guardedPath],
+  ['chmod -R a-x .git', MESSAGES.guardedPath], ['cp -r /tmp/h/. .git/', MESSAGES.guardedPath], ['tar xf h.tar -C .git', MESSAGES.guardedPath], ['mv .git .git2', MESSAGES.guardedPath],
+  ['sed -i s/x/y/ .git/config', MESSAGES.guardedPath], ['vim .git/COMMIT_EDITMSG', MESSAGES.guardedPath], ['echo ref > .git/description', MESSAGES.guardedPath],
+  ['rm .GIT/HOOKS/pre-commit', MESSAGES.guardedPath], ['rm .gi?/hooks/pre-commit', MESSAGES.guardedPath], ['rm .g*/h*/pre-commit', MESSAGES.guardedPath],
+  ['rm .gi[t]/hooks/pre-commit', MESSAGES.guardedPath], ['rm {.git,x}/hooks/pre-commit', MESSAGES.guardedPath], ['rm -rf .git/kh-orchestration', MESSAGES.guardedPath],
   ['sudo cat .git/hooks/pre-commit', MESSAGES.guardedPath], ['LESSOPEN="|x" less .git/hooks/pre-commit', MESSAGES.guardedPath], ['rg --pre=x y .git/hooks', MESSAGES.guardedPath],
-  ['tee .git/hooks/pre-commit', MESSAGES.guardedPath], ['H=.git/hooks/pre-commit', MESSAGES.guardedPath], ['cat a 2> .git/hooks/x', MESSAGES.guardedPath],
-  ['ls &> .git/hooks/x', MESSAGES.guardedPath], ['cat a >| .git/hooks/x', MESSAGES.guardedPath], ['cat <> .git/hooks/x', MESSAGES.guardedPath],
-  ['python3 -c "open(\'.git/hooks/pre-commit\', \'w\')"', MESSAGES.guardedPath],
-  // the owner-only commands
-  ...['propose', 'waive', 'exempt', 'off', 'on'].map((command) => [`node .claude/kh-orchestration/scripts/ko.mjs ${command} x`, MESSAGES.ownerOnly(command)]),
+  ['git diff --output=.git/hooks/pre-commit', MESSAGES.guardedPath], ['git grep -O x .git', MESSAGES.guardedPath], ['tee .git/hooks/pre-commit', MESSAGES.guardedPath],
+  ['H=.git/hooks/pre-commit', MESSAGES.guardedPath], ['cat a 2> .git/hooks/x', MESSAGES.guardedPath], ['ls &> .git/hooks/x', MESSAGES.guardedPath],
+  ['cat <> .git/hooks/x', MESSAGES.guardedPath], ['rm -f .git/index.lock .git/hooks/pre-commit', MESSAGES.guardedPath], ['rm -rf .git/index.lock', MESSAGES.guardedPath],
+  ['git add .git/hooks', MESSAGES.guardedPath], ['tar czf /tmp/x.tgz --exclude=.git .', MESSAGES.guardedPath], ['rsync -a --exclude .git/hooks src/ dst/', MESSAGES.guardedPath],
+  ['echo "see .git/hooks/pre-commit" | xargs rm', MESSAGES.guardedPath], ["sudo sh -c 'echo x > .git/hooks/pre-commit'", MESSAGES.guardedPath],
+
+  // git commands
+  ['git commit --no-ver', MESSAGES.noVerify], ['git commit --no-v', MESSAGES.noVerify], ['git merge --no-verif x', MESSAGES.noVerify], ['git pull --no-verify', MESSAGES.noVerify],
+  ['git ci --no-verify', MESSAGES.noVerify], ['git cherry-pick --no-verify x', MESSAGES.noVerify], ['git commit --verify --no-verify -m x', MESSAGES.noVerify],
+  ['git commit -nm x', MESSAGES.noVerify], ['git commit -a -n', MESSAGES.noVerify], ['git commit -vn', MESSAGES.noVerify], ['git commit -m x -n', MESSAGES.noVerify],
+  ['git commit -qn -m x', MESSAGES.noVerify], ['git commit -S -n -m x', MESSAGES.noVerify], ['git commit -C HEAD -n', MESSAGES.noVerify], ['git commit --mess x -n', MESSAGES.noVerify],
+  ['git commit ${X:--n} -m x', MESSAGES.hiddenOption], ['git commit -${X:-n} -m x', MESSAGES.hiddenOption], ['git commit -m x $(printf -- -n)', MESSAGES.hiddenOption],
+  ['git commit `echo -n` -m x', MESSAGES.hiddenOption], ['git commit "$@"', MESSAGES.hiddenOption], ['git merge $FLAGS x', MESSAGES.hiddenOption],
+  ['git commit -m x -{n,q}', MESSAGES.noVerify], ['git commit --no-verif{y,}', MESSAGES.noVerify],
+  ['git -c include.path=/x/evil.cfg commit -m x', MESSAGES.gitConfig], ['git config include.path /x/evil.cfg', MESSAGES.gitConfig],
+  ['git config --local include.path ../evil.cfg', MESSAGES.gitConfig], ['git config includeIf.gitdir:/x.path /y', MESSAGES.gitConfig],
+  ['git config branch.main.mergeOptions "--no-ff --no-verify"', MESSAGES.gitConfig], ['git config branch.main.mergeoptions --no-verify', MESSAGES.gitConfig],
+  ['git -c CORE.HOOKSPATH=/x commit -m x', MESSAGES.gitConfig], ['git -ccore.hooksPath=/x commit -m x', MESSAGES.gitConfig], ['git --config-env=core.hooksPath=X commit', MESSAGES.gitConfig],
+  ['git --config-env core.hooksPath=X commit', MESSAGES.gitConfig], ['git config --unset core.HOOKSPATH', MESSAGES.gitConfig], ['git config --worktree core.hooksPath /x', MESSAGES.gitConfig],
+  ['git config -f x.cfg --add core.hooksPath /x', MESSAGES.gitConfig], ['git config --replace-all core.hooksPath /x', MESSAGES.gitConfig], ['git config core.hooksP""ath /x', MESSAGES.gitConfig],
+  ["git config $'core.hooksPat\\x68' /x", MESSAGES.gitConfig], ['git -c alias.ci=commit ci', MESSAGES.gitConfig], ['git config alias.ci "commit -n"', MESSAGES.gitConfig],
+  ['git config --global alias.x y', MESSAGES.gitConfig], ['git config set alias.x y', MESSAGES.gitConfig], ['git --config-env=alias.x=E x', MESSAGES.gitConfig],
+  ['git config --edit', MESSAGES.gitConfig], ['git config --rename-section x include', MESSAGES.gitConfig],
+  ['HOME=/x git commit -m x', MESSAGES.gitEnv], ['XDG_CONFIG_HOME=/x git commit -m x', MESSAGES.gitEnv], ['env HOME=/x git commit -m x', MESSAGES.gitEnv],
+  ['GIT_CONFIG_COUNT=1 git status', MESSAGES.gitEnv], ['env GIT_CONFIG_GLOBAL=/x git commit', MESSAGES.gitEnv], ['export GIT_CONFIG_PARAMETERS=x', MESSAGES.gitEnv],
+  ['GIT_EXEC_PATH=/tmp/evil git commit -m x', MESSAGES.gitEnv], ['git --exec-path=/tmp/evil commit -m x', MESSAGES.gitEnv],
+
+  // owner-only commands and the session's marks
+  ...['propose', 'waive', 'exempt', 'off', 'on'].map((command) => [`${KO} ${command} x`, MESSAGES.ownerOnly(command)]),
   ['node ./KO.MJS approve', MESSAGES.ownerOnly('approve')], ['cd .claude/kh-orchestration/scripts && node ko.mjs off', MESSAGES.ownerOnly('off')],
-  // when in doubt: what the splitter cannot see into, in a command that mentions git, the paths or ko.mjs
-  ['echo "$(git commit -n', MESSAGES.unsplittable], ["echo 'ko.mjs approve", MESSAGES.unsplittable], ['eval "git commit -n"', MESSAGES.runsCode],
-  ['X="git commit -n"; eval $X', MESSAGES.runsCode], ['trap "git commit -n" EXIT', MESSAGES.runsCode], ['node -e "x(\'git\')"', MESSAGES.runsCode],
-  ['node --eval=git', MESSAGES.runsCode], ['python3 -Bc "import git"', MESSAGES.runsCode], ['perl -ne "print git"', MESSAGES.runsCode],
-  ["awk '{ system(\"git commit -n\") }' f", MESSAGES.runsCode], ['find . -name x -exec git commit -n \;', MESSAGES.runsCode],
-  ['G=git; $G commit -n', MESSAGES.hiddenCommand], ['$(echo git) commit -n', MESSAGES.hiddenCommand], ['G=git; "${G}" commit', MESSAGES.hiddenCommand],
-  ['echo git commit -n | sh', MESSAGES.feedsScript], ['echo x.git | node', MESSAGES.feedsScript], ["printf 'git commit -n' | bash -s", MESSAGES.feedsScript],
-  ['git show HEAD:x.sh | source /dev/stdin', MESSAGES.feedsScript],
-  ["echo 'git commit -n' | bash - x", MESSAGES.feedsScript],
-  // what the splitter does see into: quotes, escapes, separators, groups, substitutions, scripts for a shell
+  ['node .claude/kh-orchestration/scripts/k?.mjs approve', MESSAGES.ownerOnly('approve')], ['node .claude/kh-orchestration/scripts/ko.mj[s] approve', MESSAGES.ownerOnly('approve')],
+  ['node .claude/kh-orchestration/scripts/k*.mjs approve', MESSAGES.ownerOnly('approve')], [`${KO} appro{ve,ve}`, MESSAGES.ownerOnly('approve')],
+  [`${KO} --root . approve`, MESSAGES.ownerOnly('approve')], [`${KO} --json approve`, MESSAGES.ownerOnly('approve')], [`${KO} -- approve`, MESSAGES.ownerOnly('approve')],
+  [`${KO} o[n]`, MESSAGES.ownerOnly('on')], [`node --import ./x.mjs ${KO.slice(5)} waive`, MESSAGES.ownerOnly('waive')], ['./ko.mjs off', MESSAGES.ownerOnly('off')],
+  ['env -u CLAUDECODE node x.mjs', MESSAGES.sessionEnv], ['env -uCLAUDE_CODE_SESSION_ID node x.mjs', MESSAGES.sessionEnv], ['env --unset=CLAUDECODE x', MESSAGES.sessionEnv],
+  ['CLAUDECODE= node x.mjs', MESSAGES.sessionEnv], ['CLAUDE_CODE_SESSION_ID="" node x.mjs', MESSAGES.sessionEnv], ['unset CLAUDECODE CLAUDE_CODE_SESSION_ID', MESSAGES.sessionEnv],
+  ['unset -v CLAUDE_CODE_SESSION_ID', MESSAGES.sessionEnv],
+
+  // structure that cannot be seen: the raw text holds a danger token
+  ['git commit -m "unbalanced -n', MESSAGES.unsplittable], ['echo "$(git commit -n', MESSAGES.unsplittable], ["echo 'ko.mjs approve", MESSAGES.unsplittable],
+  ["echo 'x hooksPath", MESSAGES.unsplittable], ['echo "see .git/hooks', MESSAGES.unsplittable],
+  [`echo ${'$('.repeat(40)}git commit -n${')'.repeat(40)}`, MESSAGES.unsplittable], [`echo ${'${a:-'.repeat(5000)}x hooksPath`, MESSAGES.unsplittable],
+  ['bash <(echo "git commit -n -m x")', MESSAGES.feedsScript], ['source <(echo "git commit -n -m x")', MESSAGES.feedsScript], ['. <(echo "git commit -n")', MESSAGES.feedsScript],
+  ['bash /dev/stdin <<< "git commit -n -m x"', MESSAGES.feedsScript], ['. /dev/stdin <<< "git commit -n"', MESSAGES.feedsScript], ["bash -s <<< 'git commit -n -m x'", MESSAGES.feedsScript],
+  ['bash <<EOF\ngit commit -n\nEOF', MESSAGES.feedsScript], ['bash <<-EOF\n\tgit commit -n\n\tEOF', MESSAGES.feedsScript], ["bash <<< 'git commit -n'", MESSAGES.feedsScript],
+  ["cat <<'E' | bash\ngit commit -n\nE", MESSAGES.feedsScript], ['echo git commit -n | sh', MESSAGES.noVerify], ['echo commit -n | sh', MESSAGES.feedsScript], ["printf 'git commit -n' | bash -s", MESSAGES.feedsScript],
+  ["echo 'git commit -n' | bash - x", MESSAGES.feedsScript], ["echo 'ko.mjs  approve' | sh", MESSAGES.feedsScript], ['python3 - <<EOF\nimport os; os.remove(".git/hooks/pre-commit")\nEOF', MESSAGES.feedsScript],
+  ['node -e "require(\'fs\').rmSync(\'.git/hooks/pre-commit\')"'.replace('require(', 'req' + 'uire('), MESSAGES.runsCode],
+  ['python3 -c "open(\'.git/hooks/pre-commit\', \'w\')"', MESSAGES.runsCode], ["perl -e 'system(\"git commit -n\")'", MESSAGES.runsCode],
+  ["ruby -e 'system(\"git commit -n\")'", MESSAGES.runsCode], ["awk 'BEGIN{system(\"git commit -n\")}'", MESSAGES.runsCode], ['deno eval "x(\'--no-verify\')"', MESSAGES.runsCode],
+  ['node -e "x(\'GIT_CONFIG_COUNT\')"', MESSAGES.runsCode], ['node -e "x(\'include.path\')"', MESSAGES.runsCode], ['node -e "delete process.env.CLAUDECODE"', MESSAGES.runsCode],
+  ['eval "git commit -n -m x"', MESSAGES.runsCode], ['eval "g""it commit -n"', MESSAGES.runsCode], ['trap "git commit -n" EXIT', MESSAGES.runsCode],
+  ['find . -maxdepth 0 -exec git commit -n -m x \;', MESSAGES.noVerify], ['find . -exec sh -c "x commit -n" \;', MESSAGES.runsCode], ['G=git; $G commit -n -m x', MESSAGES.hiddenCommand], ['$(echo git) commit -n', MESSAGES.hiddenCommand],
+
+  // readings beyond the rule set's letter (see the Task 8 fix report)
+  ['rm $(git rev-parse --git-path hooks)/pre-commit', MESSAGES.guardedPath], ['touch $(git rev-parse --git-path kh-orchestration/off)', MESSAGES.guardedPath],
+  ['git rev-parse --git-common-dir | xargs -I{} touch {}/kh-orchestration/off', MESSAGES.guardedPath], ["find . -path '*hooks/pre-commit' -delete", MESSAGES.guardedPath],
+  ["find . -name 'pre-*' -delete", MESSAGES.guardedPath], ['ssh localhost git commit -n', MESSAGES.noVerify], ['strace -f git commit --no-verify', MESSAGES.noVerify],
+  ['npx git commit -n', MESSAGES.noVerify], ['npx node .claude/kh-orchestration/scripts/ko.mjs waive', MESSAGES.ownerOnly('waive')], ['coproc X { git commit -n; }', MESSAGES.noVerify],
+  ["sh -c '\"$@\"' _ git commit -n", MESSAGES.noVerify], ['if true { git commit -n -m x }', MESSAGES.noVerify], ["alias gc='git commit -n'; gc", MESSAGES.runsCode],
+  [`${KO} "$X" approve`, MESSAGES.ownerOnly('approve')], ['chmod -x .git/h(o)oks/pre-commit', MESSAGES.unsplittable],
+  ["busybox sh -c 'git commit -n'", MESSAGES.noVerify], ["su -c 'git commit -n'", MESSAGES.noVerify], ["script -c 'git commit -n' /dev/null", MESSAGES.noVerify], ['chmod -x .git/(hooks|x)/pre-commit', MESSAGES.unsplittable],
+
+  // the splitter: quotes, escapes, separators, groups, functions, case arms, substitutions, shells
   ['git commit --no-"verify"', MESSAGES.noVerify], ['git commit --no-ver\\ify', MESSAGES.noVerify], ["git commit $'--no-verify'", MESSAGES.noVerify],
   ["git commit $'\\x2dn'", MESSAGES.noVerify], ["git commit $'\\055n'", MESSAGES.noVerify], ["g''it commit -n", MESSAGES.noVerify], ['g"i"t commit -n', MESSAGES.noVerify],
-  ['echo ok;git commit -n', MESSAGES.noVerify], ['true&&git commit -n', MESSAGES.noVerify], ['false||git commit -n', MESSAGES.noVerify],
-  ['x|git commit -n', MESSAGES.noVerify], ['x|&git commit -n', MESSAGES.noVerify], ['sleep 1 & git commit -n', MESSAGES.noVerify], ['echo a\ngit commit -n', MESSAGES.noVerify],
-  ['(git commit -n)', MESSAGES.noVerify], ['{ git commit -n; }', MESSAGES.noVerify], ['if true; then git commit -n; fi', MESSAGES.noVerify],
-  ['while x; do git commit -n; done', MESSAGES.noVerify], ['! git commit -n', MESSAGES.noVerify], ['echo $(git commit -n)', MESSAGES.noVerify],
-  ['echo `git commit -n`', MESSAGES.noVerify], ['echo "$(git commit -n)"', MESSAGES.noVerify], ['echo "`git commit -n`"', MESSAGES.noVerify],
+  ['git com\\\nmit -n', MESSAGES.noVerify], ['git commit \\\n  -n', MESSAGES.noVerify], ['echo ok;git commit -n', MESSAGES.noVerify], ['true&&git commit -n', MESSAGES.noVerify],
+  ['false||git commit -n', MESSAGES.noVerify], ['x|git commit -n', MESSAGES.noVerify], ['x|&git commit -n', MESSAGES.noVerify], ['sleep 1 & git commit -n', MESSAGES.noVerify],
+  ['echo a\ngit commit -n', MESSAGES.noVerify], ['(git commit -n)', MESSAGES.noVerify], ['{ git commit -n; }', MESSAGES.noVerify], ['if true; then git commit -n; fi', MESSAGES.noVerify],
+  ['while x; do git commit -n; done', MESSAGES.noVerify], ['! git commit -n', MESSAGES.noVerify], ['f() { git commit -n; }; f', MESSAGES.noVerify],
+  ['function f { git commit -n; }', MESSAGES.noVerify], ['function f() { git commit -n; }', MESSAGES.noVerify], ['coproc git commit -n', MESSAGES.noVerify],
+  ['case x in x) git commit -n;; esac', MESSAGES.noVerify], ['case x in (x) echo; git commit -n;; esac', MESSAGES.noVerify],
+  ['case $y in a|b) true;; *) git commit -n;; esac', MESSAGES.noVerify], ['case x in\n  x)\n    git commit -n\n    ;;\nesac', MESSAGES.noVerify],
+  ['echo $(git commit -n)', MESSAGES.noVerify], ['echo `git commit -n`', MESSAGES.noVerify], ['echo "$(git commit -n)"', MESSAGES.noVerify],
   ['cat <(git commit -n)', MESSAGES.noVerify], ['echo $(echo $(git commit -n))', MESSAGES.noVerify], ['echo ${X:-$(git commit -n)}', MESSAGES.noVerify],
-  ['git commit -m "$(cat <<\'EOF\'\nmsg\nEOF\n)" --no-verify', MESSAGES.noVerify], ['git commit \\\n  -n', MESSAGES.noVerify],
-  ['git commit -{n,m}', MESSAGES.noVerify], ['git commit --no-verif{y,}', MESSAGES.noVerify],
+  ['cat <<EOF\n$(git commit -n)\nEOF', MESSAGES.noVerify], ['x=(a $(git commit -n))', MESSAGES.noVerify],
+  ['git commit -m "$(cat <<\'EOF\'\nmsg\nEOF\n)" --no-verify', MESSAGES.noVerify],
   ["bash -c 'git commit -n'", MESSAGES.noVerify], ["sh -ec 'git commit -n'", MESSAGES.noVerify], ["bash -o pipefail -c 'git commit -n'", MESSAGES.noVerify],
-  ["sudo sh -c 'echo x > .git/hooks/pre-commit'", MESSAGES.guardedPath], ["env -S 'git commit -n'", MESSAGES.noVerify], ['xargs sh -c "git commit -n"', MESSAGES.noVerify],
-  ['bash <<EOF\ngit commit -n\nEOF', MESSAGES.noVerify], ['bash <<-EOF\n\tgit commit -n\n\tEOF', MESSAGES.noVerify], ["bash <<< 'git commit -n'", MESSAGES.noVerify],
-  ['cat <<EOF\n$(git commit -n)\nEOF', MESSAGES.noVerify], ["bash -c 'bash -c \"git commit -n\"'", MESSAGES.noVerify],
-  ['function f { git commit -n; }', MESSAGES.noVerify], ['coproc git commit -n', MESSAGES.noVerify], ['deno eval "git"', MESSAGES.runsCode],
-  [`echo ${'$('.repeat(40)}git${')'.repeat(40)}`, MESSAGES.unsplittable],
+  ["bash -c -- 'git commit -n'", MESSAGES.noVerify], ['xargs sh -c "git commit -n"', MESSAGES.noVerify], ["bash -c 'bash -c \"git commit -n\"'", MESSAGES.noVerify],
 ];
 
 const ALLOWED = [
-  // the brief
-  'git commit -m "fix -n flag"', 'git commit -m "--no-verify is banned"', 'git merge -n x', 'git log -n 5',
-  'node .claude/kh-orchestration/scripts/ko.mjs run', 'ls .git/hooks',
-  // near misses
+  // the brief's rows, and the rows the old rules blocked that the review found everyday
+  'git commit -m "fix -n flag"', 'git commit -m "--no-verify is banned"', 'git merge -n x', 'git log -n 5', `${KO} run`, 'ls .git/hooks',
+  'git commit -m "docs: say core.hooksPath conflicts are reported"', 'git commit -m "fix(extension): block writes to .git/hooks"',
+  'git commit -m "feat: the gate lives in .git/kh-orchestration/bin"',
+  'git commit -m "$(cat <<\'EOF\'\nfeat(x): something is now true\n\nBody mentions git commit --no-verify and -n and .git/hooks/pre-commit.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)"',
+  'git tag -a v1 -m "release: gate lives in .git/hooks"', 'gh pr create --title x --body "the hooks in .git/hooks/pre-commit run the gate"',
+  'gh pr create --body="see .git/hooks" --title=".git/kh-orchestration"', 'git stash push -m "wip: before touching hooksPath handling"', 'git notes add -m ".git/hooks"',
+  'grep -n hooksPath docs/design.md', 'rg hooksPath docs/', 'git grep -n hooksPath', 'git log --grep="hooksPath" --oneline', 'git log -S"--no-verify" --oneline',
+  'git log -G "\\.git/hooks"', "sed -n '/hooksPath/p' docs/design.md", 'node --test --test-name-pattern="hooksPath" scripts/lib/',
+  'node --test --test-name-pattern "git commit -n" scripts/lib/', 'git checkout -b fix/hooksPath-report', 'git branch -m fix/hookspath-conflict',
+  'echo "see .git/hooks/pre-commit"', 'printf "%s\\n" .git/hooks/pre-commit', 'git log --oneline -- .git/hooks', 'jq . .git/kh-orchestration/verdicts/x.json',
+  "find .git/kh-orchestration -name '*.json'", 'node -e "console.log(require(\'child_process\').execSync(\'git status\').toString())"'.replace('require(', 'req' + 'uire('),
+  'python3 -c "import subprocess; print(subprocess.run([\'git\',\'status\']))"', "python3 - <<'EOF'\nimport subprocess\nprint(subprocess.check_output(['git','status']))\nEOF",
+  "awk '/git/ {print}' README.md", "find . -name '*.mjs' -exec grep -l git {} +", 'f() { git status; }; f',
+  'case "$(git rev-parse --abbrev-ref HEAD)" in main) echo m;; esac', 'git push --no-verify', 'git rebase --no-verify main', 'git fetch --no-verify', 'git am --no-verify x.patch',
+  'wc -l assets/scripts/ko.mjs on off', 'git config core.hooksPath', 'git config --show-origin --get core.hooksPath', 'git config --get core.hooksPath x',
+  'git config --get-all include.path', 'git config --list', 'git config -l | grep -i hooks', 'git config get alias.ci', 'git config alias.ci',
+  'rm -f .git/index.lock', 'rm -f ./.git/index.lock', 'cat .git/HEAD', 'ls .git', `${KO} unexempt old-branch`, `${KO} status`, `${KO} verify-branch --no-run`,
+  `${KO} run approve`, 'echo hookspath', 'grep -rn "\\.git/hooks" docs/',
+
+  // near misses of the blocked rows
   'git commit --no-e', 'git commit --no-edit', 'git commit -m -n', 'git commit -- -n', 'git commit -uno', 'git commit -amn', 'git commit -C HEAD',
-  'git commit -F msg.txt', 'git commit --message --no-verify', 'git merge --no-verify-signatures x', 'git merge --no-stat x', 'git log --no-merges',
-  '/usr/bin/gitk commit -n', 'legit commit -n', 'echo git commit -n', 'echo "git commit --no-verify"', 'git -C commit log -n 1', 'git status',
-  'git config --get core.hooksPath', 'git config --get alias.ci', 'git config --get user.name', 'git config user.name x', 'GIT_PAGER=cat git log',
-  'MY_GIT_CONFIG_X=1 ls', 'ls .git/hooks', 'cat .git/hooks/pre-commit', 'grep -rn x .git/kh-orchestration', 'cat .git/hooks/pre-commit > /tmp/copy',
-  'head -n 3 .git/hooks/pre-commit 2>/dev/null', 'test -f .git/hooks/pre-commit', '[ -x .git/hooks/pre-merge-commit ]', 'stat .git/kh-orchestration/approvals.json',
-  'diff .git/hooks/pre-commit x', 'wc -l < .git/kh-orchestration/journal.jsonl', 'ls src/hooks', 'rm -rf src/hooks', 'cat .github/hooks/x > y',
-  'node .claude/kh-orchestration/scripts/ko.mjs status', 'node .claude/kh-orchestration/scripts/ko.mjs verify-branch', 'node ko.mjs', 'cat ko.mjs.approve',
-  'echo "unbalanced', "echo 'it''s", 'eval "ls"', "bash -c 'ls -la'", 'node -e "1"', 'node scripts/x.mjs', 'python3 -c "print(1)"', 'echo x | sh -c "cat"',
-  'cat <<EOF\ngit commit -n and .git/hooks\nEOF', "cat <<'EOF'\n$(git commit -n)\nEOF", 'git commit -m "$(cat <<\'EOF\'\nfix -n and --no-verify\nEOF\n)"',
-  'git commit -m x # --no-verify', 'git commit -m x \\#--no-verify', 'echo $(git status)', 'find . -name "*.js"', 'npm test', 'ls | wc -l', 'cat "a > .git/hooks"', "grep ' > .git/hooks/x' f",
-  'echo a#b', '', '   ', '# git commit -n',
-  // the code an interpreter is given is what must mention git, not the rest of the line
+  'git commit -F msg.txt', 'git commit --message --no-verify', 'git merge --no-verify-signatures x', 'git merge --no-stat x', 'git log --no-merges', 'git fetch -n',
+  'git clean -n', 'git cherry-pick -n abc', 'git commit -m "$MSG"', 'git commit -F "$F"', 'git commit -m "$(date)"', '/usr/bin/gitk commit -n', 'legit commit -n',
+  'echo git commit -n', 'echo "git commit --no-verify"', 'git -C commit log -n 1', 'git status', 'git config user.name x', 'git config --get user.name',
+  'git config branch.main.remote origin', 'GIT_PAGER=cat git log', 'GIT_OPTIONAL_LOCKS=0 git status', 'GIT_EDITOR=true git rebase --continue',
+  'MY_GIT_CONFIG_X=1 ls', 'HOME=/tmp npm test', 'CLAUDECODE=1 node x.mjs', 'env -u FOO node x.mjs', 'unset FOO',
+  'cat .git/hooks/pre-commit', 'grep -rn x .git/kh-orchestration', 'cat .git/hooks/pre-commit > /tmp/copy', 'head -n 3 .git/hooks/pre-commit 2>/dev/null',
+  'test -f .git/hooks/pre-commit', '[ -x .git/hooks/pre-merge-commit ]', 'stat .git/kh-orchestration/approvals.json', 'diff .git/hooks/pre-commit x',
+  'wc -l < .git/kh-orchestration/journal.jsonl', 'ls .git/hooks | wc -l', 'cat .git/kh-orchestration/journal.jsonl | tail -5 | jq .', 'git show HEAD:.git/hooks',
+  'git -C .git/hooks status', 'ls src/hooks', 'rm -rf src/hooks', 'cat .github/hooks/x > y', 'rm .gitignore', 'rm -rf ./*', 'ls "$(git rev-parse --git-common-dir)/hooks"',
+  'cat "$(git rev-parse --git-common-dir)/hooks/pre-commit"', 'rm -rf $ROOT/.claude/kh-orchestration/x', 'rm "$X/src/hooks/a"', 'cd "$(git rev-parse --show-toplevel)" && npm test',
+  'node ko.mjs', 'cat ko.mjs.approve', 'node --test assets/scripts/ko.mjs.test.mjs', 'grep -c approve assets/scripts/ko.mjs',
+  'echo "unbalanced', "echo 'it''s", 'git commit -m "unbalanced', 'eval "ls"', "bash -c 'ls -la'", 'node -e "1"', 'node scripts/x.mjs', 'python3 -c "print(1)"',
+  'echo x | sh -c "cat"', 'cat <<EOF\ngit commit -n and .git/hooks\nEOF', "cat <<'EOF'\n$(git commit -n)\nEOF", 'cat > docs/notes.md <<\'EOF\'\nNever --no-verify; hooks are in .git/hooks.\nEOF',
+  'git commit -m x # --no-verify', 'git commit -m x \\#--no-verify', 'echo $(git status)', 'find . -name "*.js"', 'npm test', 'ls | wc -l', 'echo a#b', '', '   ', '# git commit -n',
   "git log --format=%H | awk '{print $1}'", 'git ls-files | xargs grep -l foo', 'git show HEAD:package.json | node -e "process.stdin.pipe(process.stdout)"',
-  'git diff | python3 -m json.tool', "git log | perl -ne 'print if /x/'",
+  'git diff | python3 -m json.tool', "git log | perl -ne 'print if /x/'", 'echo x.git | node', 'X="git commit -n"; eval $X', 'case "$x" in a) echo a;; esac',
+  "find . -name '*.orig' -delete", 'which git', 'brew install git', 'alias ll="ls -la"', 'git rev-parse --git-common-dir | cat', 'ls "$(git rev-parse --git-dir)"',
+  'for f in $(git ls-files); do node --check "$f"; done', 'if git diff --quiet; then echo clean; fi', 'echo $((1 + 2))', 'x=$(git status --porcelain)',
 ];
 
+// One line per row the rules answer otherwise, so a failure names every such row at once.
+function mismatches(rows) {
+  return rows.flatMap(([command, expected]) => {
+    const got = bash(command);
+    return isDeepStrictEqual(got, expected) ? [] : [`${JSON.stringify(command).slice(0, 120)} -> ${got.decision}${got.message ? `: ${got.message.slice(0, 50)}` : ''}`];
+  });
+}
+
 test('the Bash table: each blocked command is blocked with its message', () => {
-  for (const [command, message] of BLOCKED) assert.deepEqual(bash(command), blocked(message), JSON.stringify(command));
+  assert.deepEqual(mismatches(BLOCKED.map(([command, message]) => [command, blocked(message)])), []);
 });
 
 test('the Bash table: each allowed command is allowed', () => {
-  for (const command of ALLOWED) assert.deepEqual(bash(command), ALLOW, JSON.stringify(command));
+  assert.deepEqual(mismatches(ALLOWED.map((command) => [command, ALLOW])), []);
 });
 
-test('a command naming the resolved shared git directory is judged as one naming .git/hooks, from any worktree', () => {
+// fixtures/extension/corpus.txt: every command of the Task 8 review's probe lists (everyday.txt,
+// attack.txt, a2.txt to a6.txt), each under the answer the replaced rule set gives it. The
+// answers were read one by one against that rule set; an allowed attack is a stated limit.
+test('the review\'s everyday and attack corpora get the answers recorded beside them', () => {
+  const rows = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'extension', 'corpus.txt'), 'utf8').replace(/\n$/, '').split('\n=====\n')
+    .map((entry) => {
+      const [verdict, ...rest] = entry.replace(/^\n/, '').split('\n');
+      return [rest.join('\n'), verdict];
+    });
+  assert.ok(rows.length > 500, `${rows.length} rows`);
+  const wrong = rows.filter(([command, verdict]) => bash(command).decision !== verdict).map(([command, verdict]) => `${verdict}: ${JSON.stringify(command).slice(0, 100)}`);
+  assert.deepEqual(wrong, []);
+});
+
+test('a command naming the resolved shared git directory is judged as one naming .git, from any worktree', () => {
   const repo = repoFor({ 'a.txt': 'x\n' });
   const separate = realpathSync(mkdtempSync(join(tmpdir(), 'ko-gitdir-')));
   repos.push({ cleanup: () => rmSync(separate, { recursive: true, force: true }) });
@@ -367,18 +467,46 @@ test('a command naming the resolved shared git directory is judged as one naming
   const worktree = repo.addWorktree('feature');
   for (const cwd of [repo.root, worktree]) {
     assert.deepEqual(bash(`rm ${moved}/hooks/pre-commit`, cwd), blocked(MESSAGES.guardedPath), cwd);
+    assert.deepEqual(bash(`rm ${moved}//objects/x`, cwd), blocked(MESSAGES.guardedPath), cwd);
     assert.deepEqual(bash(`echo x > ${moved.toUpperCase()}/KH-ORCHESTRATION/approvals.json`, cwd), blocked(MESSAGES.guardedPath), cwd);
     assert.deepEqual(bash(`cat ${moved}/hooks/pre-commit`, cwd), ALLOW, cwd);
-    assert.deepEqual(bash(`rm ${moved}/objects/x`, cwd), ALLOW, cwd);
+    assert.deepEqual(bash(`rm ${separate}/other`, cwd), ALLOW, cwd);
   }
+  assert.deepEqual(bash('touch kh-orchestration/off', moved), blocked(MESSAGES.gitDirCwd), 'a separate git directory as cwd, found through the project');
 });
 
-test('a Bash command that mentions hooks from a repository whose .git cannot be read is blocked with fixed text', () => {
+test('with cwd inside a git directory only reading commands run, and cd into one is blocked', () => {
+  const repo = repoFor({ 'a.txt': 'x\n' });
+  const worktree = repo.addWorktree('wt');
+  const common = join(repo.root, '.git');
+  for (const cwd of [common, join(common, 'hooks'), join(common, 'worktrees', 'wt')]) {
+    for (const command of ['touch kh-orchestration/off', 'chmod -x hooks/pre-commit', 'chmod -x pre-commit', 'rm -rf x', 'node x.mjs', 'ls > x', 'ls | xargs rm']) {
+      assert.deepEqual(bash(command, cwd), blocked(MESSAGES.gitDirCwd), `${command} in ${cwd}`);
+    }
+    for (const command of ['ls', 'cat HEAD', 'ls -la hooks', 'git log -1', 'grep -r x .', 'cat config | grep core']) assert.deepEqual(bash(command, cwd), ALLOW, `${command} in ${cwd}`);
+  }
+  assert.deepEqual(bash('touch x', worktree), ALLOW);
+  assert.deepEqual(bash('cd .git', repo.root), blocked(MESSAGES.guardedPath));
+});
+
+test('a Bash command naming an absolute path from a repository whose .git cannot be read is blocked with fixed text', () => {
   const repo = repoFor({ 'a.txt': 'x\n' });
   const worktree = repo.addWorktree('broken');
   writeFileSync(join(worktree, '.git'), 'not a gitdir line\n');
-  assert.deepEqual(bash('rm src/hooks/x', worktree), blocked(MESSAGES.stateUnreadable));
+  assert.deepEqual(bash(`rm ${worktree}/a.txt`, worktree), blocked(MESSAGES.stateUnreadable));
+  assert.deepEqual(bash('rm a.txt', worktree), ALLOW);
   assert.deepEqual(bash('npm test', worktree), ALLOW);
+});
+
+test('a cwd or a project directory over 4,096 characters blocks a judged tool at once, and an unjudged tool is still allowed', () => {
+  const long = `/${'a/'.repeat(40_000)}`;
+  for (const [tool, input] of [['Bash', { command: 'ls /x/hooks' }], ['Edit', { file_path: 'x' }], ['Write', { file_path: '/tmp/x' }]]) {
+    const started = performance.now();
+    assert.deepEqual(call(tool, input, long), blocked(MESSAGES.pathTooLong), tool);
+    assert.ok(performance.now() - started < 50, tool);
+  }
+  assert.deepEqual(call('Read', { file_path: 'x' }, long), ALLOW);
+  assert.deepEqual(call('Edit', { file_path: `/${'b'.repeat(4097)}` }, '/'), blocked(MESSAGES.pathTooLong));
 });
 
 test('splitWords: one entry per simple command, with assignments, words, redirections and here-document bodies apart', () => {
@@ -402,6 +530,29 @@ test('splitWords: one entry per simple command, with assignments, words, redirec
   assert.deepEqual(splitWords(''), []);
   for (const unbalanced of ['echo "a', "echo 'a", 'echo $(a', 'echo `a', 'echo a)', 'echo >', 'echo ${a', "echo $'a"]) {
     assert.equal(splitWords(unbalanced), null, unbalanced);
+  }
+});
+
+test('splitWords reads function bodies and case arms as commands, and a non-string as null', () => {
+  const words = (command) => {
+    const split = splitWords(command);
+    return split === null ? null : split.map((entry) => entry.words);
+  };
+  assert.deepEqual(words('f() { git status; }; f'), [['{', 'git', 'status'], ['}'], ['f']]);
+  assert.deepEqual(words('function g() { a; }'), [['function', '{', 'a'], ['}']]);
+  assert.deepEqual(words('case "$(b)" in x|y) c;; (z) d ;& *) e;;& esac; f'), [['b'], ['c'], ['d'], ['e'], ['f']]);
+  assert.deepEqual(words('case x in\n a)\n  b\n  ;;\n esac\nc'), [['b'], ['c']]);
+  assert.deepEqual(words('case x in a) b'), null);
+  for (const value of [undefined, null, 1, {}, ['ls']]) assert.equal(splitWords(value), null);
+});
+
+test('nesting deeper than the splitter counts is null from splitWords and never a throw, in every construct that nests', () => {
+  for (const unit of ['${a:-', '"${a:-', '$(', '"$(', '<(', '${a:-"', '$((', 'x=(', '$(echo "$(', '${a:-`echo ']) {
+    const command = `echo ${unit.repeat(5000)}`;
+    const started = performance.now();
+    assert.equal(splitWords(command), null, unit);
+    assert.ok(['allow', 'block'].includes(bash(command).decision), unit);
+    assert.ok(performance.now() - started < 200, unit);
   }
 });
 
@@ -430,9 +581,25 @@ test('an edit of a protected file is blocked by every edit tool; RULES.md and ot
     for (const path of ['.claude/kh-orchestration/officers.json', '.claude/scripts/dispatch-pre-tool.mjs', '.claude/settings.json', 'tools/check.mjs', 'config/a.yml', '.claude/kh-harness/extensions.json', '.claude/kh-orchestration/scripts/new.mjs']) {
       assert.deepEqual(edit(join(repo.root, path), repo.root, tool), blocked(MESSAGES.protectedEdit), `${tool} ${path}`);
     }
-    for (const path of ['docs/harness/RULES.md', 'src/app.js', 'src/new/file.js', 'tools/other.mjs', '.claude/settings.local.json']) {
+    for (const path of ['docs/harness/RULES.md', 'src/app.js', 'src/new/file.js', 'tools/other.mjs', '.claude/settings.local.json.bak']) {
       assert.deepEqual(edit(join(repo.root, path), repo.root, tool), ALLOW, `${tool} ${path}`);
     }
+  }
+});
+
+test('.claude/settings.local.json is never edited from a session, open for proposals or not, by any path to it', () => {
+  const repo = repoFor(FILES);
+  const target = join(repo.root, '.claude/settings.local.json');
+  writeFileSync(target, '{}\n');
+  symlinkSync(target, join(repo.root, 'local-link.json'));
+  for (const open of [false, true]) {
+    if (open) writeState(repo.root, 'proposals.json', { worktrees: [repo.root] });
+    for (const [tool] of EDIT_TOOLS) {
+      for (const path of [target, '.claude/settings.local.json', join(repo.root, '.CLAUDE/Settings.Local.json'), join(repo.root, 'local-link.json'), join(repo.root, 'src/../.claude/settings.local.json')]) {
+        assert.deepEqual(edit(path, repo.root, tool), blocked(MESSAGES.localSettingsEdit), `${tool} ${path} open=${open}`);
+      }
+    }
+    assert.deepEqual(edit(join(repo.root, '.claude/settings.json'), repo.root), open ? ALLOW : blocked(MESSAGES.protectedEdit));
   }
 });
 
