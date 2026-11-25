@@ -307,7 +307,8 @@ const BLOCKED = [
   ['git diff --output=.git/hooks/pre-commit', MESSAGES.guardedPath], ['git grep -O x .git', MESSAGES.guardedPath], ['tee .git/hooks/pre-commit', MESSAGES.guardedPath],
   ['H=.git/hooks/pre-commit', MESSAGES.guardedPath], ['cat a 2> .git/hooks/x', MESSAGES.guardedPath], ['ls &> .git/hooks/x', MESSAGES.guardedPath],
   ['cat <> .git/hooks/x', MESSAGES.guardedPath], ['rm -f .git/index.lock .git/hooks/pre-commit', MESSAGES.guardedPath], ['rm -rf .git/index.lock', MESSAGES.guardedPath],
-  ['git add .git/hooks', MESSAGES.guardedPath], ['tar czf /tmp/x.tgz --exclude=.git .', MESSAGES.guardedPath], ['rsync -a --exclude .git/hooks src/ dst/', MESSAGES.guardedPath],
+  ['git add .git/hooks', MESSAGES.guardedPath], ['tar czf /tmp/x.tgz .git', MESSAGES.guardedPath], ['rsync -a src/ .git/hooks/', MESSAGES.guardedPath],
+  ['find . -path ./.git -print -delete', MESSAGES.guardedPath], ['zip -r x.zip .git', MESSAGES.guardedPath],
   ['echo "see .git/hooks/pre-commit" | xargs rm', MESSAGES.guardedPath], ["sudo sh -c 'echo x > .git/hooks/pre-commit'", MESSAGES.guardedPath],
 
   // git commands
@@ -316,7 +317,8 @@ const BLOCKED = [
   ['git commit -nm x', MESSAGES.noVerify], ['git commit -a -n', MESSAGES.noVerify], ['git commit -vn', MESSAGES.noVerify], ['git commit -m x -n', MESSAGES.noVerify],
   ['git commit -qn -m x', MESSAGES.noVerify], ['git commit -S -n -m x', MESSAGES.noVerify], ['git commit -C HEAD -n', MESSAGES.noVerify], ['git commit --mess x -n', MESSAGES.noVerify],
   ['git commit ${X:--n} -m x', MESSAGES.hiddenOption], ['git commit -${X:-n} -m x', MESSAGES.hiddenOption], ['git commit -m x $(printf -- -n)', MESSAGES.hiddenOption],
-  ['git commit `echo -n` -m x', MESSAGES.hiddenOption], ['git commit "$@"', MESSAGES.hiddenOption], ['git merge $FLAGS x', MESSAGES.hiddenOption],
+  ['git commit `echo -n` -m x', MESSAGES.hiddenOption], ['git commit "$@"', MESSAGES.hiddenOption], ['git commit $F', MESSAGES.hiddenOption], ['git commit -${X}', MESSAGES.hiddenOption],
+  ['git merge -${X} x', MESSAGES.hiddenOption], ['git pull --${F}', MESSAGES.hiddenOption], ['git merge "-$F" x', MESSAGES.hiddenOption],
   ['git commit -m x -{n,q}', MESSAGES.noVerify], ['git commit --no-verif{y,}', MESSAGES.noVerify],
   ['git -c include.path=/x/evil.cfg commit -m x', MESSAGES.gitConfig], ['git config include.path /x/evil.cfg', MESSAGES.gitConfig],
   ['git config --local include.path ../evil.cfg', MESSAGES.gitConfig], ['git config includeIf.gitdir:/x.path /y', MESSAGES.gitConfig],
@@ -357,6 +359,20 @@ const BLOCKED = [
   ['node -e "x(\'GIT_CONFIG_COUNT\')"', MESSAGES.runsCode], ['node -e "x(\'include.path\')"', MESSAGES.runsCode], ['node -e "delete process.env.CLAUDECODE"', MESSAGES.runsCode],
   ['eval "git commit -n -m x"', MESSAGES.runsCode], ['eval "g""it commit -n"', MESSAGES.runsCode], ['trap "git commit -n" EXIT', MESSAGES.runsCode],
   ['find . -maxdepth 0 -exec git commit -n -m x \;', MESSAGES.noVerify], ['find . -exec sh -c "x commit -n" \;', MESSAGES.runsCode], ['G=git; $G commit -n -m x', MESSAGES.hiddenCommand], ['$(echo git) commit -n', MESSAGES.hiddenCommand],
+
+  // a program that can write files is code: a guarded path inside it blocks
+  ["sed -n 'w .git/hooks/pre-commit' a", MESSAGES.guardedPath], ["sed -n '/re/w .git/hooks/pre-commit' a", MESSAGES.guardedPath],
+  ["sed 's/x/y/w .git/hooks/pre-commit' a", MESSAGES.guardedPath], ["sed -e 's/x/y/w .git/hooks/pre-commit' a", MESSAGES.guardedPath],
+  ["sed --expression='w .git/kh-orchestration/off' a", MESSAGES.guardedPath], ["sed -n '/\\.git\\/hooks/p' docs/x.md", MESSAGES.runsCode],
+  ["sed -n 's/x/y/w '\"$(git rev-parse --git-dir)\"'/hooks/x' a", MESSAGES.guardedPath], ["sed -n 'w $D/hooks/pre-commit' a", MESSAGES.runsCode],
+  ['awk \'{print > ".git/hooks/x"}\' f', MESSAGES.runsCode], ['perl -ne \'open(F,">.git/hooks/pre-commit")\' f', MESSAGES.runsCode],
+  ["ruby -ne 'File.write(\".git/config\", 1)' f", MESSAGES.runsCode],
+
+  // owner-only commands under node, nodejs, bun and deno run
+  ['bun .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['bun run .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
+  ['deno run .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['deno run -A .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
+  ['deno run --config deno.json --allow-read .claude/kh-orchestration/scripts/ko.mjs waive', MESSAGES.ownerOnly('waive')], ['nodejs .claude/kh-orchestration/scripts/ko.mjs off', MESSAGES.ownerOnly('off')],
+  ['npx bun .claude/kh-orchestration/scripts/ko.mjs exempt', MESSAGES.ownerOnly('exempt')],
 
   // readings beyond the rule set's letter (see the Task 8 fix report)
   ['rm $(git rev-parse --git-path hooks)/pre-commit', MESSAGES.guardedPath], ['touch $(git rev-parse --git-path kh-orchestration/off)', MESSAGES.guardedPath],
@@ -424,7 +440,17 @@ const ALLOWED = [
   'git commit -m x # --no-verify', 'git commit -m x \\#--no-verify', 'echo $(git status)', 'find . -name "*.js"', 'npm test', 'ls | wc -l', 'echo a#b', '', '   ', '# git commit -n',
   "git log --format=%H | awk '{print $1}'", 'git ls-files | xargs grep -l foo', 'git show HEAD:package.json | node -e "process.stdin.pipe(process.stdout)"',
   'git diff | python3 -m json.tool', "git log | perl -ne 'print if /x/'", 'echo x.git | node', 'X="git commit -n"; eval $X', 'case "$x" in a) echo a;; esac',
-  "find . -name '*.orig' -delete", 'which git', 'brew install git', 'alias ll="ls -la"', 'git rev-parse --git-common-dir | cat', 'ls "$(git rev-parse --git-dir)"',
+  "find . -name '*.orig' -delete",
+  // a program that names no guarded path stays allowed, whatever words it holds
+  "sed -n '/hooksPath/p' f", "sed -i 's/a/b/' src/x.js", "sed -e 's/--no-verify//' -e 's/commit -n/x/' f", "sed -n '/ko.mjs approve/p' f", "awk '{print $1 > \"out.txt\"}' f",
+  // exclusions are text values
+  'tar czf out.tgz --exclude=.git .', 'rsync -a --exclude .git ./ /tmp/x/', 'rsync -a --exclude .git/hooks src/ dst/', 'grep -rn foo --exclude-dir=.git .',
+  "zip -r x.zip . -x '.git/*'", "zip -r x.zip . -x '.git/*' '*.tmp'", "find . -path ./.git -prune -o -name '*.py' -print", 'rsync -a --exclude-from=.git/info/exclude src/ dst/',
+  'tar -czf x.tgz --exclude-vcs .', "find . -name .git -prune -o -type f -print",
+  // a branch or remote given by a variable
+  'git merge "$BRANCH"', 'git merge $BRANCH', 'git pull "$REMOTE" main', 'git commit -F "$FILE"', 'git commit -m"$MSG"', 'git commit --message="$MSG"',
+  // ko.mjs's reading subcommands under other runtimes
+  'bun .claude/kh-orchestration/scripts/ko.mjs run', 'bun run .claude/kh-orchestration/scripts/ko.mjs status', 'deno run -A .claude/kh-orchestration/scripts/ko.mjs run', 'deno test x.mjs approve', 'which git', 'brew install git', 'alias ll="ls -la"', 'git rev-parse --git-common-dir | cat', 'ls "$(git rev-parse --git-dir)"',
   'for f in $(git ls-files); do node --check "$f"; done', 'if git diff --quiet; then echo clean; fi', 'echo $((1 + 2))', 'x=$(git status --porcelain)',
 ];
 

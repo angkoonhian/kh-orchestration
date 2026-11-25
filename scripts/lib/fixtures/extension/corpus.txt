@@ -373,10 +373,10 @@ timeout 60 npm test 2>&1 | tail -20
 allow
 time git status
 =====
-block
+allow
 tar czf /tmp/x.tgz --exclude=.git .
 =====
-block
+allow
 rsync -a --exclude .git/hooks src/ dst/
 =====
 allow
