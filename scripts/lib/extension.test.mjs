@@ -275,7 +275,7 @@ const BLOCKED = [
   [`${KO} approve`, MESSAGES.ownerOnly('approve')], ['echo x > .git/hooks/pre-commit', MESSAGES.guardedPath], ['rm -rf .git/kh-orchestration/verdicts', MESSAGES.guardedPath],
 
   // words: wrappers, env in every form, git by basename and as git-<sub>, zsh's = and {
-  ['env - git commit -n -m x', MESSAGES.noVerify], ['env - PATH=/usr/bin git commit -n -m x', MESSAGES.noVerify], ['env -a x git commit -n -m x', MESSAGES.noVerify],
+  ['env - git commit -n -m x', MESSAGES.noVerify], ['env - PATH=/usr/bin git commit -n -m x', MESSAGES.gitEnv], ['env -a x git commit -n -m x', MESSAGES.noVerify],
   ['env --argv0 x git commit -n -m x', MESSAGES.noVerify], ['env --argv0=x git commit -n', MESSAGES.noVerify], ['env -S "git commit" -n -m x', MESSAGES.noVerify],
   ["env -S 'git commit -n'", MESSAGES.noVerify], ['env "-S git commit -n"', MESSAGES.noVerify], ['env -iS "git commit -n"', MESSAGES.noVerify],
   ['env --split-string="git commit -n"', MESSAGES.noVerify], ['env -C . -u X -i git commit -n', MESSAGES.noVerify], ['env -- git commit -n', MESSAGES.noVerify],
@@ -330,7 +330,7 @@ const BLOCKED = [
   ["git config $'core.hooksPat\\x68' /x", MESSAGES.gitConfig], ['git -c alias.ci=commit ci', MESSAGES.gitConfig], ['git config alias.ci "commit -n"', MESSAGES.gitConfig],
   ['git config --global alias.x y', MESSAGES.gitConfig], ['git config set alias.x y', MESSAGES.gitConfig], ['git --config-env=alias.x=E x', MESSAGES.gitConfig],
   ['git config --edit', MESSAGES.gitConfig], ['git config --rename-section x include', MESSAGES.gitConfig],
-  ['HOME=/x git commit -m x', MESSAGES.gitEnv], ['XDG_CONFIG_HOME=/x git commit -m x', MESSAGES.gitEnv], ['env HOME=/x git commit -m x', MESSAGES.gitEnv],
+  ['HOME=/x git commit -m x', MESSAGES.gitEnv], ['XDG_CONFIG_HOME=/x git commit -m x', MESSAGES.gitEnv], ['env HOME=/x git commit -m x', MESSAGES.gitEnv], ['PATH=/tmp/f:$PATH git commit -m x', MESSAGES.gitEnv], ['env PATH=/tmp/f git commit -m x', MESSAGES.gitEnv],
   ['GIT_CONFIG_COUNT=1 git status', MESSAGES.gitEnv], ['env GIT_CONFIG_GLOBAL=/x git commit', MESSAGES.gitEnv], ['export GIT_CONFIG_PARAMETERS=x', MESSAGES.gitEnv],
   ['GIT_EXEC_PATH=/tmp/evil git commit -m x', MESSAGES.gitEnv], ['git --exec-path=/tmp/evil commit -m x', MESSAGES.gitEnv],
 
@@ -498,7 +498,7 @@ const ALLOWED = [
   'git clean -n', 'git cherry-pick -n abc', 'git commit -m "$MSG"', 'git commit -F "$F"', 'git commit -m "$(date)"', '/usr/bin/gitk commit -n', 'legit commit -n',
   'echo git commit -n', 'echo "git commit --no-verify"', 'git -C commit log -n 1', 'git status', 'git config user.name x', 'git config --get user.name',
   'git config branch.main.remote origin', 'GIT_PAGER=cat git log', 'GIT_OPTIONAL_LOCKS=0 git status', 'GIT_EDITOR=true git rebase --continue',
-  'MY_GIT_CONFIG_X=1 ls', 'HOME=/tmp npm test', 'CLAUDECODE=1 node x.mjs', 'env -u FOO node x.mjs', 'unset FOO',
+  'MY_GIT_CONFIG_X=1 ls', 'HOME=/tmp npm test', 'PATH="$PATH:./node_modules/.bin" npm test', 'CLAUDECODE=1 node x.mjs', 'env -u FOO node x.mjs', 'unset FOO',
   'cat .git/hooks/pre-commit', 'grep -rn x .git/kh-orchestration', 'cat .git/hooks/pre-commit > /tmp/copy', 'head -n 3 .git/hooks/pre-commit 2>/dev/null',
   'test -f .git/hooks/pre-commit', '[ -x .git/hooks/pre-merge-commit ]', 'stat .git/kh-orchestration/approvals.json', 'diff .git/hooks/pre-commit x',
   'wc -l < .git/kh-orchestration/journal.jsonl', 'ls .git/hooks | wc -l', 'cat .git/kh-orchestration/journal.jsonl | tail -5 | jq .', 'git show HEAD:.git/hooks',
