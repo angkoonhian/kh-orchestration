@@ -19,6 +19,9 @@ export const invalidValueMessage = (name) => `The value for ${name} cannot be wr
 export const invalidVerdictKeyMessage = 'A verdict is named by a full hexadecimal tree id and a full hexadecimal base id or none.';
 export const writeFailedMessage = (name) => `The shared state file ${name} could not be written.`;
 
+// proposals.json is `{ worktrees: [<absolute real path of a worktree root>...] }`, the worktrees
+// open for proposals. The hook extension reads it itself (it cannot import this file): absent,
+// unreadable or of another shape, no worktree is open.
 const STATE_NAMES = new Set(['approvals.json', 'waivers.json', 'exemptions.json', 'proposals.json']);
 // `verdicts/<tree>-<base>.json`: the one sub-path a state name may have (decision 5).
 const OBJECT_ID = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
