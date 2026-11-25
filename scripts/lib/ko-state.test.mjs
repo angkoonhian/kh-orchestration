@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, symlinkSync, readFileSync, readdirSyn
 import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import {
-  StateError, appendJournal, corruptMessage, invalidValueMessage, isOff, readState, stateDir, unknownNameMessage, writeFailedMessage, writeState,
+  StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readState, stateDir, unknownNameMessage, verdictName, writeFailedMessage, writeState,
 } from '../../assets/scripts/ko-state.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -160,5 +160,29 @@ test('appendJournal rejects an entry that does not serialise, and appends nothin
     assert.throws(() => appendJournal(repo.root, undefined), { name: 'StateError', message: invalidValueMessage('journal.jsonl') });
     assert.throws(() => appendJournal(repo.root, { n: 1n }), { name: 'StateError', message: invalidValueMessage('journal.jsonl') });
     assert.equal(readFileSync(join(stateDir(repo.root), 'journal.jsonl'), 'utf8'), '{"event":"first"}\n');
+  });
+});
+
+const TREE = 'a'.repeat(40);
+const BASE = 'b'.repeat(64);
+
+test('verdictName joins a full hexadecimal tree and a full hexadecimal base or none, and refuses anything that could become a path', () => {
+  assert.equal(verdictName(TREE, BASE), `verdicts/${TREE}-${BASE}.json`);
+  assert.equal(verdictName(TREE, 'none'), `verdicts/${TREE}-none.json`);
+  for (const [tree, base] of [['abc', 'none'], [TREE, 'main'], [TREE, ''], ['../x', 'none'], [`${TREE}/..`, 'none'], [TREE.toUpperCase(), 'none'], [TREE, `${BASE}\n`], [TREE, 'none/'], [undefined, 'none'], [TREE, null]]) {
+    assert.throws(() => verdictName(tree, base), { name: 'StateError', message: invalidVerdictKeyMessage });
+  }
+});
+
+test('a verdict file is read and written by state like any other: absent is the fallback, corrupt throws, a write leaves one whole file', () => {
+  withRepo((repo) => {
+    const name = verdictName(TREE, 'none');
+    assert.equal(readState(repo.root, name, null), null);
+    writeState(repo.root, name, { first: 1 });
+    writeState(repo.root, name, { second: 2 });
+    assert.deepEqual(readState(repo.root, name, null), { second: 2 });
+    assert.deepEqual(readdirSync(join(stateDir(repo.root), 'verdicts')), [`${TREE}-none.json`]);
+    writeFileSync(join(stateDir(repo.root), name), '{');
+    assert.throws(() => readState(repo.root, name, null), { name: 'StateError', message: corruptMessage(name) });
   });
 });

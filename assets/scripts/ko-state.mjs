@@ -2,7 +2,7 @@
 // directory from every linked worktree.
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { commonDir } from './ko-git.mjs';
 
 export class StateError extends Error {
@@ -16,9 +16,13 @@ export const corruptMessage = (name) =>
   `The shared state file ${name} is unreadable or is not valid JSON. Restore it from a backup or ask the owner to remove it; nothing proceeds on a state file that cannot be read.`;
 export const unknownNameMessage = (name) => `"${name}" is not the name of a shared state file.`;
 export const invalidValueMessage = (name) => `The value for ${name} cannot be written as JSON.`;
+export const invalidVerdictKeyMessage = 'A verdict is named by a full hexadecimal tree id and a full hexadecimal base id or none.';
 export const writeFailedMessage = (name) => `The shared state file ${name} could not be written.`;
 
 const STATE_NAMES = new Set(['approvals.json', 'waivers.json', 'exemptions.json', 'proposals.json']);
+// `verdicts/<tree>-<base>.json`: the one sub-path a state name may have (decision 5).
+const OBJECT_ID = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
+const VERDICT_NAME = new RegExp(`^verdicts/${OBJECT_ID}-(?:${OBJECT_ID}|none)\\.json$`);
 const OFF_FILE = 'off';
 const JOURNAL_FILE = 'journal.jsonl';
 
@@ -26,8 +30,15 @@ export function stateDir(root) {
   return join(commonDir(root), 'kh-orchestration');
 }
 
+// The state name of the verdict for a tree and a base; both become part of a path, so both are checked.
+export function verdictName(tree, base) {
+  const name = `verdicts/${tree}-${base}.json`;
+  if (typeof tree !== 'string' || typeof base !== 'string' || !VERDICT_NAME.test(name)) throw new StateError(invalidVerdictKeyMessage);
+  return name;
+}
+
 function checkName(name) {
-  if (!STATE_NAMES.has(name)) throw new StateError(unknownNameMessage(name));
+  if (!STATE_NAMES.has(name) && !VERDICT_NAME.test(name)) throw new StateError(unknownNameMessage(name));
 }
 
 // An absent file is the fallback; a file that exists but cannot be read or
@@ -68,12 +79,12 @@ function serialise(name, value, indent) {
 export function writeState(root, name, value) {
   checkName(name);
   const text = serialise(name, value, 2);
-  const dir = stateDir(root);
-  const temporary = join(dir, `${name}.${process.pid}.${randomUUID()}.tmp`);
+  const target = join(stateDir(root), name);
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dirname(target), { recursive: true });
     writeFileSync(temporary, `${text}\n`);
-    renameSync(temporary, join(dir, name));
+    renameSync(temporary, target);
   } catch {
     rmSync(temporary, { force: true });
     throw new StateError(writeFailedMessage(name));

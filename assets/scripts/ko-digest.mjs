@@ -7,7 +7,7 @@ import { parseRegistry, canonicalRegistry, coveredPart } from './ko-registry.mjs
 import { PROTECTED_FILES, PROTECTED_PREFIXES, matchesGlob, readOfficers } from './extension.mjs';
 
 const RULES = 'docs/harness/RULES.md';
-const OFFICERS = '.claude/kh-orchestration/officers.json';
+export const OFFICERS = '.claude/kh-orchestration/officers.json';
 const SYMLINK = '120000';
 const GITLINK = '160000';
 
@@ -47,6 +47,24 @@ function readVerified(root, tree, entry) {
 const ancestorsAndSelf = (path) => path.split('/').map((_, index, segments) => segments.slice(0, index + 1).join('/'));
 
 /**
+ * The text of `officers.json` in a tree, read through the verified read, as
+ * `{ text }`, or `{ problem }` (fixed text) when the file is absent, is not
+ * reached as a plain file (a link at or above it), is not valid UTF-8, or its
+ * bytes do not hash to the object id. `entries` is `listEntries(root, tree)`.
+ */
+export function officersText(root, tree, entries) {
+  const linked = ancestorsAndSelf(OFFICERS).find((path) => entries.some((entry) => entry.path === path && (entry.mode === SYMLINK || entry.mode === GITLINK)));
+  if (linked !== undefined) return { problem: linkMessage(linked) };
+  const entry = entries.find((candidate) => candidate.path === OFFICERS && candidate.type === 'blob');
+  if (entry === undefined) return { problem: officersUnreadableMessage };
+  try {
+    return { text: decode(readVerified(root, tree, entry)) };
+  } catch (error) {
+    return { problem: error instanceof ObjectMismatch ? error.message : officersUnreadableMessage };
+  }
+}
+
+/**
  * `{ digest, paths }` for a tree, or `{ problem }` (fixed text) when the digest
  * cannot be trusted. `tree` must be a full object id. The canonical text is
  * one line `path NUL mode NUL object-id NEWLINE` for each covered file, sorted by path
@@ -72,17 +90,9 @@ function compute(root, tree) {
   const files = new Map(entries.filter((entry) => entry.type === 'blob' && entry.mode !== SYMLINK).map((entry) => [entry.path, entry]));
   const linkPaths = new Set(entries.filter((entry) => entry.mode === SYMLINK || entry.mode === GITLINK).map((entry) => entry.path));
 
-  const linkedOfficers = ancestorsAndSelf(OFFICERS).find((path) => linkPaths.has(path));
-  if (linkedOfficers !== undefined) return { problem: linkMessage(linkedOfficers) };
-  const officersEntry = files.get(OFFICERS);
-  if (officersEntry === undefined) return { problem: officersUnreadableMessage };
-  const officersBytes = readVerified(root, tree, officersEntry);
-  let officers = null;
-  try {
-    officers = readOfficers(decode(officersBytes));
-  } catch {
-    // not UTF-8: officers stays null
-  }
+  const loaded = officersText(root, tree, entries);
+  if (loaded.problem !== undefined) return loaded;
+  const officers = readOfficers(loaded.text);
   if (officers === null) return { problem: officersUnreadableMessage };
 
   const { officerCandidates, protectedGlobs } = officers;
