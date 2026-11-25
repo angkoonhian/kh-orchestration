@@ -25,9 +25,12 @@
 //
 // Stated limits, by design: the commit gate, the digest and verify-branch are
 // the backstop for each of these.
-// - eval, and variables holding flags or paths (`F=--no-verify; git commit $F`
-//   outside commit, merge and pull; `D=.git; cd $D`); a script written to disk
-//   and then run; string concatenation in inline code (`'.gi'+'t/hooks'`).
+// - eval, and variables holding paths (`D=.git; cd $D`) or flags: for commit a
+//   flag in a variable is caught only when the word is wholly the expansion or
+//   its literal text begins with `-` (`git commit x$F` is not), and for merge
+//   and pull a flag held in a plain parameter (`git merge $F`) is not caught;
+//   a script written to disk and then run; string concatenation in inline code
+//   (`'.gi'+'t/hooks'`).
 // - git options that run a command (`rebase -x`, `bisect run`, `submodule
 //   foreach`, `-c core.pager=...`), and an alias already configured.
 // - commits git never hooks: cherry-pick, revert, am, rebase, fast-forward
@@ -41,6 +44,8 @@
 //   unguarded for edits until the digest refuses the commit.
 // - an encoded or otherwise opaque payload piped to an interpreter
 //   (`... | base64 -d | sh`), and sed -f / awk -f script files.
+// - editor scripting (`vim -es -c '!...'`, `ed`, `ex`), `tar
+//   --checkpoint-action=exec=...`, and a copy of ko.mjs under another name.
 // - a shell write to a tracked protected file such as officers.json: only the
 //   edit tools are guarded there, and the digest refuses the commit.
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -1057,16 +1062,21 @@ function resolveCommand(command) {
 const MESSAGE_SUBCOMMANDS = new Set(['commit', 'tag', 'merge', 'stash', 'notes']);
 const SEARCH_SUBCOMMANDS = new Set(['log', 'show', 'shortlog', 'whatchanged', 'rev-list']);
 // Search commands whose pattern is a text value. sed's and awk's programs are not: they can
-// write files (sed's w command and s///w flag, awk's print >), so they are code (see programsOf).
+// write files (sed's w command and s///w flag, awk's print >), so they are code (see sedPrograms
+// and ALWAYS_CODE).
 const PATTERN_COMMANDS = new Set(['grep', 'egrep', 'fgrep', 'rg']);
-// Exclusion options of tar, rsync and grep, whose values are patterns, not paths.
+// Exclusion options, whose values are patterns, not paths, for the commands in EXCLUDING only.
 const EXCLUDE_OPTIONS = ['--exclude', '--exclude-dir', '--exclude-from'];
-// find's name tests, whose pattern is a text value when -prune follows it.
+const EXCLUDING = new Set(['tar', 'rsync', 'grep', 'rg', 'zip', 'du', 'diff', 'find']);
+// find's name tests, whose pattern is a text value in the form `TEST PATTERN -prune -o ...`
+// only, and never with -depth, -d or -delete, which make -prune keep nothing out.
 const FIND_PRUNED = new Set(['-path', '-ipath', '-name', '-iname', '-wholename', '-iwholename']);
 const PATTERN_OPTIONS = new Set(['-e', '--regexp', '--expression', '-f', '--file']);
 
 // The words of `args` that are values of the options named: separate (`--grep x`), after `=`
 // (`--grep=x`), or attached to a short one (`-Sx`, `-am x` for a letter in `shortLetters`).
+const NO_VALUES = new Set();
+
 function optionValues(args, longNames, shortLetters) {
   const values = new Set();
   for (let i = 0; i < args.length; i++) {
@@ -1093,25 +1103,25 @@ function firstOperand(args) {
   return args.find((word) => !word.text.startsWith('-')) ?? null;
 }
 
-const NO_VALUES = new Set();
-
-// The exclusion patterns of a command: --exclude and its kin, zip's -x operands, and find's
-// pattern before -prune.
-function exclusions(resolved) {
+// The exclusion patterns of a command in EXCLUDING whose output goes only to reading commands:
+// --exclude and its kin, zip's -x operands, and find's pattern in `TEST PATTERN -prune -o`.
+function exclusions(resolved, outputReadOnly) {
+  if (!EXCLUDING.has(resolved.name) || !outputReadOnly) return NO_VALUES;
   const args = resolved.words.slice(resolved.index + 1);
   const values = optionValues(args, EXCLUDE_OPTIONS, '');
+  const pruneKeepsOut = !args.some((word) => word.text === '-depth' || word.text === '-d' || word.text === '-delete');
   for (let i = 0; i < args.length; i++) {
     if (resolved.name === 'zip' && (args[i].text === '-x' || args[i].text === '--exclude')) {
       for (let k = i + 1; k < args.length && !args[k].text.startsWith('-'); k++) values.add(args[k]);
     }
-    if (resolved.name === 'find' && FIND_PRUNED.has(args[i].text) && args[i + 2]?.text === '-prune') values.add(args[i + 1]);
+    if (resolved.name === 'find' && pruneKeepsOut && FIND_PRUNED.has(args[i].text) && args[i + 2]?.text === '-prune' && args[i + 3]?.text === '-o') values.add(args[i + 1]);
   }
   return values;
 }
 
 function textValues(resolved, git, outputReadOnly) {
   const values = ownTextValues(resolved, git, outputReadOnly);
-  const excluded = exclusions(resolved);
+  const excluded = exclusions(resolved, outputReadOnly);
   return excluded.size === 0 ? values : new Set([...values, ...excluded]);
 }
 
@@ -1281,10 +1291,12 @@ function guardedWord(word, context) {
 }
 
 // Whether a command's own word only reads: its command word is read-only (git with a
-// read-only subcommand), run directly (no assignment, no wrapper), with none of the options
-// by which such a command writes or runs something.
+// read-only subcommand), run directly (no assignment, no wrapper), with none of the options by
+// which such a command writes or runs something. xargs is the one wrapper allowed, and only for
+// a command that has no such options at all, since xargs can add any word from its input.
 function readsOnly(command, resolved, git) {
-  if (command.assignments.length > 0 || resolved.wrappers.length > 0 || resolved.word === undefined || resolved.word.expands) return false;
+  if (command.assignments.length > 0 || resolved.wrappers.some((name) => name !== 'xargs') || resolved.word === undefined || resolved.word.expands) return false;
+  if (resolved.wrappers.includes('xargs') && (git !== null || Object.hasOwn(WRITING_OPTIONS, resolved.name))) return false;
   const args = resolved.words.slice(resolved.index + 1).map((word) => word.text);
   if (git !== null) return READ_ONLY_GIT.has(git.sub) && !args.some((text) => WRITING_OPTIONS.git.test(text));
   if (!READ_ONLY.has(resolved.name)) return false;
@@ -1431,6 +1443,8 @@ function configChangesHooks(rest) {
 }
 
 const isNoVerify = (text) => text.length >= 6 && '--no-verify'.startsWith(text);
+// The shortest abbreviation git accepts, looked for anywhere in the raw text of a word that holds an expansion.
+const NO_VERIFY_PREFIX = '--no-v';
 
 // Each gated subcommand's options that take a value: short letters, and long names that take
 // the next word when written without `=`.
@@ -1473,23 +1487,31 @@ function literalOf(word) {
   return literal + word.text.slice(at);
 }
 
-// Whether an expansion in an option position could be a flag: for commit, a word that is wholly
-// an expansion or whose literal text begins with `-`; for merge and pull, only the latter, so a
-// branch or remote given as "$BRANCH" is allowed. An option's value is never one.
+// A plain parameter, `$NAME` or `${NAME}`: the one expansion a merge or pull operand may hold.
+const PLAIN_PARAMETER = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})$/;
+
+// Whether an expansion in an option position could be a flag. On commit, merge and pull, a word
+// whose literal text begins with `-`, or that holds anything but plain parameters (a command
+// substitution, backticks, `${NAME<op>...}`, `$@`), may; on commit, so may a word that is wholly
+// an expansion. A branch or remote given as "$BRANCH" or "origin/${BRANCH}" is allowed. An
+// option's value is never one.
 function hidesOption(sub, word) {
   if (!word.expands || expansionIsValue(sub, word)) return false;
   const literal = literalOf(word);
-  return literal.startsWith('-') || (sub === 'commit' && literal === '');
+  if (literal.startsWith('-') || (sub === 'commit' && literal === '')) return true;
+  return word.spans.some(([start, end]) => !PLAIN_PARAMETER.test(word.text.slice(start, end)));
 }
 
-// git commit, merge or pull: --no-verify (or an abbreviation), commit's -n, or a word that may
-// hide a flag (hidesOption), before `--`. Values of options are skipped, never read as flags.
+// git commit, merge or pull: --no-verify (or an abbreviation), a word holding an expansion whose
+// raw text holds one (`${X:---no-verify}`; a literal --no-verify-signatures is no such word), commit's -n, or a word that may hide a flag (hidesOption), before `--`.
+// Values of options are skipped, never read as flags.
 function judgeGated(sub, rest) {
   for (let i = 0; i < rest.length; i++) {
     const word = rest[i];
     const variants = variantsOf(word);
     if (variants === null) refuse(MESSAGES.noVerify);
     if (variants.length === 1 && variants[0] === '--') return;
+    if (word.expands && word.text.includes(NO_VERIFY_PREFIX)) refuse(MESSAGES.noVerify);
     if (hidesOption(sub, word)) refuse(MESSAGES.hiddenOption);
     if (variants.some((text) => gatedOption(sub, text).skips)) refuse(MESSAGES.noVerify);
     if (variants.length === 1 && gatedOption(sub, variants[0]).takesNext) i++;
@@ -1529,9 +1551,6 @@ const OWNER_ONLY = ['approve', 'propose', 'waive', 'exempt', 'off', 'on'];
 const SESSION_NAMES = new Set(['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID']);
 const SESSION_EMPTIED = /^(CLAUDECODE|CLAUDE_CODE_SESSION_ID)=$/;
 // node's options that take the next word, so that its script operand is found.
-// (One string: the self-containment check reads a quoted word after that option's name as an import.)
-const NODE_VALUED = new Set(('-r --require --import --loader --experimental-loader -C --conditions --input-type --env-file --test-name-pattern '
-  + '--test-skip-pattern --test-reporter --test-reporter-destination --inspect-port --title --watch-path --test-concurrency').split(' '));
 
 // Whether a word matches `name` as written, by a brace variant, or as a glob pattern.
 function couldBe(word, name) {
@@ -1544,48 +1563,24 @@ function couldBe(word, name) {
 }
 const basenameWord = (word) => (word.text.includes('/') ? { ...word, text: word.text.slice(word.text.lastIndexOf('/') + 1) } : word);
 
-const BUN_VALUED = new Set(['--cwd', '-r', '--preload', '--config', '-c', '--env-file']);
-const DENO_VALUED = new Set(['--config', '-c', '--import-map', '--lock', '--cert', '--location', '--seed', '-L', '--log-level']);
-// The runtimes a script operand is found under, each with its options that take the next word,
-// and the subcommand word before the script: none for node, an optional `run` for bun, `run`
-// for deno (any other deno subcommand runs no script operand of ours).
-const RUNTIMES = {
-  node: { valued: NODE_VALUED, run: null },
-  nodejs: { valued: NODE_VALUED, run: null },
-  bun: { valued: BUN_VALUED, run: 'optional' },
-  deno: { valued: DENO_VALUED, run: 'required' },
-};
-
-// The script word a command runs: a runtime's script operand, or the command word itself; -1 for none.
-function scriptWord(resolved) {
-  if (!Object.hasOwn(RUNTIMES, resolved.name)) return resolved.index;
-  const { valued, run } = RUNTIMES[resolved.name];
-  let ranSubcommand = run === null;
-  for (let i = resolved.index + 1; i < resolved.words.length; i++) {
-    const text = resolved.words[i].text;
-    if (text.startsWith('-')) {
-      if (valued.has(text)) i++;
-    } else if (!ranSubcommand) {
-      ranSubcommand = true;
-      if (text !== 'run') {
-        if (run === 'required') return -1;
-        return i;
-      }
-    } else {
-      return i;
-    }
-  }
-  return -1;
-}
-
-function judgeOwner(command, resolved) {
+// Owner-only commands, whatever runs ko.mjs (node, bun, deno, tsx, npx, the file itself): in a
+// command whose command word is not read-only, a word that is not a text value and whose
+// basename could be ko.mjs, followed by an owner-only subcommand.
+function judgeOwner(command, resolved, values) {
   const unsets = [...resolved.unsets, ...(resolved.name === 'unset' ? resolved.words.slice(resolved.index + 1).map((word) => word.text) : [])];
   if ([...command.assignments, ...resolved.envAssignments].some((word) => SESSION_EMPTIED.test(word.text)) || unsets.some((name) => SESSION_NAMES.has(name))) refuse(MESSAGES.sessionEnv);
-  const at = scriptWord(resolved);
-  if (at === -1 || resolved.words[at] === undefined || !couldBe(basenameWord(resolved.words[at]), 'ko.mjs')) return;
-  // The subcommand is the first word that is not an option; a word right after an option
-  // may be that option's value, so the word after it is read too. A word holding an expansion
-  // may be an option.
+  if (resolved.word === undefined || READ_ONLY.has(resolved.name)) return;
+  for (let at = 0; at < resolved.words.length; at++) {
+    const word = resolved.words[at];
+    if (!values.has(word) && couldBe(basenameWord(word), 'ko.mjs')) judgeOwnerSubcommand(resolved, at);
+  }
+}
+
+// The words after a ko.mjs at `at`. The subcommand is the first word that is not an option; a
+// word right after an option may be that option's value, so the word after it is read too. A
+// word holding an expansion may be an option. The walk stops at the first word that settles it,
+// so every word is read at most twice whatever the number of ko.mjs words.
+function judgeOwnerSubcommand(resolved, at) {
   let afterOption = false;
   let seen = false;
   for (let i = at + 1; i < resolved.words.length; i++) {
@@ -1617,6 +1612,9 @@ const PATH_TOKENS = [
   /(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\([^)]{0,200}\)|`[^`]{0,200}`)\/+(?:hooks|kh-orchestration)(?![a-z0-9_.-])/i,
 ];
 // (A substitution's inside is read for at most 200 characters, so the scan stays linear.)
+// The path tokens for a sed program, with no left boundary: GNU sed takes a file name straight
+// after w, W, r and R (`w.git/hooks/pre-commit`).
+const SED_PATH_TOKENS = [/\.git\/+(?:hooks|config|kh-orchestration)/i, PATH_TOKENS[1]];
 // Every danger token: the path tokens and the flag and word tokens.
 const DANGER = [
   ...PATH_TOKENS,
@@ -1631,12 +1629,18 @@ const DANGER = [
 // - judgeUnseen: a command word that is a variable or a substitution, that command's raw text;
 //   eval, trap, alias, awk, find -exec* and deno eval, that command's raw text; source or `.`
 //   reading standard input, the command and its here-document bodies; DANGER. A -S string that
-//   cannot be split; DANGER. sed's program operands (every -e value, or the first operand);
-//   PATH_TOKENS only, since a sed pattern legitimately holds words such as hooksPath.
+//   cannot be split; DANGER.
+// - judgeUnseen's sed check calls holdsAny directly on sed's program operands (every -e value,
+//   or the first operand): SED_PATH_TOKENS (no left boundary), since a sed pattern legitimately
+//   holds words such as hooksPath; SED_PATH_TOKENS and DANGER when a program holds `git` or
+//   `ko.mjs`, since sed's e command and s///e flag run a shell command.
 // - judgeShell and judgeInterpreter (via scanFedScript): a script fed on standard input, from a
 //   pipe the whole command line, from a here-document or here-string the command and its
-//   bodies, from /dev/stdin, `-` or <( ) the command; and an interpreter's inline code
-//   (node -e, python -c, perl -e/-n/-p, ruby -e), the command and its bodies; DANGER.
+//   bodies, from /dev/stdin, `-` or <( ) the command; and an interpreter's inline code, the
+//   command and its bodies; DANGER. Inline code is any word before `--` that is one of an
+//   interpreter's long inline options (node --eval, --print) or a short group holding one of
+//   its letters (node e p, python c, perl e E n p, ruby e n p, php r, lua, Rscript and
+//   osascript e), wherever it stands.
 // Each text is scanned as written and with quotes, backslashes and parentheses (zsh's glob
 // groups, `.git/h(o)oks`) taken out.
 function holdsAny(tokens, texts) {
@@ -1671,8 +1675,9 @@ const COMMAND_STRING = new Set(['su', 'script', 'runuser']);
 function inlineOptionsOf(name) {
   if (name === 'node' || name === 'nodejs' || name === 'bun') return { short: 'ep', long: ['--eval', '--print'] };
   if (/^(python|pypy)[0-9.]*$/.test(name)) return { short: 'c', long: [] };
-  if (name === 'perl') return { short: 'eE', long: [] };
-  if (name === 'ruby' || name === 'lua' || name === 'rscript' || name === 'osascript') return { short: 'e', long: [] };
+  if (name === 'perl') return { short: 'eEnp', long: [] };
+  if (name === 'ruby') return { short: 'enp', long: [] };
+  if (name === 'lua' || name === 'rscript' || name === 'osascript') return { short: 'e', long: [] };
   if (name === 'php') return { short: 'r', long: [] };
   return null;
 }
@@ -1717,15 +1722,16 @@ function judgeShell(command, args, context, depth) {
   scanFedScript(command, context);
 }
 
+// Inline code is looked for in every word before `--`, whatever precedes it: which options
+// take a value is not modelled, so `perl -M strict -e ...` and `node -r fs -e ...` are found.
+// The first word that is not an option is taken as the script operand for standard input.
 function judgeInterpreter(command, args, inlineOptions, context) {
   let operand = null;
   let inline = false;
   for (const word of args) {
     const text = word.text;
-    if (!text.startsWith('-') || text === '-') {
-      operand = word;
-      break;
-    }
+    if (text === '--') break;
+    if (operand === null && (!text.startsWith('-') || text === '-')) operand = word;
     const long = inlineOptions.long.some((option) => text === option || text.startsWith(`${option}=`));
     const short = /^-[A-Za-z]+$/.test(text) && [...inlineOptions.short].some((letter) => text.includes(letter));
     if (long || short) inline = true;
@@ -1744,7 +1750,11 @@ function judgeUnseen(command, resolved, context, depth) {
   const { name } = resolved;
   const args = resolved.words.slice(resolved.index + 1);
   if (ALWAYS_CODE.has(name) || (name === 'find' && args.some((word) => FIND_EXEC.has(word.text))) || (name === 'deno' && args[0]?.text === 'eval')) scanned(MESSAGES.runsCode, command.raw);
-  if (name === 'sed' && holdsAny(PATH_TOKENS, sedPrograms(args).map((word) => word.text))) refuse(MESSAGES.runsCode);
+  if (name === 'sed') {
+    const programs = sedPrograms(args).map((word) => word.text);
+    const runsCommands = programs.some((text) => /git|ko\.mjs/i.test(text));
+    if (holdsAny(runsCommands ? [...SED_PATH_TOKENS, ...DANGER] : SED_PATH_TOKENS, programs)) refuse(MESSAGES.runsCode);
+  }
   if (SHELLS.has(name)) judgeShell(command, args, context, depth);
   if (COMMAND_STRING.has(name)) {
     const at = args.findIndex((word) => word.text === '-c' || word.text === '--command');
@@ -1777,22 +1787,20 @@ function judgeCommand(command, context, depth) {
   judgeGuardedArea(command, resolved, git, values, context);
   judgeGitEnvironment(command, resolved, git);
   if (git !== null) judgeGit(resolved, git, values);
-  judgeOwner(command, resolved);
+  judgeOwner(command, resolved, values);
   judgeInnerCommand(resolved, values);
   judgeUnseen(command, resolved, context, depth);
 }
 
-// A git or runtime word after the command word, behind a wrapper the tables above do not know
-// (ssh, strace, npx, a coproc's name, sh -c '"$@"' _ git ...), is judged as a command word too.
-const INNER_COMMANDS = new Set(['git', ...Object.keys(RUNTIMES)]);
+// A git word after the command word, behind a wrapper the tables above do not know (ssh,
+// strace, npx, a coproc's name, sh -c '"$@"' _ git ...), is judged as a command word too.
 function judgeInnerCommand(resolved, values) {
   const at = resolved.words.findIndex((word, index) => index > resolved.index && !values.has(word) && !word.expands
-    && (INNER_COMMANDS.has(commandName(word)) || commandName(word).startsWith('git-')));
+    && (commandName(word) === 'git' || commandName(word).startsWith('git-')));
   if (at === -1) return;
   const inner = { ...resolved, index: at, word: resolved.words[at], name: commandName(resolved.words[at]) };
   const git = gitInvocation(inner);
   if (git !== null) judgeGit(inner, git, textValues(inner, git, true));
-  else judgeOwner({ assignments: [] }, inner);
 }
 
 function judgeCommands(commands, context, depth) {

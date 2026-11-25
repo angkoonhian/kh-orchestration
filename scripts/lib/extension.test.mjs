@@ -368,6 +368,32 @@ const BLOCKED = [
   ['awk \'{print > ".git/hooks/x"}\' f', MESSAGES.runsCode], ['perl -ne \'open(F,">.git/hooks/pre-commit")\' f', MESSAGES.runsCode],
   ["ruby -ne 'File.write(\".git/config\", 1)' f", MESSAGES.runsCode],
 
+  // second re-review: exemptions an attacker could satisfy, and sed and inline code wherever they stand
+  ['find . -path ./.git/hooks/pre-commit -prune | xargs chmod a-x', MESSAGES.guardedPath], ['find . -depth -path ./.git -prune -o -type f -print0 | xargs -0 chmod a-x', MESSAGES.guardedPath],
+  ['find . -path ./.git -prune | xargs chmod -R a-x', MESSAGES.guardedPath], ['find . -path ./.git/hooks -prune | xargs chmod -R a-x', MESSAGES.guardedPath],
+  ['find . -path ./.git -prune -o -print | xargs chmod -R a-x', MESSAGES.guardedPath], ['find . -d -path ./.git -prune -o -print | xargs rm', MESSAGES.guardedPath],
+  ['find . -path ./.git -prune -o -delete', MESSAGES.guardedPath], ['cp --exclude .git/hooks/pre-commit x', MESSAGES.guardedPath], ['tar czf - --exclude=.git/x . | xargs rm', MESSAGES.guardedPath],
+  ['git merge --no-edit $(echo --no-verify) side', MESSAGES.noVerify], ['git merge `echo --no-verify` side', MESSAGES.noVerify], ['git merge ${X:---no-verify} side', MESSAGES.noVerify],
+  ['git merge "${X:---no-verify}" side', MESSAGES.noVerify], ['git pull $(echo --no-verify)', MESSAGES.noVerify], ['git pull origin main ${X:---no-verify}', MESSAGES.noVerify],
+  ['git merge $(cat f) side', MESSAGES.hiddenOption], ['git merge ${X:-y} side', MESSAGES.hiddenOption], ['git merge "${X#x}"', MESSAGES.hiddenOption], ['git pull "$@"', MESSAGES.hiddenOption],
+  ['git merge "$(git rev-parse --abbrev-ref @{u})"', MESSAGES.hiddenOption], ['git commit -m x origin/$(echo a)', MESSAGES.hiddenOption], ['git commit -m x a${X:-b}', MESSAGES.hiddenOption],
+  ["sed 's/x/y/w.git/hooks/pre-commit' a", MESSAGES.runsCode], ["sed -n '$w.git/hooks/pre-commit' /dev/null", MESSAGES.runsCode], ["echo 'exit 0' | sed -n 'w.git/hooks/pre-commit'", MESSAGES.runsCode],
+  ["sed -n 'W.git/hooks/pre-commit' a", MESSAGES.runsCode], ["sed -n '1w.git/hooks/x' a", MESSAGES.runsCode], ["sed -n '/x/w.git/kh-orchestration/off' a", MESSAGES.runsCode],
+  ["sed -n 'w./.git//hooks/x' a", MESSAGES.guardedPath], ["sed '1e git commit -n -m x' a", MESSAGES.runsCode], ["sed 's/.*/git commit -n -m x/e' a", MESSAGES.runsCode], ["sed '1e ko.mjs approve' a", MESSAGES.runsCode], ["sed -n '/ko.mjs approve/p' f", MESSAGES.runsCode],
+  ['git merge "x${Y}--no-verify" y', MESSAGES.noVerify],
+  ['perl -M strict -e \'unlink ".git/hooks/pre-commit"\'', MESSAGES.runsCode], ['perl -I . -e \'unlink ".git/hooks/pre-commit"\'', MESSAGES.runsCode],
+  ['python3 -W ignore -c \'import os; os.remove(".git/hooks/pre-commit")\'', MESSAGES.runsCode], ['python3 -X dev -c \'import os; os.remove(".git/hooks/pre-commit")\'', MESSAGES.runsCode],
+  ['node -r fs -e \'x(".git/hooks/pre-commit")\'', MESSAGES.runsCode], ['node --require fs -e \'x(".git/hooks/pre-commit")\'', MESSAGES.runsCode],
+  ['ruby -r fileutils -e \'FileUtils.rm(".git/hooks/pre-commit")\'', MESSAGES.runsCode], ['perl -n script.pl -e \'x(".git/config")\'', MESSAGES.runsCode],
+  ['bunx tsx .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['bun x tsx .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
+  ['deno .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['deno task t .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
+  ['tsx .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['ts-node .claude/kh-orchestration/scripts/ko.mjs propose', MESSAGES.ownerOnly('propose')],
+  ['npx tsx .claude/kh-orchestration/scripts/ko.mjs waive', MESSAGES.ownerOnly('waive')], ['pnpm dlx tsx .claude/kh-orchestration/scripts/ko.mjs exempt', MESSAGES.ownerOnly('exempt')],
+  ['bun --define x=1 .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['bun --port 3000 .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
+  ['bun run --filter x .claude/kh-orchestration/scripts/ko.mjs off', MESSAGES.ownerOnly('off')], ['deno run --ext js .claude/kh-orchestration/scripts/ko.mjs on', MESSAGES.ownerOnly('on')],
+  ['vim ko.mjs on', MESSAGES.ownerOnly('on')], ['echo -delete | xargs find .git/hooks', MESSAGES.guardedPath], ['echo --pre=sh | xargs rg x .git', MESSAGES.guardedPath],
+  ['echo --output=.git/hooks/x | xargs git diff', MESSAGES.guardedPath], ['ls .git | xargs less', MESSAGES.guardedPath],
+
   // owner-only commands under node, nodejs, bun and deno run
   ['bun .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['bun run .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
   ['deno run .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['deno run -A .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
@@ -442,11 +468,16 @@ const ALLOWED = [
   'git diff | python3 -m json.tool', "git log | perl -ne 'print if /x/'", 'echo x.git | node', 'X="git commit -n"; eval $X', 'case "$x" in a) echo a;; esac',
   "find . -name '*.orig' -delete",
   // a program that names no guarded path stays allowed, whatever words it holds
-  "sed -n '/hooksPath/p' f", "sed -i 's/a/b/' src/x.js", "sed -e 's/--no-verify//' -e 's/commit -n/x/' f", "sed -n '/ko.mjs approve/p' f", "awk '{print $1 > \"out.txt\"}' f",
+  "sed -n '/hooksPath/p' f", "sed -i 's/a/b/' src/x.js", "sed -e 's/--no-verify//' -e 's/commit -n/x/' f", "awk '{print $1 > \"out.txt\"}' f",
   // exclusions are text values
   'tar czf out.tgz --exclude=.git .', 'rsync -a --exclude .git ./ /tmp/x/', 'rsync -a --exclude .git/hooks src/ dst/', 'grep -rn foo --exclude-dir=.git .',
   "zip -r x.zip . -x '.git/*'", "zip -r x.zip . -x '.git/*' '*.tmp'", "find . -path ./.git -prune -o -name '*.py' -print", 'rsync -a --exclude-from=.git/info/exclude src/ dst/',
   'tar -czf x.tgz --exclude-vcs .', "find . -name .git -prune -o -type f -print",
+  // second re-review: the exemptions kept, and their near misses
+  "find . -path ./.git -prune -o -type f -print | xargs grep -l foo", 'git merge "origin/${BRANCH}"', 'python3 -m pytest -k "no_verify"', 'node -r ./setup.mjs scripts/build.mjs',
+  "sed -e 's/--no-verify//' notes.md", "sed -i 's/github/gitlab/' README.md", 'grep approve .claude/kh-orchestration/scripts/ko.mjs', 'diff ko.mjs approve', 'cat ko.mjs',
+  'node .claude/kh-orchestration/scripts/ko.mjs status --json', 'git add assets/scripts/ko.mjs', 'git commit -m "ko.mjs approve now asks for the word"', 'ls .git/hooks | xargs cat',
+  "du -sh --exclude=.git .", 'diff -r --exclude=.git a b', 'rg foo --exclude-dir .git',
   // a branch or remote given by a variable
   'git merge "$BRANCH"', 'git merge $BRANCH', 'git pull "$REMOTE" main', 'git commit -F "$FILE"', 'git commit -m"$MSG"', 'git commit --message="$MSG"',
   // ko.mjs's reading subcommands under other runtimes

@@ -1445,7 +1445,7 @@ php -r 'system("git commit -n");'
 block
 awk 'BEGIN{system("git commit -n")}'
 =====
-allow
+block
 sed -n '1e git commit -n' a
 =====
 allow
