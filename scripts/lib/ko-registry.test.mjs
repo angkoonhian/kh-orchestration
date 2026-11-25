@@ -229,10 +229,29 @@ test('a free part holding a comment marker, a carriage return or U+2028/U+2029 i
   for (const construct of ['<!-- hides the rest', '<!-->', 'text -->']) {
     assert.deepEqual(parseRegistry(`## A1 — ${construct}\n- approval: agent\n`).problems, [{ line: 1, text: MINOR_WORDING_PROBLEM }], `${construct} in a title`);
   }
-  for (const construct of ['text\r## V9 — fake', 'text ## V9 — fake', 'text ## V9 — fake']) {
-    assert.notDeepEqual(parseRegistry(`## A1 — ${construct}\n- approval: agent\n`).problems, [], 'a heading with one of them is reported, as a heading that starts no rule or as wording');
+  for (const separator of ['\r', '\u2028', '\u2029']) {
+    assert.deepEqual(parseRegistry(`## A1 — text${separator}## V9 — fake\n- approval: agent\n`).problems, [{ line: 1, text: NOT_A_RULE_HEADING }], 'a heading with a CR, U+2028 or U+2029 in it starts no rule');
   }
-  assert.equal(MINOR_WORDING_PROBLEM, 'the wording of a rule with "approval: agent" may not contain "<!--", "-->", a carriage return, U+2028 or U+2029.');
+  assert.equal(MINOR_WORDING_PROBLEM, 'the wording of a rule with "approval: agent" may not contain "<!--", "-->", a control character, a line or paragraph separator, or a zero-width or bidi character.');
+});
+
+const CHARACTER_CLASSES = {
+  'a backspace': '\b', 'an escape': '\x1b', 'a vertical tab': '\v', 'a form feed': '\f', 'a NUL': '\0', 'a DEL': '\x7f',
+  'a NEL': '\u0085', 'a C1 control': '\u009f', 'a zero-width space': '\u200b', 'a right-to-left mark': '\u200f',
+  'a bidi override': '\u202e', 'a bidi isolate': '\u2066', 'a word joiner': '\u2060', 'a byte order mark mid-value': '\ufeff',
+};
+
+test('a free part holding a control, zero-width or bidi character is a reported problem at its line, in a why value and in a title', () => {
+  for (const [name, character] of Object.entries(CHARACTER_CLASSES)) {
+    assert.deepEqual(parseRegistry(`## A1 — t\n- why: a${character}b\n- approval: agent\n`).problems, [{ line: 2, text: MINOR_WORDING_PROBLEM }], `${name} in a why value`);
+    assert.deepEqual(parseRegistry(`\n## A1 — a${character}b\n- approval: agent\n`).problems, [{ line: 2, text: MINOR_WORDING_PROBLEM }], `${name} in a title`);
+  }
+  assert.deepEqual(parseRegistry('## A1 — t\x1b[8m\n- why: \b\b\b\b\bstatus: superseded\n- approval: agent\n').problems.map((problem) => problem.line), [1, 2]);
+});
+
+test('a tab and ordinary non-ASCII text are allowed in a free part', () => {
+  const text = '## A1 — café 日本語 \u{1F600}\n- why:\tcafé 日本語 \u{1F600}\n- verify: naïve\ttext\n- approval: agent\n';
+  assert.deepEqual(parseRegistry(text).problems, []);
 });
 
 test('the same constructs are no problem in an owner rule or in a line of an agent rule that is not free, and on a new line of an agent rule they change the form', () => {

@@ -3,7 +3,7 @@
 // the approval digest depends on exactly which text this reads as a rule.
 
 export const NOT_A_RULE_HEADING = 'this level-2 heading is not "## <id> <separator> <rule>", so it starts no rule.';
-export const MINOR_WORDING_PROBLEM = 'the wording of a rule with "approval: agent" may not contain "<!--", "-->", a carriage return, U+2028 or U+2029.';
+export const MINOR_WORDING_PROBLEM = 'the wording of a rule with "approval: agent" may not contain "<!--", "-->", a control character, a line or paragraph separator, or a zero-width or bidi character.';
 export const duplicateIdMessage = (id) => `the id ${id} is already used by an earlier rule, so this rule is ignored.`;
 
 // A level-2 heading is a line starting `## ` (or any white space) or `##` alone.
@@ -16,8 +16,10 @@ const COMMENT = /<!--[\s\S]*?-->/g;
 // The start of a key line, for finding where a free value begins.
 const KEY_START = /^\s*[-*]\s*([A-Za-z][\w-]*)\s*:/;
 const FREE_KEYS = new Set(['why', 'verify', 'priority']);
-// Text that can change what a person or a model reading the raw file takes the rules to be.
-const UNSAFE_WORDING = /<!--|-->|\r|\u2028|\u2029/;
+// Text that can change what a person or a model reading the raw file takes the rules to be:
+// a comment marker; a C0 control other than TAB; DEL and the C1 controls; U+2028 and U+2029;
+// zero-width and bidi controls (U+200B-U+200F, U+202A-U+202E, U+2060-U+2069, U+FEFF).
+const UNSAFE_WORDING = /<!--|-->|[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/;
 
 const toLf = (text) => text.replace(/\r\n/g, '\n');
 
@@ -148,7 +150,11 @@ function withoutFreeParts(block) {
 //   and the value of each `why`, `verify` and `priority` line (the text after
 //   its colon). Everything else is covered byte for byte, so adding, removing,
 //   reordering or re-spacing any line, a `pointer`, `enforced-by` or `status`
-//   line, a comment or prose, changes the form.
+//   line, a comment or prose, changes the form. A line that a closed comment
+//   touches (`- why: x <!-- c -->`) is not free: it is covered byte for byte.
+//   A free part is a problem, so the digest is unapprovable, when it holds
+//   `<!--`, `-->`, a C0 control other than TAB, DEL, a C1 control, U+2028,
+//   U+2029, or a zero-width or bidi control (see UNSAFE_WORDING).
 const section = (tag, payload) => `${tag}\0${payload.length}\0${payload}\0`;
 
 /**
