@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { listEntries, notBlobMessage, readBlob } from './ko-git.mjs';
 import { parseRegistry, canonicalRegistry, coveredPart } from './ko-registry.mjs';
-import { PROTECTED_FILES, PROTECTED_PREFIXES, matchesGlob, readOfficers } from './extension.mjs';
+import { PROTECTED_FILES, PROTECTED_PREFIXES, compileGlob, readOfficers } from './extension.mjs';
 
 const RULES = 'docs/harness/RULES.md';
 const OFFICERS = '.claude/kh-orchestration/officers.json';
@@ -17,7 +17,8 @@ export const notUtf8Message = `${RULES} is not valid UTF-8.`;
 export const officersUnreadableMessage = `${OFFICERS} is absent from the tree or is not an officers file.`;
 export const readFailedMessage = (reason) => `The protected files could not be read: ${reason}`;
 export const linkMessage = (path) => `${path} is a symbolic link or a submodule, and a link may not stand at, above or under a protected file.`;
-export const directoryMessage = (id, element) => `The officer ${id} names the directory ${element}: name the file, or add a glob to "protected" in ${OFFICERS}.`;
+export const globDirectoryMessage = (glob) => `The protected glob ${glob} names a directory and matches no file: write ${glob}/** in ${OFFICERS}.`;
+export const objectMismatchMessage = (path) => `The bytes of ${path} do not hash to its object id, so the object is damaged or forged.`;
 
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
@@ -25,6 +26,13 @@ const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 
 // Throws when the bytes are not valid UTF-8. A byte-order mark is kept, so it is part of the text.
 const decode = (bytes) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+
+// Whether bytes are the blob an object id names: the id is the hash of `blob <length> NUL` and the bytes.
+// git does not check a loose object against its name when it reads it.
+function hashesTo(oid, bytes) {
+  const hash = createHash(oid.length === 64 ? 'sha256' : 'sha1');
+  return hash.update(`blob ${bytes.length}\0`).update(bytes).digest('hex') === oid;
+}
 
 // `a/b/c` gives `a`, `a/b` and `a/b/c`.
 const ancestorsAndSelf = (path) => path.split('/').map((_, index, segments) => segments.slice(0, index + 1).join('/'));
@@ -57,34 +65,35 @@ function compute(root, tree) {
 
   const linkedOfficers = ancestorsAndSelf(OFFICERS).find((path) => linkPaths.has(path));
   if (linkedOfficers !== undefined) return { problem: linkMessage(linkedOfficers) };
+  const officersEntry = files.get(OFFICERS);
+  if (officersEntry === undefined) return { problem: officersUnreadableMessage };
   const officersBytes = readBlob(root, tree, OFFICERS);
+  if (!hashesTo(officersEntry.oid, officersBytes)) return { problem: objectMismatchMessage(OFFICERS) };
   let officers = null;
-  if (officersBytes !== null) {
-    try {
-      officers = readOfficers(decode(officersBytes));
-    } catch {
-      // not UTF-8: officers stays null
-    }
+  try {
+    officers = readOfficers(decode(officersBytes));
+  } catch {
+    // not UTF-8: officers stays null
   }
   if (officers === null) return { problem: officersUnreadableMessage };
 
   const { officerCandidates, protectedGlobs } = officers;
+  const globs = protectedGlobs.map((glob) => ({ glob, matches: compileGlob(glob) }));
   const underPrefix = (path) => PROTECTED_PREFIXES.some((prefix) => path.startsWith(prefix));
-  const matchesProtectedGlob = (path) => protectedGlobs.some((glob) => matchesGlob(glob, path));
+  const matchesProtectedGlob = (path) => globs.some(({ matches }) => matches(path));
 
-  // A path that is a directory, not a file, in the tree.
-  const isDirectory = (path) => !files.has(path) && !linkPaths.has(path) && entries.some((entry) => entry.path.startsWith(`${path}/`));
+  const directories = new Set(entries.flatMap((entry) => ancestorsAndSelf(entry.path).slice(0, -1)));
   for (const path of PROTECTED_FILES) {
-    if (isDirectory(path)) return { problem: notBlobMessage(path) };
+    if (directories.has(path)) return { problem: notBlobMessage(path) };
   }
-  for (const candidate of officerCandidates) {
-    if (isDirectory(candidate.path)) return { problem: directoryMessage(candidate.id, candidate.element) };
+  for (const glob of protectedGlobs) {
+    if (!/[*?]/.test(glob) && directories.has(glob)) return { problem: globDirectoryMessage(glob) };
   }
 
   const reachedThrough = [...PROTECTED_FILES, ...PROTECTED_PREFIXES.map((prefix) => prefix.slice(0, -1)), ...officerCandidates.map((candidate) => candidate.path)];
   const hidden = reachedThrough.flatMap(ancestorsAndSelf).find((path) => linkPaths.has(path));
   if (hidden !== undefined) return { problem: linkMessage(hidden) };
-  const covered = [...linkPaths].find((path) => underPrefix(path) || matchesProtectedGlob(path));
+  const covered = [...linkPaths].find((path) => underPrefix(path) || matchesProtectedGlob(path) || protectedGlobs.some((glob) => hidesGlob(path, glob)));
   if (covered !== undefined) return { problem: linkMessage(covered) };
 
   const scripts = new Set(officerCandidates.map((candidate) => candidate.path));
@@ -93,11 +102,14 @@ function compute(root, tree) {
     .sort();
   let canonical = '';
   for (const path of paths) {
-    let id = files.get(path).oid;
+    const { mode, oid } = files.get(path);
+    let id = oid;
     if (path === RULES) {
+      const bytes = readBlob(root, tree, path);
+      if (!hashesTo(oid, bytes)) return { problem: objectMismatchMessage(RULES) };
       let text;
       try {
-        text = decode(readBlob(root, tree, path));
+        text = decode(bytes);
       } catch {
         return { problem: notUtf8Message };
       }
@@ -105,9 +117,20 @@ function compute(root, tree) {
       if (parsed.problems.length > 0) return { problem: invalidRulesMessage(parsed.problems[0].line, parsed.problems[0].text) };
       id = sha256(canonicalRegistry(parsed));
     }
-    canonical += `${path}\0${id}\n`;
+    canonical += `${path}\0${mode}\0${id}\n`;
   }
   return { digest: sha256(canonical), paths };
+}
+
+// Whether a link at `link` stands on a glob's fixed part: equal to, or an ancestor of, the
+// directories a glob names before its first `**`, each segment matched by the glob rules.
+// Beyond a `**` nothing is fixed, so `**` + `/*.py` is hidden by no link.
+function hidesGlob(link, glob) {
+  const segments = glob.split('/');
+  const firstWild = segments.findIndex((segment) => segment.includes('**'));
+  const fixed = firstWild === -1 ? segments : segments.slice(0, firstWild);
+  const linkSegments = link.split('/');
+  return linkSegments.length <= fixed.length && linkSegments.every((segment, index) => compileGlob(fixed[index])(segment));
 }
 
 // The rules of a tree's RULES.md by id; empty when the file is absent.

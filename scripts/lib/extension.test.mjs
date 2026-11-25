@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { reachesOtherFiles } from './self-contained.mjs';
-import { PROTECTED_FILES, PROTECTED_PREFIXES, isProtected, matchesGlob, readOfficers } from '../../assets/scripts/extension.mjs';
+import { PROTECTED_FILES, PROTECTED_PREFIXES, compileGlob, isProtected, readOfficers } from '../../assets/scripts/extension.mjs';
 
 const EXTENSION = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'assets', 'scripts', 'extension.mjs');
 const officersText = (argvs, extra = {}) => JSON.stringify({
@@ -22,12 +22,14 @@ test('the self-containment check finds every way to reach another file, and pass
     "import x from '../y.mjs';", "import x from './y.mjs'", "import { a } from 'pkg';", "export { a } from '../y.mjs';", "export * from './y.mjs';",
     "import './side.mjs';", "/* c */ import x from '../y.mjs';", "import(`./x.mjs`)", "import(name)", "await import('./x.mjs')", "import('node:fs' + x)",
     "import { createRequire } from 'node:module'; const r = createRequire(import.meta.url); r('./x');", "const x = require('./x');",
-    "import {\n  a,\n  b,\n} from '../y.mjs';",
+    "import {\n  a,\n  b,\n} from '../y.mjs';", "import /* from 'node:fs' */ x from './evil.mjs';", "import { a /* from \"node:fs\" */ } from './evil.mjs';",
+    "import /* c */ ('./evil.mjs')", "const u = 'http://x'; import y from './evil.mjs';", "const u = \"//\"; export * from './evil.mjs';",
   ];
   for (const source of bad) assert.notDeepEqual(reachesOtherFiles(source), [], source);
   const good = [
     "import { createHash } from 'node:crypto';", "import fs, { x } from \"node:fs\";", "import 'node:fs';", "export { a } from 'node:path';", "await import('node:fs');",
-    "import {\n  a,\n} from 'node:path';\nexport const x = 1;", '// the word import in a comment\nexport const y = 2;',
+    "import {\n  a,\n} from 'node:path';\nexport const x = 1;", '// the word import in a comment\nexport const y = 2;', "/* import x from './y.mjs' */ import fs from 'node:fs';", "// import('./x.mjs')\nimport fs from 'node:fs';",
+    "const u = 'http://x'; import fs from 'node:fs';",
   ];
   for (const source of good) assert.deepEqual(reachesOtherFiles(source), [], source);
 });
@@ -37,20 +39,29 @@ test('the protected prefixes and files are the brief\'s lists', () => {
   assert.deepEqual(PROTECTED_FILES, ['docs/harness/RULES.md', '.claude/kh-orchestration/officers.json', '.claude/settings.json']);
 });
 
-test('matchesGlob: ** crosses directories, * and ? do not, everything else is literal', () => {
+test('a compiled glob: **/ matches zero or more directories, a trailing /** what is under the directory, a lone ** everything; * and ? never cross /', () => {
   const table = [
     ['src/a.js', 'src/a.js', true], ['src/a.js', 'src/b.js', false], ['src/*.js', 'src/a.js', true], ['src/*.js', 'src/deep/a.js', false],
-    ['src/**', 'src/a.js', true], ['src/**', 'src/deep/er/a.js', true], ['src/**', 'src', false], ['**/a.js', 'x/y/a.js', true],
-    ['**/a.js', 'a.js', false], ['src/**/a.js', 'src/x/y/a.js', true], ['**', 'any/path/at.all', true], ['a?c', 'abc', true], ['a?c', 'a/c', false],
-    ['a?c', 'ac', false], ['*', 'a/b', false], ['*', 'ab', true], ['a.b', 'axb', false], ['a+b', 'a+b', true], ['a(b)', 'a(b)', true], ['a.js', 'A.js', false],
-    ['x/*/y', 'x/m/y', true], ['x/*/y', 'x//y', true], ['x/*/y', 'x/m/n/y', false],
+    ['**/*.py', 'a.py', true], ['**/*.py', 'x/a.py', true], ['**/*.py', 'x/y/a.py', true], ['**/*.py', 'a.pyc', false], ['**/*.py', 'xa.py/b', false],
+    ['src/**/a.js', 'src/a.js', true], ['src/**/a.js', 'src/x/y/a.js', true], ['src/**/a.js', 'srcx/a.js', false], ['src/**/a.js', 'src/xa.js', false],
+    ['lib/**', 'lib/a', true], ['lib/**', 'lib/a/b', true], ['lib/**', 'lib', false], ['lib/**', 'libx/a', false],
+    ['**', 'x', true], ['**', 'a/b/c', true], ['**', '.hidden/x', true], ['**/a.js', '.hidden/a.js', true], ['**/x', 'ax', false],
+    ['a?c', 'abc', true], ['a?c', 'a/c', false], ['a?c', 'ac', false], ['*', 'a/b', false], ['*', 'ab', true], ['a.b', 'aXb', false], ['a.b', 'a.b', true],
+    ['a+b', 'a+b', true], ['a(b)', 'a(b)', true], ['a.js', 'A.js', false], ['x/*/y', 'x/m/y', true], ['x/*/y', 'x/m/n/y', false], ['a$b', 'a$b', true],
   ];
-  for (const [glob, path, expected] of table) assert.equal(matchesGlob(glob, path), expected, `${glob} ${path}`);
+  for (const [glob, path, expected] of table) assert.equal(compileGlob(glob)(path), expected, `${glob} ${path}`);
 });
 
-test('a glob containing [, ], {, } or a backslash is invalid, so no officers file with one is read', () => {
-  for (const glob of ['a[b]', 'a]', '{a,b}', 'a}', 'a\\b']) {
-    assert.equal(readOfficers(officersText([['node', 'a.mjs']], { protected: [glob] })), null, glob);
+test('compiling a glob twice gives the same matcher, so a hot path does not compile again', () => {
+  assert.equal(compileGlob('a/**'), compileGlob('a/**'));
+});
+
+test('an invalid glob makes the officers file unreadable: empty, absolute, a .., . or empty segment, a trailing /, or [ ] { } \\', () => {
+  for (const glob of ['', '/abs/x', '../x', 'a/../x', './x', 'a/./b', '.', '..', 'a//b', 'docs/', '/', 'a[b]', 'a]', '{a,b}', 'a}', 'a\\b']) {
+    assert.equal(readOfficers(officersText([['node', 'a.mjs']], { protected: [glob] })), null, JSON.stringify(glob));
+  }
+  for (const glob of ['a', 'a/b.js', '**', '**/*.py', 'lib/**', 'a.b/c?', '.hidden/**']) {
+    assert.notEqual(readOfficers(officersText([['node', 'a.mjs']], { protected: [glob] })), null, glob);
   }
 });
 

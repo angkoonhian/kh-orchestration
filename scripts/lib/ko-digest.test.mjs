@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { deflateSync } from 'node:zlib';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import { MINOR_WORDING_PROBLEM, canonicalRegistry, parseRegistry } from '../../assets/scripts/ko-registry.mjs';
-import { agentRuleChanges, digestOfTree, directoryMessage, invalidRulesMessage, linkMessage, notUtf8Message, officersUnreadableMessage, readFailedMessage, treeNotIdMessage } from '../../assets/scripts/ko-digest.mjs';
+import { agentRuleChanges, digestOfTree, globDirectoryMessage, invalidRulesMessage, linkMessage, objectMismatchMessage, notUtf8Message, officersUnreadableMessage, readFailedMessage, treeNotIdMessage } from '../../assets/scripts/ko-digest.mjs';
 import { notBlobMessage } from '../../assets/scripts/ko-git.mjs';
 
 isolateProcessEnv();
@@ -59,7 +60,7 @@ test('the digest is the SHA-256 of the canonical text: sorted path NUL object-id
       [OFFICERS, oid(OFFICERS)], [SETTINGS, oid(SETTINGS)], [RULES, rulesHash], ['tools/officers/a1.mjs', oid('tools/officers/a1.mjs')],
     ].sort((a, b) => (a[0] < b[0] ? -1 : 1));
     const result = digestOf(repo);
-    assert.deepEqual(result, { digest: sha(lines.map(([path, hash]) => `${path}\0${hash}\n`).join('')), paths: lines.map(([path]) => path) });
+    assert.deepEqual(result, { digest: sha(lines.map(([path, hash]) => `${path}\0${"100644"}\0${hash}\n`).join('')), paths: lines.map(([path]) => path) });
     assert.deepEqual(result.paths, ['.claude/kh-orchestration/officers.json', '.claude/settings.json', 'docs/harness/RULES.md', 'tools/officers/a1.mjs']);
   });
 });
@@ -170,7 +171,7 @@ test('a link that is not at, above or under anything covered is no problem and i
   });
 });
 
-test('every officer-argv spelling of a script is covered: normalised, doubled or dotted separators, an option value; a directory is a problem naming the officer and the element', () => {
+test('every officer-argv spelling of a script is covered: normalised, doubled or dotted separators, an option value', () => {
   const spellings = ['./scripts/../scripts/check.mjs', 'scripts/./check.mjs', 'scripts//check.mjs', '././scripts/check.mjs', '--import=./scripts/check.mjs', 'scripts/check.mjs'];
   for (const spelling of spellings) {
     withRepo({ 'scripts/check.mjs': 'one\n', [OFFICERS]: officers(['node', spelling]) }, (repo) => {
@@ -179,14 +180,84 @@ test('every officer-argv spelling of a script is covered: normalised, doubled or
       assert.notEqual(digestAfter(repo, 'scripts/check.mjs', 'two\n').digest, before.digest, spelling);
     });
   }
-  for (const element of ['scripts', 'scripts/', './scripts//', '--require=scripts']) {
-    withRepo({ 'scripts/check.mjs': 'one\n', [OFFICERS]: officers(['node', 'x.mjs'], ['node', element]) }, (repo) => {
-      assert.deepEqual(digestOf(repo), { problem: directoryMessage('o1', element) }, element);
-    });
-  }
   withRepo({ 'scripts/check.mjs': 'one\n', [OFFICERS]: officers(['node', '../scripts/check.mjs', '/scripts/check.mjs', 'scripts\\check.mjs', 'nothing.mjs', '.']) }, (repo) => {
     assert.deepEqual(digestOf(repo).paths, ['.claude/kh-orchestration/officers.json', '.claude/settings.json', 'docs/harness/RULES.md']);
   });
+});
+
+test('an argv element naming a directory is neither a problem nor covered; a glob covers it', () => {
+  const commands = [['pytest', 'tests'], ['ruff', 'check', 'tests'], ['node', '--test', 'tests/'], ['eslint', '.']];
+  for (const argv of commands) {
+    withRepo({ 'tests/x.py': 'one\n', [OFFICERS]: officers(argv) }, (repo) => {
+      const before = digestOf(repo);
+      assert.deepEqual(before.paths, ['.claude/kh-orchestration/officers.json', '.claude/settings.json', 'docs/harness/RULES.md'], argv.join(' '));
+      assert.deepEqual(digestAfter(repo, 'tests/x.py', 'two\n'), before, argv.join(' '));
+    });
+  }
+  withRepo({ 'tests/x.py': 'one\n', [OFFICERS]: officersWith({ protected: ['tests/**'] }, ['pytest', 'tests']) }, (repo) => {
+    assert.ok(digestOf(repo).paths.includes('tests/x.py'));
+  });
+});
+
+test('a link at or above the fixed directories of a protected glob is a problem, and never beyond a **', () => {
+  const cases = {
+    'lib -> real, lib/**': (repo) => { repo.write('real/x.mjs', 'x\n'); commitLink(repo, 'lib', 'real'); return 'lib'; },
+    'scripts -> real, scripts/officers/*.mjs': (repo) => { repo.write('real/officers/a.mjs', 'x\n'); commitLink(repo, 'scripts', 'real'); return 'scripts'; },
+    'scripts/officers -> ../real': (repo) => { repo.write('real/a.mjs', 'x\n'); commitLink(repo, 'scripts/officers', '../real'); return 'scripts/officers'; },
+  };
+  const globs = { 'lib -> real, lib/**': ['lib/**'], 'scripts -> real, scripts/officers/*.mjs': ['scripts/officers/*.mjs'], 'scripts/officers -> ../real': ['scripts/officers/*.mjs'] };
+  for (const [name, build] of Object.entries(cases)) {
+    withRepo({ [OFFICERS]: officersWith({ protected: globs[name] }, ['node', 'tools/officers/a1.mjs']) }, (repo) => {
+      const path = build(repo);
+      repo.commitAll('link');
+      assert.deepEqual(digestOf(repo), { problem: linkMessage(path) }, name);
+    });
+  }
+  withRepo({ [OFFICERS]: officersWith({ protected: ['**/*.py'] }, ['node', 'tools/officers/a1.mjs']), 'setup.py': 'one\n', 'assets/a.png': 'x\n' }, (repo) => {
+    commitLink(repo, 'docs/img', '../assets');
+    repo.commitAll('link');
+    const before = digestOf(repo);
+    assert.ok(before.paths.includes('setup.py'));
+    assert.notEqual(digestAfter(repo, 'setup.py', 'two\n').digest, before.digest);
+  });
+});
+
+test('a protected glob with no wildcard that names a directory in the tree is a problem saying to write dir/**', () => {
+  withRepo({ 'lib/x.mjs': 'x\n', [OFFICERS]: officersWith({ protected: ['lib'] }, ['node', 'tools/officers/a1.mjs']) }, (repo) => {
+    assert.deepEqual(digestOf(repo), { problem: globDirectoryMessage('lib') });
+    assert.match(globDirectoryMessage('lib'), /lib\/\*\*/);
+  });
+  withRepo({ 'package.json': '{}\n', [OFFICERS]: officersWith({ protected: ['package.json', 'absent'] }, ['node', 'tools/officers/a1.mjs']) }, (repo) => {
+    assert.ok(digestOf(repo).paths.includes('package.json'));
+  });
+});
+
+test('the file mode is covered: removing the executable bit of a covered script changes the digest', () => {
+  withRepo({}, (repo) => {
+    chmodSync(join(repo.root, 'tools/officers/a1.mjs'), 0o755);
+    repo.commitAll('executable');
+    const before = digestOf(repo);
+    chmodSync(join(repo.root, 'tools/officers/a1.mjs'), 0o644);
+    repo.commitAll('not executable');
+    assert.notEqual(digestOf(repo).digest, before.digest);
+  });
+});
+
+test('bytes that do not hash to their object id are a problem: a forged loose object for officers.json or RULES.md', () => {
+  for (const path of [RULES, OFFICERS]) {
+    withRepo({}, (repo) => {
+      const approvedText = baseFiles()[path];
+      const forgedText = path === RULES ? registry(ownerRule('R1', 'forged'), agentRule()) : officers(['node', 'tools/officers/a1.mjs'], ['true']);
+      repo.write(path, forgedText);
+      repo.commitAll('forged');
+      const oid = repo.git('rev-parse', `HEAD:${path}`).stdout.trim();
+      const object = join(repo.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+      rmSync(object);
+      const body = Buffer.from(approvedText);
+      writeFileSync(object, deflateSync(Buffer.concat([Buffer.from(`blob ${body.length}\0`), body])));
+      assert.deepEqual(digestOf(repo), { problem: objectMismatchMessage(path) }, path);
+    });
+  }
 });
 
 test('every file matching a protected glob is covered; one that does not match is not', () => {

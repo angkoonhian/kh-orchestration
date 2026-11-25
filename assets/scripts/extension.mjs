@@ -7,24 +7,49 @@ import { posix } from 'node:path';
 export const PROTECTED_PREFIXES = ['.claude/kh-orchestration/scripts/', '.claude/kh-harness/', '.claude/scripts/'];
 export const PROTECTED_FILES = ['docs/harness/RULES.md', '.claude/kh-orchestration/officers.json', '.claude/settings.json'];
 
-const INVALID_GLOB = /[[\]{}\\]/;
+const INVALID_GLOB_CHARACTERS = /[[\]{}\\]/;
 
-const globRegExp = (glob) => new RegExp(`^${glob.replace(/\*\*|[*?]|[^*?]+/g, (part) => {
-  if (part === '**') return '.*';
-  if (part === '*') return '[^/]*';
-  if (part === '?') return '[^/]';
-  return part.replace(/[.+^$()|]/g, '\\$&');
-})}$`);
+// A valid glob is not empty, not absolute, ends in no `/`, has no empty, `.` or `..`
+// segment, and has none of `[ ] { } \`.
+const isValidGlob = (glob) => !INVALID_GLOB_CHARACTERS.test(glob) && glob.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+
+const matchers = new Map();
 
 /**
- * Decision 9: `**` matches any run of characters including `/`, `*` any run
- * without `/`, `?` one character other than `/`; everything else is literal
- * and case-sensitive; paths use `/`. So `src/**` matches what is under `src/`
- * and `**` + `/a.js` needs a directory before `a.js`. A glob with `[`, `]`,
- * `{`, `}` or `\` is invalid (see `readOfficers`) and never reaches here.
+ * Decision 9, compiled once per glob: a function from a repository-relative
+ * path with `/` separators to whether the glob matches it. `*` matches any run
+ * of characters but `/`, `?` one character but `/`; `**/` matches zero or more
+ * directories (`**` + `/*.py` matches `a.py` and `x/a.py`); a trailing `/**`
+ * matches everything under the directory, not the directory itself; a lone
+ * `**` matches every path; any other `**` matches any run of characters,
+ * `/` and dot-directories included. Everything else is literal and
+ * case-sensitive. The glob must be valid (see `readOfficers`).
  */
-export function matchesGlob(glob, path) {
-  return globRegExp(glob).test(path);
+export function compileGlob(glob) {
+  let matcher = matchers.get(glob);
+  if (matcher === undefined) {
+    let source = '';
+    for (let index = 0; index < glob.length;) {
+      const rest = glob.slice(index);
+      if (rest.startsWith('**/')) {
+        source += '(?:.*/)?';
+        index += 3;
+      } else if (rest === '/**') {
+        source += '/.+';
+        index += 3;
+      } else if (rest.startsWith('**')) {
+        source += '.*';
+        index += 2;
+      } else {
+        source += rest[0] === '*' ? '[^/]*' : rest[0] === '?' ? '[^/]' : rest[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        index += 1;
+      }
+    }
+    const expression = new RegExp(`^${source}$`, 's');
+    matcher = (path) => expression.test(path);
+    matchers.set(glob, matcher);
+  }
+  return matcher;
 }
 
 /**
@@ -40,7 +65,7 @@ export function isProtected(relPath, officerScripts, protectedGlobs) {
   return PROTECTED_FILES.includes(relPath)
     || PROTECTED_PREFIXES.some((prefix) => relPath.startsWith(prefix))
     || officerScripts.includes(relPath)
-    || protectedGlobs.some((glob) => matchesGlob(glob, relPath));
+    || protectedGlobs.some((glob) => compileGlob(glob)(relPath));
 }
 
 // The path an argv element names, as a candidate: the element, or the value after the
@@ -73,7 +98,7 @@ export function readOfficers(officersJsonText) {
   }
   if (parsed === null || typeof parsed !== 'object' || parsed.schema !== 1) return null;
   const globs = parsed.protected;
-  if (!Array.isArray(globs) || !globs.every((glob) => typeof glob === 'string' && !INVALID_GLOB.test(glob))) return null;
+  if (!Array.isArray(globs) || !globs.every((glob) => typeof glob === 'string' && isValidGlob(glob))) return null;
   if (!Array.isArray(parsed.officers)) return null;
   const officerCandidates = [];
   for (const officer of parsed.officers) {
