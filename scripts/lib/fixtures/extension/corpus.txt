@@ -457,7 +457,7 @@ git commit -an
 block
 git commit -anm x
 =====
-allow
+block
 git commit -m x -- --no-verify
 =====
 block
@@ -1335,16 +1335,16 @@ git -C .git/hooks status
 block
 git commit --verify --no-verify -m x
 =====
-allow
+block
 git rebase -x "git commit -n -m viaExec" HEAD
 =====
-allow
+block
 git -c core.pager="sh -c 'git commit -n -m viaPager'" -p log
 =====
-allow
+block
 git bisect run sh -c 'git commit -n'
 =====
-allow
+block
 git submodule foreach 'git commit -n'
 =====
 allow
@@ -1385,7 +1385,7 @@ bash -o pipefail -c 'git commit -n'
 block
 bash --norc -c 'git commit -n'
 =====
-allow
+block
 bash -c 'eval "$0"' 'git commit -n'
 =====
 block
@@ -1448,7 +1448,7 @@ awk 'BEGIN{system("git commit -n")}'
 block
 sed -n '1e git commit -n' a
 =====
-allow
+block
 vim -c '!git commit -n' -c q
 =====
 allow
@@ -1463,7 +1463,7 @@ find . -maxdepth 0 -exec git commit -n -m x \;
 block
 find . -maxdepth 0 -exec sh -c 'g""it commit -n' \;
 =====
-allow
+block
 tar cf /dev/null a --checkpoint=1 --checkpoint-action=exec='git commit -n -m x'
 =====
 block

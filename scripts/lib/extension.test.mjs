@@ -353,8 +353,8 @@ const BLOCKED = [
   ['bash <<EOF\ngit commit -n\nEOF', MESSAGES.feedsScript], ['bash <<-EOF\n\tgit commit -n\n\tEOF', MESSAGES.feedsScript], ["bash <<< 'git commit -n'", MESSAGES.feedsScript],
   ["cat <<'E' | bash\ngit commit -n\nE", MESSAGES.feedsScript], ['echo git commit -n | sh', MESSAGES.noVerify], ['echo commit -n | sh', MESSAGES.feedsScript], ["printf 'git commit -n' | bash -s", MESSAGES.feedsScript],
   ["echo 'git commit -n' | bash - x", MESSAGES.feedsScript], ["echo 'ko.mjs  approve' | sh", MESSAGES.feedsScript], ['python3 - <<EOF\nimport os; os.remove(".git/hooks/pre-commit")\nEOF', MESSAGES.feedsScript],
-  ['node -e "require(\'fs\').rmSync(\'.git/hooks/pre-commit\')"'.replace('require(', 'req' + 'uire('), MESSAGES.runsCode],
-  ['python3 -c "open(\'.git/hooks/pre-commit\', \'w\')"', MESSAGES.runsCode], ["perl -e 'system(\"git commit -n\")'", MESSAGES.runsCode],
+  ['node -e "require(\'fs\').rmSync(\'.git/hooks/pre-commit\')"'.replace('require(', 'req' + 'uire('), MESSAGES.guardedPath],
+  ['python3 -c "open(\'.git/hooks/pre-commit\', \'w\')"', MESSAGES.guardedPath], ["perl -e 'system(\"git commit -n\")'", MESSAGES.runsCode],
   ["ruby -e 'system(\"git commit -n\")'", MESSAGES.runsCode], ["awk 'BEGIN{system(\"git commit -n\")}'", MESSAGES.runsCode], ['deno eval "x(\'--no-verify\')"', MESSAGES.runsCode],
   ['node -e "x(\'GIT_CONFIG_COUNT\')"', MESSAGES.runsCode], ['node -e "x(\'include.path\')"', MESSAGES.runsCode], ['node -e "delete process.env.CLAUDECODE"', MESSAGES.runsCode],
   ['eval "git commit -n -m x"', MESSAGES.runsCode], ['eval "g""it commit -n"', MESSAGES.runsCode], ['trap "git commit -n" EXIT', MESSAGES.runsCode],
@@ -363,10 +363,26 @@ const BLOCKED = [
   // a program that can write files is code: a guarded path inside it blocks
   ["sed -n 'w .git/hooks/pre-commit' a", MESSAGES.guardedPath], ["sed -n '/re/w .git/hooks/pre-commit' a", MESSAGES.guardedPath],
   ["sed 's/x/y/w .git/hooks/pre-commit' a", MESSAGES.guardedPath], ["sed -e 's/x/y/w .git/hooks/pre-commit' a", MESSAGES.guardedPath],
-  ["sed --expression='w .git/kh-orchestration/off' a", MESSAGES.guardedPath], ["sed -n '/\\.git\\/hooks/p' docs/x.md", MESSAGES.runsCode],
+  ["sed --expression='w .git/kh-orchestration/off' a", MESSAGES.guardedPath], ["sed -n '/\\.git\\/hooks/p' docs/x.md", MESSAGES.guardedPath],
   ["sed -n 's/x/y/w '\"$(git rev-parse --git-dir)\"'/hooks/x' a", MESSAGES.guardedPath], ["sed -n 'w $D/hooks/pre-commit' a", MESSAGES.runsCode],
-  ['awk \'{print > ".git/hooks/x"}\' f', MESSAGES.runsCode], ['perl -ne \'open(F,">.git/hooks/pre-commit")\' f', MESSAGES.runsCode],
-  ["ruby -ne 'File.write(\".git/config\", 1)' f", MESSAGES.runsCode],
+  ['awk \'{print > ".git/hooks/x"}\' f', MESSAGES.guardedPath], ['perl -ne \'open(F,">.git/hooks/pre-commit")\' f', MESSAGES.guardedPath],
+  ["ruby -ne 'File.write(\".git/config\", 1)' f", MESSAGES.guardedPath],
+
+  // third re-review: flag words wherever they stand, guarded paths as tokens, whitespace operands as code
+  ['git commit --mess -- -n', MESSAGES.noVerify], ['git commit --templ -- -n -m x', MESSAGES.noVerify], ['git merge --mess -- --no-verify side', MESSAGES.noVerify],
+  ['git merge --into-name -- --no-verify side', MESSAGES.noVerify], ['git commit -- -n', MESSAGES.noVerify], ['git commit --author x -n', MESSAGES.noVerify],
+  ['git merge side -- --no-verify', MESSAGES.noVerify], ['git commit -m x -- --no-verify', MESSAGES.noVerify], ['git commit -m $(echo x -n)', MESSAGES.hiddenOption],
+  ['git commit -m$(echo x -n)', MESSAGES.hiddenOption], ['git commit -F `echo f -n`', MESSAGES.hiddenOption], ['git commit -m -m -n', MESSAGES.noVerify],
+  ["chmod a-x $(echo .g''it/hooks/pre-commit)", MESSAGES.guardedPath], ["chmod a-x `echo .g''it/hooks/pre-commit`", MESSAGES.guardedPath],
+  ["chmod a-x \"$(printf %s .g''it/hooks/pre-commit)\"", MESSAGES.guardedPath], ['racket -e \'(delete-file ".git/hooks/pre-commit")\'', MESSAGES.guardedPath],
+  ['lua -e \'os.remove(".git/hooks/pre-commit")\'', MESSAGES.guardedPath], ['chmod a-x .g\\it/hooks/pre-commit', MESSAGES.guardedPath], ['chmod a-x ".git"/hooks/pre-commit', MESSAGES.guardedPath],
+  ['julia -e \'rm("x/../.git/config")\'', MESSAGES.guardedPath],
+  ["script -qc 'git commit -n -m x' /dev/null", MESSAGES.noVerify], ["script --command='git commit -n -m x' /dev/null", MESSAGES.noVerify],
+  ["taskset 1 bash -c 'git commit -n -m x'", MESSAGES.noVerify], ["flock /tmp/l -c 'git commit -n -m x'", MESSAGES.noVerify], ["chrt -b 0 sh -c 'git commit -n -m x'", MESSAGES.noVerify],
+  ["guile -c '(system \"git commit -n -m x\")'", MESSAGES.runsCode], ["ssh host 'git commit --no-verify -m x'", MESSAGES.runsCode], ['docker run img sh -c "git commit -n -m x"', MESSAGES.runsCode],
+  ["tmux new-session 'git commit -n -m x'", MESSAGES.runsCode], ["watch 'git commit -n -m x'", MESSAGES.runsCode], ["nohup sh -c 'git -c core.hooksPath=/x commit -m y'", MESSAGES.gitConfig],
+  ["unbuffer git commit -n", MESSAGES.noVerify], ["flock /tmp/l git commit -n", MESSAGES.noVerify], ["watch -n 1 git commit -n", MESSAGES.noVerify],
+  ["make run ARGS='ko.mjs approve'", MESSAGES.runsCode], ['git grep -lO x .git', MESSAGES.guardedPath], ['git grep -lOvim x .git', MESSAGES.guardedPath],
 
   // second re-review: exemptions an attacker could satisfy, and sed and inline code wherever they stand
   ['find . -path ./.git/hooks/pre-commit -prune | xargs chmod a-x', MESSAGES.guardedPath], ['find . -depth -path ./.git -prune -o -type f -print0 | xargs -0 chmod a-x', MESSAGES.guardedPath],
@@ -381,10 +397,10 @@ const BLOCKED = [
   ["sed -n 'W.git/hooks/pre-commit' a", MESSAGES.runsCode], ["sed -n '1w.git/hooks/x' a", MESSAGES.runsCode], ["sed -n '/x/w.git/kh-orchestration/off' a", MESSAGES.runsCode],
   ["sed -n 'w./.git//hooks/x' a", MESSAGES.guardedPath], ["sed '1e git commit -n -m x' a", MESSAGES.runsCode], ["sed 's/.*/git commit -n -m x/e' a", MESSAGES.runsCode], ["sed '1e ko.mjs approve' a", MESSAGES.runsCode], ["sed -n '/ko.mjs approve/p' f", MESSAGES.runsCode],
   ['git merge "x${Y}--no-verify" y', MESSAGES.noVerify],
-  ['perl -M strict -e \'unlink ".git/hooks/pre-commit"\'', MESSAGES.runsCode], ['perl -I . -e \'unlink ".git/hooks/pre-commit"\'', MESSAGES.runsCode],
-  ['python3 -W ignore -c \'import os; os.remove(".git/hooks/pre-commit")\'', MESSAGES.runsCode], ['python3 -X dev -c \'import os; os.remove(".git/hooks/pre-commit")\'', MESSAGES.runsCode],
-  ['node -r fs -e \'x(".git/hooks/pre-commit")\'', MESSAGES.runsCode], ['node --require fs -e \'x(".git/hooks/pre-commit")\'', MESSAGES.runsCode],
-  ['ruby -r fileutils -e \'FileUtils.rm(".git/hooks/pre-commit")\'', MESSAGES.runsCode], ['perl -n script.pl -e \'x(".git/config")\'', MESSAGES.runsCode],
+  ['perl -M strict -e \'unlink ".git/hooks/pre-commit"\'', MESSAGES.guardedPath], ['perl -I . -e \'unlink ".git/hooks/pre-commit"\'', MESSAGES.guardedPath],
+  ['python3 -W ignore -c \'import os; os.remove(".git/hooks/pre-commit")\'', MESSAGES.guardedPath], ['python3 -X dev -c \'import os; os.remove(".git/hooks/pre-commit")\'', MESSAGES.guardedPath],
+  ['node -r fs -e \'x(".git/hooks/pre-commit")\'', MESSAGES.guardedPath], ['node --require fs -e \'x(".git/hooks/pre-commit")\'', MESSAGES.guardedPath],
+  ['ruby -r fileutils -e \'FileUtils.rm(".git/hooks/pre-commit")\'', MESSAGES.guardedPath], ['perl -n script.pl -e \'x(".git/config")\'', MESSAGES.guardedPath],
   ['bunx tsx .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['bun x tsx .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
   ['deno .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['deno task t .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')],
   ['tsx .claude/kh-orchestration/scripts/ko.mjs approve', MESSAGES.ownerOnly('approve')], ['ts-node .claude/kh-orchestration/scripts/ko.mjs propose', MESSAGES.ownerOnly('propose')],
@@ -449,7 +465,7 @@ const ALLOWED = [
   `${KO} run approve`, 'echo hookspath', 'grep -rn "\\.git/hooks" docs/',
 
   // near misses of the blocked rows
-  'git commit --no-e', 'git commit --no-edit', 'git commit -m -n', 'git commit -- -n', 'git commit -uno', 'git commit -amn', 'git commit -C HEAD',
+  'git commit --no-e', 'git commit --no-edit', 'git commit -m -n', 'git commit -uno', 'git commit -amn', 'git commit -C HEAD',
   'git commit -F msg.txt', 'git commit --message --no-verify', 'git merge --no-verify-signatures x', 'git merge --no-stat x', 'git log --no-merges', 'git fetch -n',
   'git clean -n', 'git cherry-pick -n abc', 'git commit -m "$MSG"', 'git commit -F "$F"', 'git commit -m "$(date)"', '/usr/bin/gitk commit -n', 'legit commit -n',
   'echo git commit -n', 'echo "git commit --no-verify"', 'git -C commit log -n 1', 'git status', 'git config user.name x', 'git config --get user.name',
@@ -468,11 +484,17 @@ const ALLOWED = [
   'git diff | python3 -m json.tool', "git log | perl -ne 'print if /x/'", 'echo x.git | node', 'X="git commit -n"; eval $X', 'case "$x" in a) echo a;; esac',
   "find . -name '*.orig' -delete",
   // a program that names no guarded path stays allowed, whatever words it holds
-  "sed -n '/hooksPath/p' f", "sed -i 's/a/b/' src/x.js", "sed -e 's/--no-verify//' -e 's/commit -n/x/' f", "awk '{print $1 > \"out.txt\"}' f",
+  "sed -n '/hooksPath/p' f", "sed -i 's/a/b/' src/x.js", "sed -e 's/--no-verify//' f", "awk '{print $1 > \"out.txt\"}' f",
   // exclusions are text values
   'tar czf out.tgz --exclude=.git .', 'rsync -a --exclude .git ./ /tmp/x/', 'rsync -a --exclude .git/hooks src/ dst/', 'grep -rn foo --exclude-dir=.git .',
   "zip -r x.zip . -x '.git/*'", "zip -r x.zip . -x '.git/*' '*.tmp'", "find . -path ./.git -prune -o -name '*.py' -print", 'rsync -a --exclude-from=.git/info/exclude src/ dst/',
   'tar -czf x.tgz --exclude-vcs .', "find . -name .git -prune -o -type f -print",
+  // third re-review: near misses
+  'git commit -m "--no-verify is banned" -a', 'git commit -mn', 'git commit -m"Fix $ISSUE"', 'git commit -m"Fix $ISSUE" -a', 'git commit --message="use -n carefully"',
+  'git merge --no-verify-signatures side', 'git merge -n side', "sed -i 's#https://x.git/hooks#y#' README.md", "sed 's/old.git\\/hooks/new/' f", "sed -n '/my.git\\/config/p' f",
+  'docker run img sh -c "npm test && git status"', "ssh host 'git pull && npm ci'", 'npm test -- --grep "no-verify flag is refused"', 'pytest -k "no_verify or hookspath"',
+  'gh issue create --title "hooksPath conflict" --body "set core.hooksPath and commit -n"', 'jest --testNamePattern "commit -n is blocked"',
+  'git commit -m "docs: explain why git commit -n is refused"', 'npm run build -- --name "my app"', "bash -c 'npm test && npm run lint'", 'git commit -F "my notes.txt"',
   // second re-review: the exemptions kept, and their near misses
   "find . -path ./.git -prune -o -type f -print | xargs grep -l foo", 'git merge "origin/${BRANCH}"', 'python3 -m pytest -k "no_verify"', 'node -r ./setup.mjs scripts/build.mjs',
   "sed -e 's/--no-verify//' notes.md", "sed -i 's/github/gitlab/' README.md", 'grep approve .claude/kh-orchestration/scripts/ko.mjs', 'diff ko.mjs approve', 'cat ko.mjs',
