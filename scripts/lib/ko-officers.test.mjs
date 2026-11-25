@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import { MAX_GLOBS, matchesGlob } from '../../assets/scripts/extension.mjs';
-import { OFFICERS, officersUnreadableMessage } from '../../assets/scripts/ko-digest.mjs';
+import { OFFICERS, officersUnreadableMessage, treeNotIdMessage } from '../../assets/scripts/ko-digest.mjs';
 import {
   DEFAULT_TIMEOUT_SECONDS, MAX_OUTPUT_CHARACTERS, MAX_TIMEOUT_SECONDS, duplicateIdMessage, invalidOfficersMessage, officersOfTree, runOfficers, signalMessage, startFailedMessage,
 } from '../../assets/scripts/ko-officers.mjs';
@@ -68,6 +68,9 @@ test('officersOfTree returns the digest module\'s problem when the file cannot b
   assert.deepEqual(readDocument(document({ officers: [] })), { baseBranch: 'main', officers: [] });
   withRepo({ 'a.txt': 'x' }, (repo) => {
     assert.match(officersOfTree(repo.root, TREE).problem, /^The protected files could not be read: /);
+    for (const name of ['HEAD', 'main', 'HEAD^{tree}'.slice(0, 4), '--output=x', '']) {
+      assert.deepEqual(officersOfTree(repo.root, name), { problem: treeNotIdMessage }, name);
+    }
   });
 });
 
@@ -78,7 +81,12 @@ test('officersOfTree refuses what the runner cannot run, with fixed text naming 
     [{ ...document(), extra: 1 }, 'it has a key other than schema, baseBranch, protected and officers'],
     [{ schema: 1, protected: [], officers: [] }, 'it has a key other than schema, baseBranch, protected and officers'],
     [document({ officers: [{ ...officer(), extra: 1 }] }), 'officer o1 has a key other than id, rule, argv, appliesTo, timeoutSeconds and options'],
-    [document({ officers: [{ id: 'o1', argv: ['x'], appliesTo: ['**'] }] }), 'officer o1 has a key other than id, rule, argv, appliesTo, timeoutSeconds and options'],
+    [document({ officers: [{ id: 'o1', argv: ['x'], appliesTo: ['**'] }] }), 'officer o1 is missing the key rule'],
+    [document({ officers: [{ id: 'o1', rule: null, argv: ['x'] }] }), 'officer o1 is missing the key appliesTo'],
+    [document({ officers: [officer({ id: '' })] }), 'an officer has an empty id'],
+    [document({ officers: [officer({ argv: [''] })] }), 'officer o1: argv must start with a command, and no element may contain a NUL character'],
+    [document({ officers: [officer({ argv: ['tr\u0000ue'] })] }), 'officer o1: argv must start with a command, and no element may contain a NUL character'],
+    [document({ officers: [officer({ argv: ['node', 'a\u0000b'] })] }), 'officer o1: argv must start with a command, and no element may contain a NUL character'],
     [document({ officers: [officer({ rule: 1 })] }), 'officer o1: rule must be a string or null'],
     [document({ officers: [officer({ appliesTo: [] })] }), 'officer o1: appliesTo must be a non-empty list of valid globs'],
     [document({ officers: [officer({ appliesTo: ['a/'] })] }), 'officer o1: appliesTo must be a non-empty list of valid globs'],
@@ -234,5 +242,104 @@ test('output is the first 4000 characters of standard output then standard error
     const [astral] = await run(repo, [{ id: 'astral', argv: node('process.stdout.write("x".repeat(3999) + "\\u{1F600}")') }]);
     assert.equal(astral.output, 'x'.repeat(3999));
     assert.equal(astral.output.isWellFormed(), true);
+  });
+});
+
+test('an argv that cannot be spawned is an error with the start-failure text, and the remaining officers still run', async () => {
+  await inRepo({}, async (repo) => {
+    const results = await run(repo, [
+      { id: 'empty', argv: [''] },
+      { id: 'nul', argv: ['tr\u0000ue'] },
+      { id: 'nul-arg', argv: [process.execPath, 'a\u0000b'] },
+      { id: 'after', argv: node('') },
+    ]);
+    assert.deepEqual(results.map((r) => [r.result, r.output]), [['error', startFailedMessage('')], ['error', startFailedMessage('tr\u0000ue')], ['error', startFailedMessage(process.execPath)], ['pass', '']]);
+  });
+});
+
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const pidFile = (repo) => join(repo.root, '..', 'stray.pid');
+// An officer whose leader ends at once, leaving a descendant that holds the output pipes; `detached` puts the descendant in a group of its own.
+const straySpawner = (repo, detached, seconds) => node(
+  `const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, ${seconds * 1000})"], { detached: ${detached}, stdio: ["ignore", "inherit", "inherit"] });
+   require("node:fs").writeFileSync(${JSON.stringify(pidFile(repo))}, String(child.pid)); child.unref();`,
+);
+const killStray = (repo) => {
+  try {
+    process.kill(Number(readFileSync(pidFile(repo), 'utf8')), 'SIGKILL');
+  } catch {
+    // already gone
+  }
+};
+
+test('the run ends by the timeout plus its grace even when a descendant in another group holds the pipes', async () => {
+  await inRepo({}, async (repo) => {
+    try {
+      const started = Date.now();
+      const [result] = await run(repo, [{ id: 'sticky', timeoutSeconds: 1, argv: node(`process.stdout.write("kept"); require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { detached: true, stdio: ["ignore", "inherit", "inherit"] }).unref(); setInterval(() => {}, 1000);`) }]);
+      assert.equal(result.result, 'timeout');
+      assert.equal(result.output, 'kept');
+      assert.ok(Date.now() - started < 4000, `${Date.now() - started} ms`);
+    } finally {
+      killStray(repo);
+    }
+  });
+});
+
+test('a leader that exits 0 is a pass even while a descendant in another group holds the pipes, and the run does not wait for it', async () => {
+  await inRepo({}, async (repo) => {
+    try {
+      const started = Date.now();
+      const [result] = await run(repo, [{ id: 'detached', argv: straySpawner(repo, true, 20) }]);
+      assert.equal(result.result, 'pass');
+      assert.ok(Date.now() - started < 3000, `${Date.now() - started} ms`);
+    } finally {
+      killStray(repo);
+    }
+  });
+});
+
+test('a background child left in the officer\'s group is killed when the officer finishes, whatever the result', async () => {
+  await inRepo({}, async (repo) => {
+    for (const exit of ['', 'process.exit(1);']) {
+      try {
+        const started = Date.now();
+        const [result] = await run(repo, [{ id: 'leaky', argv: node(`${straySpawner(repo, false, 20).at(-1)} ${exit}`) }]);
+        assert.equal(result.result, exit === '' ? 'pass' : 'fail');
+        assert.ok(Date.now() - started < 3000, `${Date.now() - started} ms`);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(alive(Number(readFileSync(pidFile(repo), 'utf8'))), false);
+      } finally {
+        killStray(repo);
+      }
+    }
+  });
+});
+
+test('standard output and standard error are decoded separately, so a split character is two invalid bytes', async () => {
+  await inRepo({}, async (repo) => {
+    const [result] = await run(repo, [{ id: 'split', argv: node('process.stdout.write(Buffer.from([0xc3])); process.stderr.write(Buffer.from([0xa9]))') }]);
+    assert.equal(result.output, '\ufffd\ufffd');
+  });
+});
+
+test('the officer inherits no git configuration and no KO_ variable but the four it is given', async () => {
+  await inRepo({}, async (repo) => {
+    const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'KO_STRAY', 'KO_OPTIONS_EXTRA'];
+    for (const name of names) process.env[name] = 'x';
+    process.env.KEEP_ME = 'y';
+    try {
+      const [result] = await run(repo, [{ id: 'env', argv: node('process.stdout.write(JSON.stringify(Object.keys(process.env).filter((n) => /^(GIT_|KO_|KEEP_)/.test(n)).sort()))') }]);
+      assert.deepEqual(JSON.parse(result.output), ['KEEP_ME', 'KO_BASE', 'KO_CHANGED_FILE', 'KO_OPTIONS', 'KO_TREE']);
+    } finally {
+      for (const name of [...names, 'KEEP_ME']) delete process.env[name];
+    }
   });
 });

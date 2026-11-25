@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { KIT_VERSION, isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import { OFFICERS, officersUnreadableMessage, digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { invalidVerdictKeyMessage, stateDir, verdictName } from '../../assets/scripts/ko-state.mjs';
+import { officersOfTree } from '../../assets/scripts/ko-officers.mjs';
 import { passing, produceVerdict, readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 isolateProcessEnv();
@@ -97,25 +98,20 @@ test('passing is true only when the ids equal the officers read from the same tr
 });
 
 const officersFile = (...officers) => JSON.stringify({
-  schema: 1, baseBranch: 'main', protected: [], officers: officers.map(({ id, argv, appliesTo = ['**'] }) => ({ id, rule: null, argv, appliesTo })),
+  schema: 1, baseBranch: 'main', protected: [], officers: officers.map(({ id, argv, appliesTo = ['**'], rule = null }) => ({ id, rule, argv, appliesTo })),
 });
 const node = (code) => [process.execPath, '-e', code];
 
-test('produceVerdict records the digest, the results and the supplied fields for the tree', async () => {
+test('produceVerdict reads the officers from the tree, and records the digest, the results and the supplied fields', async () => {
   const marker = (id) => `require("node:fs").writeFileSync(${JSON.stringify(id)}, "x")`;
   await withRepo({
-    [OFFICERS]: officersFile({ id: 'ok', argv: node('') }, { id: 'bad', argv: node('process.exit(1)') }, { id: 'docs', argv: node(marker('docs-ran')), appliesTo: ['docs/**'] }),
+    [OFFICERS]: officersFile({ id: 'ok', argv: node('') }, { id: 'bad', argv: node('process.exit(1)'), rule: 'R1' }, { id: 'docs', argv: node(marker('docs-ran')), appliesTo: ['docs/**'] }),
     'src/a.js': 'one\n',
   }, async (repo) => {
     const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
-    const officers = [
-      { id: 'ok', rule: null, argv: node(''), appliesTo: ['**'], timeoutSeconds: 30, options: {} },
-      { id: 'bad', rule: 'R1', argv: node('process.exit(1)'), appliesTo: ['**'], timeoutSeconds: 30, options: {} },
-      { id: 'docs', rule: null, argv: node(marker('docs-ran')), appliesTo: ['docs/**'], timeoutSeconds: 30, options: {} },
-    ];
     const waivers = [{ officer: 'bad', reason: 'x' }];
     const before = new Date().toISOString();
-    const made = await produceVerdict(repo.root, { tree, base: 'none', baseTree: null, branch: 'main', officers, waivers, kitVersion: KIT_VERSION });
+    const made = await produceVerdict(repo.root, { tree, base: 'none', branch: 'main', waivers, kitVersion: KIT_VERSION });
     const { verdict } = made;
     assert.equal(verdict.schema, 1);
     assert.deepEqual([verdict.tree, verdict.base, verdict.branch, verdict.kitVersion], [tree, 'none', 'main', KIT_VERSION]);
@@ -126,18 +122,63 @@ test('produceVerdict records the digest, the results and the supplied fields for
     assert.equal(existsSync(join(repo.root, 'docs-ran')), false);
     writeVerdict(repo.root, verdict);
     assert.deepEqual(readVerdict(repo.root, tree, 'none'), verdict);
-    assert.equal(passing(verdict, officers), false);
+    assert.equal(passing(verdict, officersOfTree(repo.root, tree).officers), false);
   });
 });
 
-test('produceVerdict returns the digest\'s problem and runs nothing when the digest cannot be trusted', async () => {
+test('a verdict is for the officers the tree holds: it cannot be made with other ones', async () => {
+  await withRepo({ [OFFICERS]: officersFile({ id: 'o1', argv: ['false'] }) }, async (repo) => {
+    const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+    assert.equal(produceVerdict.length, 2);
+    const { verdict } = await produceVerdict(repo.root, { tree, base: 'none', branch: null, waivers: [], kitVersion: '0.1.0', officers: [{ id: 'o1', rule: null, argv: ['true'], appliesTo: ['**'], timeoutSeconds: 30, options: {} }] });
+    assert.equal(verdict.officers[0].result, 'fail');
+    assert.equal(passing(verdict, officersOfTree(repo.root, tree).officers), false);
+  });
+});
+
+test('produceVerdict derives the base tree from the base, for the agent-rule changes', async () => {
+  const rules = (why) => `# Rules\n\nPreamble.\n\n## A1 — an agent rule\n- why: ${why}\n- enforced-by: officer\n- pointer: x.mjs\n- approval: agent\n`;
+  await withRepo({ [OFFICERS]: officersFile({ id: 'ok', argv: node('') }), 'docs/harness/RULES.md': rules('first') }, async (repo) => {
+    const base = repo.git('rev-parse', 'HEAD').stdout.trim();
+    repo.write('docs/harness/RULES.md', rules('second'));
+    repo.commitAll('reword');
+    const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+    const { verdict } = await produceVerdict(repo.root, { tree, base, branch: 'x', waivers: [], kitVersion: '0.1.0' });
+    assert.deepEqual(verdict.agentRuleChanges, [{ id: 'A1', change: 'reworded' }]);
+  });
+});
+
+test('produceVerdict refuses a tree or base that is not an object id before any git call, and writes nothing', async () => {
+  await withRepo({ [OFFICERS]: officersFile({ id: 'ok', argv: node('') }) }, async (repo) => {
+    const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+    const target = join(repo.root, '..', 'written-by-git');
+    for (const [t, b] of [[tree, `--output=${target}`], [`--output=${target}`, 'none'], [tree, 'main'], ['HEAD', 'none']]) {
+      assert.deepEqual(await produceVerdict(repo.root, { tree: t, base: b, branch: null, waivers: [], kitVersion: '0.1.0' }), { problem: invalidVerdictKeyMessage });
+    }
+    assert.equal(existsSync(target), false);
+  });
+});
+
+test('produceVerdict returns the problem and runs nothing when the officers file or the digest cannot be trusted', async () => {
   await withRepo({ 'a.txt': 'x' }, async (repo) => {
     const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
-    const officers = [{ id: 'ok', rule: null, argv: node(`require("node:fs").writeFileSync("ran", "x")`), appliesTo: ['**'], timeoutSeconds: 30, options: {} }];
-    const made = await produceVerdict(repo.root, { tree, base: 'none', baseTree: null, branch: null, officers, waivers: [], kitVersion: '0.1.0' });
-    assert.deepEqual(made, { problem: officersUnreadableMessage });
+    assert.deepEqual(await produceVerdict(repo.root, { tree, base: 'none', branch: null, waivers: [], kitVersion: '0.1.0' }), { problem: officersUnreadableMessage });
+  });
+  await withRepo({ [OFFICERS]: JSON.stringify({ ...JSON.parse(officersFile({ id: 'ok', argv: node(`require("node:fs").writeFileSync("ran", "x")`) })), protected: ['src'] }), 'src/a.js': 'x\n' }, async (repo) => {
+    const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+    const made = await produceVerdict(repo.root, { tree, base: 'none', branch: null, waivers: [], kitVersion: '0.1.0' });
+    assert.deepEqual(made, digestOfTree(repo.root, tree));
+    assert.equal(typeof made.problem, 'string');
     assert.equal(existsSync(join(repo.root, 'ran')), false);
   });
+});
+
+test('passing is false for no verdict and for anything but a list of officers', () => {
+  assert.equal(passing(null, []), false);
+  assert.equal(passing(undefined, []), false);
+  assert.equal(passing(verdictOf({ officers: [] }), { problem: 'x' }), false);
+  assert.equal(passing(verdictOf({ officers: [] }), { baseBranch: 'main', officers: [] }), false);
+  assert.equal(passing(verdictOf({ officers: [] }), null), false);
 });
 
 test('two processes writing the same verdict at once leave one whole file and no temporary file', async () => {

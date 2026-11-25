@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { MAX_GLOBS, isValidGlob, matchesGlob, readOfficers } from './extension.mjs';
-import { OFFICERS, officersText, officersUnreadableMessage, readFailedMessage } from './ko-digest.mjs';
+import { OFFICERS, isFullObjectId, officersText, officersUnreadableMessage, readFailedMessage, treeNotIdMessage } from './ko-digest.mjs';
 import { listEntries } from './ko-git.mjs';
 
 export const DEFAULT_TIMEOUT_SECONDS = 600;
@@ -15,23 +15,27 @@ export const MAX_OUTPUT_CHARACTERS = 4000;
 
 export const invalidOfficersMessage = (reason) => `${OFFICERS} is not usable: ${reason}.`;
 export const duplicateIdMessage = (id) => invalidOfficersMessage(`two officers have the id ${id}`);
+export const emptyIdMessage = invalidOfficersMessage('an officer has an empty id');
 export const startFailedMessage = (command) => `${command} could not be started.`;
 export const signalMessage = (signal) => `The officer was ended by the signal ${signal}.`;
 
 const TOP_KEYS = ['schema', 'baseBranch', 'protected', 'officers'];
 const OFFICER_KEYS = ['id', 'rule', 'argv', 'appliesTo', 'timeoutSeconds', 'options'];
 const REQUIRED_OFFICER_KEYS = ['id', 'rule', 'argv', 'appliesTo'];
-const hasExactlyKeys = (value, allowed, required) => Object.keys(value).every((key) => allowed.includes(key)) && required.every((key) => key in value);
+const hasOnlyKeys = (value, allowed) => Object.keys(value).every((key) => allowed.includes(key));
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 // The reason one officer is unusable, or null. The id, the argv and the globs of `appliesTo` as strings
 // were checked by `readOfficers` (extension.mjs) only for what the digest needs; this is the rest.
 function officerProblem(officer) {
-  if (!isPlainObject(officer) || !hasExactlyKeys(officer, OFFICER_KEYS, REQUIRED_OFFICER_KEYS)) {
+  if (!isPlainObject(officer) || !hasOnlyKeys(officer, OFFICER_KEYS)) {
     return `officer ${officer?.id} has a key other than id, rule, argv, appliesTo, timeoutSeconds and options`;
   }
-  const { id, rule, appliesTo, timeoutSeconds, options } = officer;
+  const { id, rule, argv, appliesTo, timeoutSeconds, options } = officer;
+  const missing = REQUIRED_OFFICER_KEYS.find((key) => !(key in officer));
+  if (missing !== undefined) return `officer ${id} is missing the key ${missing}`;
+  if (argv[0] === '' || argv.some((element) => element.includes('\0'))) return `officer ${id}: argv must start with a command, and no element may contain a NUL character`;
   if (rule !== null && typeof rule !== 'string') return `officer ${id}: rule must be a string or null`;
   if (!Array.isArray(appliesTo) || appliesTo.length === 0 || appliesTo.length > MAX_GLOBS
     || !appliesTo.every((glob) => typeof glob === 'string' && isValidGlob(glob))) {
@@ -52,6 +56,7 @@ function officerProblem(officer) {
  * this adds the base branch, the exact key sets and each officer's fields.
  */
 export function officersOfTree(root, tree) {
+  if (!isFullObjectId(tree)) return { problem: treeNotIdMessage };
   let loaded;
   try {
     loaded = officersText(root, tree, listEntries(root, tree));
@@ -61,10 +66,11 @@ export function officersOfTree(root, tree) {
   if (loaded.problem !== undefined) return loaded;
   if (readOfficers(loaded.text) === null) return { problem: officersUnreadableMessage };
   const parsed = JSON.parse(loaded.text);
-  if (!hasExactlyKeys(parsed, TOP_KEYS, TOP_KEYS)) return { problem: invalidOfficersMessage('it has a key other than schema, baseBranch, protected and officers') };
+  if (!hasOnlyKeys(parsed, TOP_KEYS) || !TOP_KEYS.every((key) => key in parsed)) return { problem: invalidOfficersMessage('it has a key other than schema, baseBranch, protected and officers') };
   if (typeof parsed.baseBranch !== 'string' || parsed.baseBranch === '') return { problem: invalidOfficersMessage('baseBranch must be a non-empty string') };
   const ids = new Set();
   for (const officer of parsed.officers) {
+    if (officer.id === '') return { problem: emptyIdMessage };
     const reason = officerProblem(officer);
     if (reason !== null) return { problem: invalidOfficersMessage(reason) };
     if (ids.has(officer.id)) return { problem: duplicateIdMessage(officer.id) };
@@ -76,8 +82,12 @@ export function officersOfTree(root, tree) {
   };
 }
 
-const INHERITED_GIT_VARIABLES = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_PREFIX', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'];
+// Not passed on: the variables a git hook sets, all git configuration injected through the environment,
+// and any KO_ variable of the caller (this module sets the four the officer is meant to see).
+const NOT_INHERITED = /^(?:GIT_(?:DIR|WORK_TREE|INDEX_FILE|PREFIX|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES)|GIT_CONFIG_.*|KO_.*)$/;
 const KILL_GRACE_MS = 1000;
+// How long output still in the pipes is read after the officer has ended, before the pipes are closed on any descendant that holds them.
+const DRAIN_MS = 200;
 // Four bytes is the most one character takes, so this many bytes always hold the characters kept.
 const CAPTURE_BYTES = MAX_OUTPUT_CHARACTERS * 4;
 
@@ -96,14 +106,17 @@ function capture(stream) {
   return () => Buffer.concat(chunks);
 }
 
-// Leniently decoded (an invalid byte becomes U+FFFD), cut at the character limit without splitting a surrogate pair.
+// Each stream is decoded on its own, leniently (an invalid byte becomes U+FFFD), cut at the character limit without splitting a surrogate pair.
 function textOf(stdout, stderr) {
-  const text = Buffer.concat([stdout, stderr]).toString('utf8');
+  const text = stdout.toString('utf8') + stderr.toString('utf8');
   const cut = text.slice(0, MAX_OUTPUT_CHARACTERS);
   return cut.isWellFormed() ? cut : cut.slice(0, -1);
 }
 
-// Starts the officer as the leader of its own process group, so a timeout reaches its descendants.
+// Starts the officer as the leader of its own process group, so the group can be signalled whole. The run ends
+// when the leader exits (its status decides) or, after a timeout, when the grace for the polite signal is over;
+// either way the whole group is then killed and the pipes are read for DRAIN_MS more at most, so no descendant,
+// not even one in a group of its own, can hold the run open.
 function runOne(root, officer, env) {
   const [command, ...args] = officer.argv;
   const started = performance.now();
@@ -111,10 +124,15 @@ function runOne(root, officer, env) {
     const finish = (result, exitCode, output) => resolve({
       id: officer.id, rule: officer.rule, result, exitCode, seconds: Math.round(performance.now() - started) / 1000, output,
     });
-    const child = spawn(command, args, { cwd: root, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let child;
+    try {
+      child = spawn(command, args, { cwd: root, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      finish('error', null, startFailedMessage(command));
+      return;
+    }
     const stdout = capture(child.stdout);
     const stderr = capture(child.stderr);
-    const output = () => textOf(stdout(), stderr());
     const killGroup = (signal) => {
       try {
         process.kill(-child.pid, signal);
@@ -123,28 +141,51 @@ function runOne(root, officer, env) {
       }
     };
     let timedOut = false;
+    let ended = false;
     let hardKill;
     const timer = setTimeout(() => {
       timedOut = true;
       killGroup('SIGTERM');
-      hardKill = setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS);
+      hardKill = setTimeout(() => end(null, null), KILL_GRACE_MS);
     }, officer.timeoutSeconds * 1000);
+    // The one place a run ends. The group is killed, the pipes are drained briefly and closed, and the result is decided.
+    const end = (code, signal) => {
+      if (ended) return;
+      ended = true;
+      clearTimeout(timer);
+      clearTimeout(hardKill);
+      killGroup('SIGKILL');
+      const open = [child.stdout, child.stderr].filter((stream) => !stream.closed);
+      let pending = open.length;
+      let settled = false;
+      let limit;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(limit);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        const output = textOf(stdout(), stderr());
+        if (timedOut) finish('timeout', null, output);
+        else if (signal !== null) finish('error', null, signalMessage(signal));
+        else finish(code === 0 ? 'pass' : 'fail', code, output);
+      };
+      limit = setTimeout(settle, DRAIN_MS);
+      for (const stream of open) {
+        stream.on('close', () => {
+          pending -= 1;
+          if (pending === 0) settle();
+        });
+      }
+      if (pending === 0) settle();
+    };
     child.on('error', () => {
+      if (ended) return;
+      ended = true;
       clearTimeout(timer);
       finish('error', null, startFailedMessage(command));
     });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      clearTimeout(hardKill);
-      if (timedOut) {
-        killGroup('SIGKILL');
-        finish('timeout', null, output());
-      } else if (signal !== null) {
-        finish('error', null, signalMessage(signal));
-      } else {
-        finish(code === 0 ? 'pass' : 'fail', code, output());
-      }
-    });
+    child.on('exit', end);
   });
 }
 
@@ -164,8 +205,7 @@ export async function runOfficers(root, { officers, base, tree, changed }) {
   try {
     const changedFile = join(directory, 'changed');
     writeFileSync(changedFile, changed.join('\0'));
-    const inherited = { ...process.env };
-    for (const name of INHERITED_GIT_VARIABLES) delete inherited[name];
+    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !NOT_INHERITED.test(name)));
     const results = [];
     for (const officer of officers) {
       if (!changed.some((path) => officer.appliesTo.some((glob) => matchesGlob(glob, path)))) {

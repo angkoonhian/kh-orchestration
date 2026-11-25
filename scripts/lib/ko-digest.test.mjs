@@ -433,3 +433,11 @@ test('agentRuleChanges throws a fixed message when the RULES.md of either tree i
     
   });
 });
+
+test('officers.json that cannot be read from the object database is a failed read, not an absent or misshapen file', () => {
+  withRepo({}, (repo) => {
+    const oid = repo.git('rev-parse', `HEAD:${OFFICERS}`).stdout.trim();
+    rmSync(join(repo.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2)));
+    assert.deepEqual(digestOf(repo), { problem: readFailedMessage('git failed to read the file.') });
+  });
+});

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
   OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
-  listEntries, readBlob, repoRoot, tidy,
+  listEntries, readBlob, repoRoot, tidy, treeOfCommit,
 } from '../../assets/scripts/ko-git.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -357,5 +357,26 @@ test('output beyond the limit has its own fixed text', () => {
     const sha = repo.git('hash-object', '-w', 'big.bin').stdout.trim();
     const result = git(repo.root, ['cat-file', 'blob', sha]);
     assert.deepEqual(result, { status: 127, stdout: '', stderr: OUTPUT_TOO_LARGE });
+  });
+});
+
+test('a revision argument that looks like an option is a revision, never an option', () => {
+  withRepo({ files: { 'a.txt': 'x' } }, (repo) => {
+    const target = join(repo.root, '..', 'written-by-git');
+    const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+    assert.throws(() => changedPaths(repo.root, `--output=${target}`, tree), { message: gitFailedMessage('list the changed paths') });
+    assert.throws(() => changedPaths(repo.root, tree, `--output=${target}`), { message: gitFailedMessage('list the changed paths') });
+    assert.throws(() => listEntries(repo.root, `--output=${target}`), { message: gitFailedMessage('list the tree') });
+    assert.throws(() => readBlob(repo.root, `--output=${target}`, 'a.txt'), { message: gitFailedMessage('read the file') });
+    assert.throws(() => treeOfCommit(repo.root, `--output=${target}`), { message: gitFailedMessage('read the base tree') });
+    assert.equal(existsSync(target), false);
+  });
+});
+
+test('treeOfCommit is the tree of a commit, and null for the base none', () => {
+  withRepo({ files: { 'a.txt': 'x' } }, (repo) => {
+    assert.equal(treeOfCommit(repo.root, head(repo)), repo.git('rev-parse', 'HEAD^{tree}').stdout.trim());
+    assert.equal(treeOfCommit(repo.root, 'none'), null);
+    assert.throws(() => treeOfCommit(repo.root, 'f'.repeat(40)), { message: gitFailedMessage('read the base tree') });
   });
 });

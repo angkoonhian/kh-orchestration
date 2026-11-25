@@ -2,8 +2,8 @@
 // kept in `verdicts/<tree>-<base>.json` under the shared state directory. The
 // commit gate relies on it, so it is never trusted past what `readVerdict` checks.
 import { agentRuleChanges, digestOfTree } from './ko-digest.mjs';
-import { changedPaths } from './ko-git.mjs';
-import { runOfficers } from './ko-officers.mjs';
+import { changedPaths, treeOfCommit } from './ko-git.mjs';
+import { officersOfTree, runOfficers } from './ko-officers.mjs';
 import { StateError, readState, verdictName, writeState } from './ko-state.mjs';
 
 const RESULTS = ['pass', 'fail', 'skipped', 'timeout', 'error'];
@@ -15,18 +15,30 @@ const resultHasShape = (entry) => entry !== null && typeof entry === 'object'
   && (entry.exitCode === null || Number.isInteger(entry.exitCode)) && typeof entry.seconds === 'number' && isString(entry.output);
 
 /**
- * Runs the officers on a tree and returns `{ verdict }`, or `{ problem }` when
- * the digest cannot be trusted (then no officer is started and there is no
- * verdict). `baseTree` is the tree of `base`, or null when `base` is `none`;
- * `officers` come from `officersOfTree` for the same tree; `waivers` are
- * recorded as given. Throws what `agentRuleChanges` and `changedPaths` throw.
+ * Runs the officers the tree holds and returns `{ verdict }`, or `{ problem }`
+ * (fixed text) when the tree or base is not an object id, the officers file
+ * cannot be used, or the digest cannot be trusted; then no officer is started
+ * and there is no verdict. The officers are read from `tree` here, never taken
+ * from the caller, so the record is of the tree's own checks. `base` is a commit
+ * id or `none`; its tree is derived from it. `waivers` are recorded as given.
+ * Precondition: the working tree equals `tree` (the officers run in it); the
+ * caller checks that, this function cannot. Throws what `agentRuleChanges`,
+ * `treeOfCommit` and `changedPaths` throw.
  */
-export async function produceVerdict(root, { tree, base, baseTree, branch, officers, waivers, kitVersion }) {
+export async function produceVerdict(root, { tree, base, branch, waivers, kitVersion }) {
+  try {
+    verdictName(tree, base);
+  } catch (error) {
+    if (error instanceof StateError) return { problem: error.message };
+    throw error;
+  }
+  const read = officersOfTree(root, tree);
+  if (read.problem !== undefined) return { problem: read.problem };
   const digest = digestOfTree(root, tree);
   if (digest.problem !== undefined) return { problem: digest.problem };
   const startedAt = new Date().toISOString();
-  const changes = agentRuleChanges(root, baseTree, tree);
-  const results = await runOfficers(root, { officers, base, tree, changed: changedPaths(root, base, tree) });
+  const changes = agentRuleChanges(root, treeOfCommit(root, base), tree);
+  const results = await runOfficers(root, { officers: read.officers, base, tree, changed: changedPaths(root, base, tree) });
   return {
     verdict: {
       schema: 1, tree, base, branch, digest: digest.digest, officers: results, agentRuleChanges: changes, waivers, startedAt, finishedAt: new Date().toISOString(), kitVersion,
@@ -67,9 +79,11 @@ export function readVerdict(root, tree, base) {
 /**
  * Whether a verdict shows every officer passing. `officers` is the list read from
  * the SAME tree: the verdict's officer ids must equal its ids in order, and every
- * result must be `pass` or `skipped`. A repository with no officers passes.
+ * result must be `pass` or `skipped`. A repository with no officers passes. No
+ * verdict, or anything but a list of officers, is not passing.
  */
 export function passing(verdict, officers) {
+  if (verdict === null || typeof verdict !== 'object' || !Array.isArray(verdict.officers) || !Array.isArray(officers)) return false;
   return verdict.officers.length === officers.length
     && verdict.officers.every((entry, index) => entry.id === officers[index].id && (entry.result === 'pass' || entry.result === 'skipped'));
 }

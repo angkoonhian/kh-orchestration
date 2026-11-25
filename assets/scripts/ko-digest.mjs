@@ -22,6 +22,9 @@ export const objectMismatchMessage = (path) => `The bytes of ${path} do not hash
 
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
+// Whether a string is a full object id: 40 or 64 lower-case hexadecimal digits.
+export const isFullObjectId = (text) => OBJECT_ID.test(text);
+
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 
 // Throws when the bytes are not valid UTF-8. A byte-order mark is kept, so it is part of the text.
@@ -50,17 +53,25 @@ const ancestorsAndSelf = (path) => path.split('/').map((_, index, segments) => s
  * The text of `officers.json` in a tree, read through the verified read, as
  * `{ text }`, or `{ problem }` (fixed text) when the file is absent, is not
  * reached as a plain file (a link at or above it), is not valid UTF-8, or its
- * bytes do not hash to the object id. `entries` is `listEntries(root, tree)`.
+ * bytes do not hash to the object id. A read that fails throws, so it is never
+ * mistaken for an absent file. `entries` is `listEntries(root, tree)`.
  */
 export function officersText(root, tree, entries) {
   const linked = ancestorsAndSelf(OFFICERS).find((path) => entries.some((entry) => entry.path === path && (entry.mode === SYMLINK || entry.mode === GITLINK)));
   if (linked !== undefined) return { problem: linkMessage(linked) };
   const entry = entries.find((candidate) => candidate.path === OFFICERS && candidate.type === 'blob');
   if (entry === undefined) return { problem: officersUnreadableMessage };
+  let bytes;
   try {
-    return { text: decode(readVerified(root, tree, entry)) };
+    bytes = readVerified(root, tree, entry);
   } catch (error) {
-    return { problem: error instanceof ObjectMismatch ? error.message : officersUnreadableMessage };
+    if (error instanceof ObjectMismatch) return { problem: error.message };
+    throw error;
+  }
+  try {
+    return { text: decode(bytes) };
+  } catch {
+    return { problem: officersUnreadableMessage };
   }
 }
 
@@ -77,7 +88,7 @@ export function officersText(root, tree, entries) {
  * a link. A failed read is a problem too, never a digest that omits a file.
  */
 export function digestOfTree(root, tree) {
-  if (!OBJECT_ID.test(tree)) return { problem: treeNotIdMessage };
+  if (!isFullObjectId(tree)) return { problem: treeNotIdMessage };
   try {
     return compute(root, tree);
   } catch (error) {

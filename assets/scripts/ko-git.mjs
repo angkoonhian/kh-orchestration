@@ -100,10 +100,16 @@ export function baseOf(root, baseBranch) {
   return mergeBase.status === 0 ? oneLine(mergeBase.stdout) : NO_BASE;
 }
 
+// The tree of the commit `base` names, or null for the base `none`. Throws when the commit cannot be read.
+export function treeOfCommit(root, base) {
+  if (base === NO_BASE) return null;
+  return oneLine(mustSucceed(git(root, ['rev-parse', '--verify', '--end-of-options', `${base}^{tree}`]), 'read the base tree'));
+}
+
 export function changedPaths(root, base, tree) {
   const argv = base === NO_BASE
-    ? ['ls-tree', '-r', '-z', '--name-only', tree]
-    : ['diff', '--name-only', '-z', '--no-renames', base, tree];
+    ? ['ls-tree', '-r', '-z', '--name-only', '--end-of-options', tree]
+    : ['diff', '--name-only', '-z', '--no-renames', '--end-of-options', base, tree];
   return nulSeparated(mustSucceed(git(root, argv), 'list the changed paths'));
 }
 
@@ -118,10 +124,10 @@ export function tidy(root) {
 // null only when the path is not in the tree. Any failure to find out, and any
 // entry that is not a file, is an error: a caller must never read it as absent.
 export function readBlob(root, tree, path) {
-  const entry = mustSucceed(git(root, ['ls-tree', '-z', tree, '--', path]), 'read the file');
+  const entry = mustSucceed(git(root, ['ls-tree', '-z', '--end-of-options', tree, '--', path]), 'read the file');
   if (entry === '') return null;
   if (entry.split(' ')[1] !== 'blob') throw new Error(notBlobMessage(path));
-  const result = exec(root, ['cat-file', 'blob', `${tree}:${path}`], { readOnly: true, binary: true });
+  const result = exec(root, ['cat-file', 'blob', '--end-of-options', `${tree}:${path}`], { readOnly: true, binary: true });
   return mustSucceed(result, 'read the file');
 }
 
@@ -129,7 +135,7 @@ export function readBlob(root, tree, path) {
 // A symbolic link is a blob of mode 120000 and a submodule a commit of mode 160000;
 // neither is followed, so a path under one is not listed.
 export function listEntries(root, tree) {
-  const out = mustSucceed(git(root, ['ls-tree', '-r', '-z', '--full-tree', tree]), 'list the tree');
+  const out = mustSucceed(git(root, ['ls-tree', '-r', '-z', '--full-tree', '--end-of-options', tree]), 'list the tree');
   return nulSeparated(out).map((line) => {
     const match = line.match(/^(\d+) (\w+) ([0-9a-f]+)\t([\s\S]*)$/);
     if (!match) throw new Error(gitFailedMessage('list the tree'));
