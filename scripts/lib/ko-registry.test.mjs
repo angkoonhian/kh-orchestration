@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { KH_HARNESS_DIR, siblingAbsentMessage } from './test-repo.mjs';
-import { NOT_A_RULE_HEADING, canonicalRegistry, duplicateIdMessage, parseRegistry } from '../../assets/scripts/ko-registry.mjs';
+import { MINOR_WORDING_PROBLEM, NOT_A_RULE_HEADING, canonicalRegistry, duplicateIdMessage, parseRegistry } from '../../assets/scripts/ko-registry.mjs';
 
 const FIXTURE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'contract-1', 'RULES.md'), 'utf8');
 const lf = (text) => text.replace(/\r\n/g, '\n');
@@ -167,21 +167,84 @@ test('the canonical form is the same for the same registry and differs for any c
   for (const [name, text] of Object.entries(changes)) assert.notEqual(canonical(text), canonical(base), name);
 });
 
-test('rewording or re-spacing an approval: agent rule outside its ID, approval, enforced-by and pointer leaves the canonical form unchanged', () => {
+test('only the title and the values of why, verify and priority are free in an approval: agent rule; every other byte is covered', () => {
   const canonical = (text) => canonicalRegistry(parseRegistry(text));
   const base = registry(agentRule('- verify: npm test\n- priority: normal\n'), '## R2 — owner rule\n- enforced-by: none\n');
   const same = {
     'title': base.replace('an agent rule', 'a reworded agent rule'),
+    'title with the separator characters in it': base.replace('an agent rule', 'a — b – c - d -- e'),
     'why': base.replace('a reason', 'another reason'),
     'verify': base.replace('npm test', 'npm run check'),
     'priority': base.replace('priority: normal', 'priority: high'),
-    'an added key': base.replace('- approval: agent', '- approval: agent\n- status: superseded'),
-    'a comment': base.replace('- approval: agent', '- approval: agent\n<!-- note -->'),
-    'prose in the rule': base.replace('- approval: agent', '- approval: agent\n\nsome prose'),
-    'spacing': base.replace('- enforced-by: officer', '*   Enforced_By :   officer  ').replace('- pointer: tools/officers/a1.mjs', '-pointer:tools/officers/a1.mjs'),
-    'key order': base.replace('- enforced-by: officer\n- pointer: tools/officers/a1.mjs\n', '- pointer: tools/officers/a1.mjs\n- enforced-by: officer\n'),
+    'a free value re-spaced and reworded (its `- verify:` prefix as written)': base.replace('- verify: npm test', '- verify:    npm run check  '),
+    'an empty free value': base.replace('a reason', ''),
   };
   for (const [name, text] of Object.entries(same)) assert.equal(canonical(text), canonical(base), name);
+  const changes = {
+    'a status line added': base.replace('- approval: agent', '- approval: agent\n- status: superseded'),
+    'a last-verified line added': base.replace('- approval: agent', '- approval: agent\n- last-verified: 2026-01-01'),
+    'a second why line added': base.replace('- approval: agent', '- approval: agent\n- why: more'),
+    'a free line removed': base.replace('- verify: npm test\n', ''),
+    'a comment added': base.replace('- approval: agent', '- approval: agent\n<!-- note -->'),
+    'prose added': base.replace('- approval: agent', '- approval: agent\n\nsome prose'),
+    'a blank line added': base.replace('- approval: agent', '- approval: agent\n'),
+    'a pointer re-spaced (covered byte for byte)': base.replace('- pointer: tools', '- pointer:  tools'),
+    'an enforced-by re-spaced': base.replace('- enforced-by: officer', '*   Enforced_By :   officer  '),
+    'a pointer bullet changed': base.replace('- pointer:', '* pointer:'),
+    'the order of lines': base.replace('- enforced-by: officer\n- pointer: tools/officers/a1.mjs\n', '- pointer: tools/officers/a1.mjs\n- enforced-by: officer\n'),
+    'the dash before the title': base.replace('## A1 — an agent rule', '## A1 - an agent rule'),
+    'the id': base.replace('## A1', '## A2'),
+    'a free key prefix respelled': base.replace('- verify:', '- Verify:'),
+  };
+  for (const [name, text] of Object.entries(changes)) assert.notEqual(canonical(text), canonical(base), name);
+});
+
+test('an agent rule with two why lines has both free', () => {
+  const canonical = (text) => canonicalRegistry(parseRegistry(text));
+  const two = registry(agentRule('- why: second\n'));
+  assert.equal(canonical(two.replace('a reason', 'x').replace('second', 'y')), canonical(two));
+  assert.notEqual(canonical(two), canonical(registry(agentRule())));
+});
+
+const CONSTRUCTS = {
+  'an unclosed comment': '<!-- hides the rest',
+  'a comment opened as <!-->': '<!-->',
+  'a comment closer': 'text -->',
+  'a lone carriage return': 'text\r## V9 — fake',
+  'a line separator': 'text ## V9 — fake',
+  'a paragraph separator': 'text ## V9 — fake',
+};
+
+test('a free part holding a comment marker, a carriage return or U+2028/U+2029 is a reported problem at its line', () => {
+  for (const [name, construct] of Object.entries(CONSTRUCTS)) {
+    for (const [where, text, line] of [
+      ['a why value', `## A1 — t\n- why: ${construct}\n- approval: agent\n`, 2],
+      ['a verify value', `## A1 — t\n- approval: agent\n- Verify: ${construct}\n`, 3],
+      ['a priority value', `# T\n## A1 — t\n- approval: agent\n- priority: ${construct}\n`, 4],
+    ]) {
+      const parsed = parseRegistry(text);
+      assert.deepEqual(parsed.problems, [{ line, text: MINOR_WORDING_PROBLEM }], `${name} in ${where}`);
+    }
+  }
+  for (const construct of ['<!-- hides the rest', '<!-->', 'text -->']) {
+    assert.deepEqual(parseRegistry(`## A1 — ${construct}\n- approval: agent\n`).problems, [{ line: 1, text: MINOR_WORDING_PROBLEM }], `${construct} in a title`);
+  }
+  for (const construct of ['text\r## V9 — fake', 'text ## V9 — fake', 'text ## V9 — fake']) {
+    assert.notDeepEqual(parseRegistry(`## A1 — ${construct}\n- approval: agent\n`).problems, [], 'a heading with one of them is reported, as a heading that starts no rule or as wording');
+  }
+  assert.equal(MINOR_WORDING_PROBLEM, 'the wording of a rule with "approval: agent" may not contain "<!--", "-->", a carriage return, U+2028 or U+2029.');
+});
+
+test('the same constructs are no problem in an owner rule or in a line of an agent rule that is not free, and on a new line of an agent rule they change the form', () => {
+  const canonical = (text) => canonicalRegistry(parseRegistry(text));
+  const base = registry(agentRule());
+  for (const [name, construct] of Object.entries(CONSTRUCTS)) {
+    assert.deepEqual(parseRegistry(`## O1 — t\n- why: ${construct}\n- approval: owner\n`).problems, [], `${name} in an owner rule`);
+    assert.deepEqual(parseRegistry(base.replace('- approval: agent', `- approval: agent\n${construct}`)).problems, [], `${name} on a new line`);
+    assert.notEqual(canonical(base.replace('- approval: agent', `- approval: agent\n${construct}`)), canonical(base), `${name} on a new line`);
+  }
+  const fake = base.replace('- approval: agent', '- approval: agent\n<!-->\n## V9 — fake\n-->');
+  assert.notEqual(canonical(fake), canonical(base));
 });
 
 test('only a rule with exactly one approval line whose value is agent is an agent rule; every other rule contributes its whole block', () => {
