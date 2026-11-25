@@ -299,3 +299,10 @@ test('a rule cannot be confused with another rule, with the preamble, or with a 
   const forged = '## R1 — a\n- why: x\n';
   assert.notEqual(canonical(forged), canonical('## R1 — a\n- why: x\n\0'));
 });
+
+test('each parsed rule says whether it is an agent rule, by the same reading the canonical form uses', () => {
+  const owner = agentRule().replace('approval: agent', 'approval: owner').replace('A1', 'O1');
+  const twice = agentRule('- approval: agent\n').replace('A1', 'T1');
+  const parsed = parseRegistry(registry(agentRule(), owner, twice));
+  assert.deepEqual(parsed.rules.map((rule) => [rule.id, rule.agent]), [['A1', true], ['O1', false], ['T1', false]]);
+});

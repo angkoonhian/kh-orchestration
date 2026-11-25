@@ -45,7 +45,8 @@ function keyEntries(lf) {
  * such heading, so the lines of a heading that starts no rule, or of a repeated
  * id, stay in the block before them. `keys` holds the last value of each key
  * (keys named by `normalKey`); a key line sits in the rule above it only.
- * `startLine` and each problem's `line` are 1-based.
+ * `startLine` and each problem's `line` are 1-based. `agent` is true for a rule that
+ * owner approval need not cover: exactly one `approval` line, whose value is `agent`.
  */
 export function parseRegistry(text) {
   const lf = toLf(text);
@@ -88,7 +89,8 @@ export function parseRegistry(text) {
     startLine: rule.startLine,
   }));
   for (const rule of built) {
-    if (!isAgentRule(keyEntries(rule.block))) continue;
+    rule.agent = isAgentRule(keyEntries(rule.block));
+    if (!rule.agent) continue;
     for (const part of freeParts(rule.block)) {
       if (UNSAFE_WORDING.test(rule.block.slice(part.start, part.end))) problems.push({ line: rule.startLine + part.line, text: MINOR_WORDING_PROBLEM });
     }
@@ -164,7 +166,7 @@ const section = (tag, payload) => `${tag}\0${payload.length}\0${payload}\0`;
 export function canonicalRegistry(parsed) {
   const sections = [section('preamble', parsed.preamble)];
   for (const rule of parsed.rules) {
-    sections.push(isAgentRule(keyEntries(rule.block))
+    sections.push(rule.agent
       ? section('agent', section('id', rule.id) + section('rest', withoutFreeParts(rule.block)))
       : section('block', rule.block));
   }
