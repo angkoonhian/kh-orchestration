@@ -4,7 +4,8 @@ import { chmodSync, existsSync, mkdirSync, symlinkSync, readFileSync, readdirSyn
 import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import {
-  StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readState, stateDir, unknownNameMessage, verdictName, writeFailedMessage, writeState,
+  StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readState, shapeMessage, stateDir,
+  unknownNameMessage, verdictName, writeFailedMessage, writeState,
 } from '../../assets/scripts/ko-state.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -184,5 +185,54 @@ test('a verdict file is read and written by state like any other: absent is the 
     assert.deepEqual(readdirSync(join(stateDir(repo.root), 'verdicts')), [`${TREE}-none.json`]);
     writeFileSync(join(stateDir(repo.root), name), '{');
     assert.throws(() => readState(repo.root, name, null), { name: 'StateError', message: corruptMessage(name) });
+  });
+});
+
+const DIGEST = 'a'.repeat(64);
+
+test('readApprovals: absent is nothing approved; the records are given back as written', () => {
+  withRepo((repo) => {
+    assert.deepEqual(readApprovals(repo.root), []);
+    const digests = [{ digest: DIGEST, approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }, { digest: 'b'.repeat(64), approvedAt: 'x', branch: null }];
+    writeState(repo.root, 'approvals.json', { digests });
+    assert.deepEqual(readApprovals(repo.root), digests);
+  });
+});
+
+test('readApprovals throws a StateError with fixed text for any other shape, never "nothing approved"', () => {
+  withRepo((repo) => {
+    const entry = { digest: DIGEST, approvedAt: 'x', branch: 'main' };
+    for (const value of [
+      [], null, 7, {}, { digests: {} }, { digests: [entry], extra: 1 }, { digests: [null] }, { digests: [{ ...entry, digest: 'A'.repeat(64) }] },
+      { digests: [{ ...entry, digest: 'a'.repeat(63) }] }, { digests: [{ ...entry, approvedAt: 1 }] }, { digests: [{ ...entry, branch: 3 }] },
+      { digests: [{ digest: DIGEST, approvedAt: 'x' }] }, { digests: [{ ...entry, more: true }] },
+    ]) {
+      writeState(repo.root, 'approvals.json', value);
+      assert.throws(() => readApprovals(repo.root), (error) => error instanceof StateError && error.message === shapeMessage('approvals.json'), JSON.stringify(value));
+    }
+    writeFileSync(join(stateDir(repo.root), 'approvals.json'), '{"digests": [');
+    assert.throws(() => readApprovals(repo.root), { name: 'StateError', message: corruptMessage('approvals.json') });
+  });
+});
+
+test('readExemptions: absent is no branch exempt; the records are given back as written', () => {
+  withRepo((repo) => {
+    assert.deepEqual(readExemptions(repo.root), []);
+    const branches = [{ name: 'old/feature', reason: 'predates the install', at: '2026-11-26T00:00:00.000Z' }];
+    writeState(repo.root, 'exemptions.json', { branches });
+    assert.deepEqual(readExemptions(repo.root), branches);
+  });
+});
+
+test('readExemptions throws a StateError with fixed text for any other shape, never "no branch exempt"', () => {
+  withRepo((repo) => {
+    const entry = { name: 'b', reason: 'r', at: 'x' };
+    for (const value of [
+      [], null, 'x', {}, { branches: 'b' }, { branches: [entry], extra: 1 }, { branches: [7] }, { branches: [{ ...entry, name: '' }] },
+      { branches: [{ ...entry, reason: '' }] }, { branches: [{ ...entry, at: null }] }, { branches: [{ name: 'b', reason: 'r' }] }, { branches: [{ ...entry, more: 1 }] },
+    ]) {
+      writeState(repo.root, 'exemptions.json', value);
+      assert.throws(() => readExemptions(repo.root), (error) => error instanceof StateError && error.message === shapeMessage('exemptions.json'), JSON.stringify(value));
+    }
   });
 });

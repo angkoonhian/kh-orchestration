@@ -24,19 +24,20 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
-import fs, { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { reachesOtherFiles } from './self-contained.mjs';
-import { KIT_VERSION, installKhHarness, isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
+import { installKhHarness, isolateProcessEnv, makeRepo, registerExtension, testEnv } from './test-repo.mjs';
 import {
   MAX_COMMAND_LENGTH, MAX_GLOBS, MESSAGES, PROTECTED_FILES, PROTECTED_PREFIXES,
   isProtected, isValidGlob, matchesGlob, preToolUse, readOfficers, sharedStateDirSync, splitWords,
 } from '../../assets/scripts/extension.mjs';
+import { PROBE_PAYLOAD } from '../../assets/scripts/ko-contract.mjs';
 import { stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
-import { checkContract1, lfSha256, probeContract1 } from '../../assets/scripts/verify-contract-1.mjs';
+import { checkContract1, probeContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
 isolateProcessEnv();
 
@@ -870,21 +871,11 @@ test('sharedStateDirSync follows git where a gitdir has no commondir: the gitdir
 
 // ---- through the real kh-harness hook (step 4) ----
 
-const MODULE = '.claude/kh-orchestration/scripts/extension.mjs';
-const PROBE = { session_id: 'probe', cwd: '', hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git commit --no-verify' }, tool_use_id: 'probe-1' };
-
-// A repository with kh-harness installed and this extension registered as the contract's
-// "extensions file" section says: written whole to a temporary file in .claude/kh-harness/ and renamed.
+// A repository with kh-harness installed and this extension registered.
 function registeredRepo() {
   const repo = repoFor({ 'a.txt': 'x\n' });
   installKhHarness(repo.root);
-  mkdirSync(join(repo.root, dirname(MODULE)), { recursive: true });
-  copyFileSync(EXTENSION, join(repo.root, MODULE));
-  const entry = { id: 'kh-orchestration', version: KIT_VERSION, module: MODULE, sha256: lfSha256(readFileSync(join(repo.root, MODULE))), onFailure: 'block' };
-  const temporary = join(repo.root, '.claude/kh-harness/extensions.json.tmp');
-  writeFileSync(temporary, `${JSON.stringify([entry], null, 2)}\n`);
-  renameSync(temporary, join(repo.root, '.claude/kh-harness/extensions.json'));
-  return { repo, entry };
+  return { repo, entry: registerExtension(repo.root) };
 }
 
 // The session log and its markers go to this run's own directories, not the user's.
@@ -899,7 +890,7 @@ after(() => rmSync(hookDirs, { recursive: true, force: true }));
 test('through the real hook: the contract checks and the probe find no problem and no warning, an allowed call prints nothing, and a blocked one is denied', () => {
   const { repo, entry } = registeredRepo();
   assert.deepEqual(checkContract1(repo.root, entry), { problems: [], warnings: [] });
-  assert.deepEqual(probeContract1(repo.root, entry, { ...PROBE, cwd: repo.root }), { problems: [] });
+  assert.deepEqual(probeContract1(repo.root, entry, { ...PROBE_PAYLOAD, cwd: repo.root }), { problems: [] });
   const run = (payload) => spawnSync(process.execPath, [join(repo.root, '.claude/scripts/dispatch-pre-tool.mjs')], {
     cwd: repo.root, input: JSON.stringify({ session_id: 'ko-step-4', cwd: repo.root, hook_event_name: 'PreToolUse', tool_use_id: 'u', ...payload }), encoding: 'utf8', env: hookEnv(repo.root),
   });

@@ -9,6 +9,15 @@ export const OUTPUT_TOO_LARGE = 'git produced more output than can be read.';
 export const notBlobMessage = (path) => `${path} is in the tree but is not a file.`;
 export const gitFailedMessage = (what) => `git failed to ${what}.`;
 
+// What every helper here throws: its message is fixed text, so a caller may show it, where a
+// fault of any other kind has a message that is not.
+export class GitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'GitError';
+  }
+}
+
 const NO_BASE = 'none';
 const SPAWN_FAILED_STATUS = 127;
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -37,7 +46,7 @@ export function git(root, argv, { input } = {}) {
 }
 
 function mustSucceed(result, what) {
-  if (result.status !== 0) throw new Error(gitFailedMessage(what));
+  if (result.status !== 0) throw new GitError(gitFailedMessage(what));
   return result.stdout;
 }
 
@@ -66,7 +75,7 @@ function refExists(root, ref) {
   const result = git(root, ['show-ref', '--verify', '-q', ref]);
   if (result.status === 0) return true;
   if (result.status === 1) return false;
-  throw new Error(gitFailedMessage('read a branch'));
+  throw new GitError(gitFailedMessage('read a branch'));
 }
 
 // The commit HEAD names, or null when HEAD is unborn: a symbolic ref to a
@@ -76,7 +85,7 @@ function headCommit(root) {
   if (commit.status === 0) return oneLine(commit.stdout);
   const symbolic = git(root, ['symbolic-ref', '-q', 'HEAD']);
   if (symbolic.status === 0 && !refExists(root, oneLine(symbolic.stdout))) return null;
-  throw new Error(gitFailedMessage('read HEAD'));
+  throw new GitError(gitFailedMessage('read HEAD'));
 }
 
 export function headTree(root) {
@@ -121,12 +130,21 @@ export function tidy(root) {
   return { tidy: unstaged.length === 0 && untracked.length === 0, unstaged, untracked };
 }
 
+// `{ mode, type, oid }` of one path in a tree, or null only when the path is not in it.
+export function treeEntry(root, tree, path) {
+  const entry = mustSucceed(git(root, ['ls-tree', '-z', '--end-of-options', tree, '--', path]), 'read the file');
+  if (entry === '') return null;
+  const match = entry.match(/^(\d+) (\w+) ([0-9a-f]+)\t/);
+  if (!match) throw new GitError(gitFailedMessage('read the file'));
+  return { mode: match[1], type: match[2], oid: match[3] };
+}
+
 // null only when the path is not in the tree. Any failure to find out, and any
 // entry that is not a file, is an error: a caller must never read it as absent.
 export function readBlob(root, tree, path) {
-  const entry = mustSucceed(git(root, ['ls-tree', '-z', '--end-of-options', tree, '--', path]), 'read the file');
-  if (entry === '') return null;
-  if (entry.split(' ')[1] !== 'blob') throw new Error(notBlobMessage(path));
+  const entry = treeEntry(root, tree, path);
+  if (entry === null) return null;
+  if (entry.type !== 'blob') throw new GitError(notBlobMessage(path));
   const result = exec(root, ['cat-file', 'blob', '--end-of-options', `${tree}:${path}`], { readOnly: true, binary: true });
   return mustSucceed(result, 'read the file');
 }
@@ -138,7 +156,7 @@ export function listEntries(root, tree) {
   const out = mustSucceed(git(root, ['ls-tree', '-r', '-z', '--full-tree', '--end-of-options', tree]), 'list the tree');
   return nulSeparated(out).map((line) => {
     const match = line.match(/^(\d+) (\w+) ([0-9a-f]+)\t([\s\S]*)$/);
-    if (!match) throw new Error(gitFailedMessage('list the tree'));
+    if (!match) throw new GitError(gitFailedMessage('list the tree'));
     return { mode: match[1], type: match[2], oid: match[3], path: match[4] };
   });
 }

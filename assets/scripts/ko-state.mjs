@@ -18,7 +18,16 @@ export const unknownNameMessage = (name) => `"${name}" is not the name of a shar
 export const invalidValueMessage = (name) => `The value for ${name} cannot be written as JSON.`;
 export const invalidVerdictKeyMessage = 'A verdict is named by a full hexadecimal tree id and a full hexadecimal base id or none.';
 export const writeFailedMessage = (name) => `The shared state file ${name} could not be written.`;
+export const shapeMessage = (name) =>
+  `The shared state file ${name} is not of the shape kh-orchestration writes. Restore it from a backup or ask the owner to remove it; nothing proceeds on a state file that cannot be read.`;
 
+// approvals.json is `{ digests: [{ digest, approvedAt, branch }] }`: each digest the owner approved
+// (64 lower-case hexadecimal digits), when (an ISO time), and the branch it was approved on (null
+// on a detached HEAD). Absent, nothing is approved. Read through readApprovals.
+// exemptions.json is `{ branches: [{ name, reason, at }] }`: the branches, by exact name, the gate
+// lets through without an install, why (non-empty) and when. Absent, no branch is exempt. Read
+// through readExemptions.
+// off is a file whose presence is the owner's switch (isOff); its content means nothing.
 // proposals.json is `{ worktrees: [<absolute real path of a worktree root>...] }`, the worktrees
 // open for proposals. The hook extension reads it itself (it cannot import this file): absent,
 // unreadable or of another shape, no worktree is open.
@@ -93,6 +102,29 @@ export function writeState(root, name, value) {
     throw new StateError(writeFailedMessage(name));
   }
 }
+
+const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const hasExactKeys = (value, keys) => isPlainObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+const isText = (value) => typeof value === 'string' && value !== '';
+const DIGEST = /^[0-9a-f]{64}$/;
+
+// The list a state file of the shape `{ <key>: [entry...] }` holds; [] when the file is absent. Any
+// other shape throws: a damaged record must never read as an empty one.
+function readList(root, name, key, entryHasShape) {
+  const value = readState(root, name, { [key]: [] });
+  if (!hasExactKeys(value, [key]) || !Array.isArray(value[key]) || !value[key].every(entryHasShape)) throw new StateError(shapeMessage(name));
+  return value[key];
+}
+
+const approvalHasShape = (entry) => hasExactKeys(entry, ['digest', 'approvedAt', 'branch'])
+  && typeof entry.digest === 'string' && DIGEST.test(entry.digest) && isText(entry.approvedAt) && (entry.branch === null || isText(entry.branch));
+const exemptionHasShape = (entry) => hasExactKeys(entry, ['name', 'reason', 'at']) && isText(entry.name) && isText(entry.reason) && isText(entry.at);
+
+// The approvals, `[{ digest, approvedAt, branch }]`. Throws a StateError for a file that cannot be read or is of another shape.
+export const readApprovals = (root) => readList(root, 'approvals.json', 'digests', approvalHasShape);
+
+// The exemptions, `[{ name, reason, at }]`. Throws a StateError for a file that cannot be read or is of another shape.
+export const readExemptions = (root) => readList(root, 'exemptions.json', 'branches', exemptionHasShape);
 
 export function isOff(root) {
   return existsSync(join(stateDir(root), OFF_FILE));

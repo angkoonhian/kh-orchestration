@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
-  OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
-  listEntries, readBlob, repoRoot, tidy, treeOfCommit,
+  GitError, OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
+  listEntries, readBlob, repoRoot, tidy, treeEntry, treeOfCommit,
 } from '../../assets/scripts/ko-git.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -378,5 +378,34 @@ test('treeOfCommit is the tree of a commit, and null for the base none', () => {
     assert.equal(treeOfCommit(repo.root, head(repo)), repo.git('rev-parse', 'HEAD^{tree}').stdout.trim());
     assert.equal(treeOfCommit(repo.root, 'none'), null);
     assert.throws(() => treeOfCommit(repo.root, 'f'.repeat(40)), { message: gitFailedMessage('read the base tree') });
+  });
+});
+
+test('every failure the helpers throw is a GitError, so a caller can tell their fixed text from a fault', () => {
+  withRepo({}, (repo) => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), 'ko-outside-')));
+    try {
+      assert.throws(() => commonDir(outside), (error) => error instanceof GitError && error.message === gitFailedMessage('locate the git directory'));
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+    repo.write('d/a.txt', 'x\n');
+    repo.commitAll('dir');
+    assert.throws(() => readBlob(repo.root, headTree(repo.root), 'd'), (error) => error instanceof GitError && error.message === notBlobMessage('d'));
+    assert.throws(() => listEntries(repo.root, 'not-a-tree'), GitError);
+  });
+});
+
+test('treeEntry gives the mode, type and object id of one path in a tree, null when absent, and throws for a tree git cannot read', () => {
+  withRepo({ files: { 'a.txt': 'x\n', 'd/b.txt': 'y\n' } }, (repo) => {
+    symlinkSync('a.txt', join(repo.root, 'link'));
+    repo.commitAll('link');
+    const tree = headTree(repo.root);
+    const oid = repo.git('rev-parse', `${tree}:a.txt`).stdout.trim();
+    assert.deepEqual(treeEntry(repo.root, tree, 'a.txt'), { mode: '100644', type: 'blob', oid });
+    assert.equal(treeEntry(repo.root, tree, 'link').mode, '120000');
+    assert.equal(treeEntry(repo.root, tree, 'd').type, 'tree');
+    assert.equal(treeEntry(repo.root, tree, 'missing'), null);
+    assert.throws(() => treeEntry(repo.root, 'not-a-tree', 'a.txt'), { message: gitFailedMessage('read the file') });
   });
 });

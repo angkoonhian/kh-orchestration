@@ -216,7 +216,11 @@ export function readOfficers(officersJsonText) {
 // ---------------------------------------------------------------------------
 // Messages
 
-const RUN = 'node .claude/kh-orchestration/scripts/ko.mjs run';
+const KO = 'node .claude/kh-orchestration/scripts/ko.mjs';
+// The commands a refusal names, in one table: the gate and ko.mjs import it from here, so every
+// message names a command in the same words.
+export const COMMANDS = Object.freeze({ run: `${KO} run`, approve: `${KO} approve`, status: `${KO} status` });
+const RUN = COMMANDS.run;
 const unseen = (reason) => `This command's structure cannot be seen (${reason}) and its text holds a way round the commit gate (no-verify, hooksPath, a .git path, an owner-only ko.mjs command), so it is blocked. Run it as plain commands.`;
 
 // Every text the hook returns. Each is one line of at most 300 characters with no `<` or `>`,
@@ -230,7 +234,7 @@ export const MESSAGES = Object.freeze({
   xargs: 'A git command or ko.mjs run through xargs takes words the hook cannot see, so it is blocked. Run the command directly, with its subcommand and options written out.',
   guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
-  ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code. Ask the owner to run node .claude/kh-orchestration/scripts/ko.mjs ${command}.`,
+  ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code. Ask the owner to run ${KO} ${command}.`,
   sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
   feedsScript: unseen('it feeds a script to a shell or an interpreter'),
@@ -240,7 +244,7 @@ export const MESSAGES = Object.freeze({
   pathTooLong: 'The working directory, the project directory or a path in this call is longer than 4,096 characters, so the call is blocked. Use a shorter path.',
   noCommand: 'This Bash call carries no command text to check, so it is blocked. Send the command as a string in the command field.',
   noTarget: 'This edit names no file path the hook can resolve, so it is blocked. Give the file\'s absolute path.',
-  protectedEdit: 'This file decides what passes the commit gate and is not edited from a session. The owner can open this worktree for proposals by running node .claude/kh-orchestration/scripts/ko.mjs propose in their own terminal here.',
+  protectedEdit: `This file decides what passes the commit gate and is not edited from a session. The owner can open this worktree for proposals by running ${KO} propose in their own terminal here.`,
   localSettingsEdit: '.claude/settings.local.json can switch the hooks off and, being untracked, no approval can cover it, so it is never edited from a session. The owner edits it in their own editor.',
   gitDirEdit: `Files inside the git directory (its hooks, its config, the kh-orchestration shared state) are not edited from a session. Use git commands for git's own files, and ${RUN} for a verdict.`,
   stateUnreadable: 'The .git of this repository is neither a directory nor a readable gitdir file, so the commit gate\'s state cannot be found and this call is blocked. Repair .git outside this session.',
