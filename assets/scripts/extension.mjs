@@ -27,7 +27,9 @@
 // the backstop for each of these.
 // - eval, and variables holding paths (`D=.git; cd $D`) or flags: for commit a
 //   flag in a variable is caught only when the word is wholly the expansion or
-//   its literal text begins with `-` (`git commit x$F` is not), and for merge
+//   its literal text begins with `-` (`git commit x$F` is not), except a message
+//   word that is wholly an expansion after an option that may take `-m` as its
+//   value (`N=-n; git commit --trailer -m "$N"`), which is not caught; for merge
 //   and pull a flag held in a plain parameter (`git merge $F`) is not caught;
 //   a script written to disk and then run; string concatenation in inline code
 //   (`'.gi'+'t/hooks'`).
@@ -1325,7 +1327,7 @@ const SED_GUARDED_TOKEN = /(?:^|[^A-Za-z0-9_]|(?<![A-Za-z])[wWrR])\.git\/+(?:hoo
 const stripQuotes = (text) => normalizePath(text.replace(/['"\\]/g, ''));
 
 // A bare `.git` token inside a substitution, whose output becomes the word (`cd $(echo .git)`).
-const GIT_IN_SUBSTITUTION = /(?:^|[\s(`])\.git(?=$|[\s)/`])/;
+const GIT_IN_SUBSTITUTION = /(?:^|[\s(`/])\.git(?=$|[\s)/`])/;
 // A substitution asking git where its directory is (`$(git rev-parse --git-path hooks)`).
 const GIT_DIR_QUERY = /\brev-parse\b[^)`]*?--(?:git-dir|git-common-dir|absolute-git-dir|git-path)\b/;
 
@@ -1511,9 +1513,13 @@ const PLAIN_PARAMETER = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}
 // Whether an expansion could be a flag. On commit, merge and pull, a word whose literal text
 // begins with `-`, or that holds anything but plain parameters (a command substitution,
 // backticks, `${NAME<op>...}`, `$@`), may; on commit, so may a word that is wholly an expansion.
-// A branch or remote given as "$BRANCH" or "origin/${BRANCH}" is allowed.
+// A branch or remote given as "$BRANCH" or "origin/${BRANCH}" is allowed, and on commit so is
+// a long option's value made of quoted plain parameters (`--author="$A"`), which cannot split.
+const quotedLongValue = (word) => /^--[A-Za-z-]+=/.test(word.text)
+  && word.spans.every(([start, end, quoted]) => quoted && start > word.text.indexOf('=') && PLAIN_PARAMETER.test(word.text.slice(start, end)));
 function hidesOption(sub, word) {
   if (!word.expands) return false;
+  if (sub === 'commit' && quotedLongValue(word)) return false;
   const literal = literalOf(word);
   if (literal.startsWith('-') || (sub === 'commit' && literal === '')) return true;
   return word.spans.some(([start, end]) => !PLAIN_PARAMETER.test(word.text.slice(start, end)));
@@ -1524,7 +1530,10 @@ function hidesOption(sub, word) {
 // no value letter (-am, -sm, -qam, -aF); or a value glued to one (-mText, -am"$MSG",
 // --message=Text). The one place a flag word is free, and only while the option itself stands
 // in option position: after a word that begins with `-` and has no `=` (which git may take as
-// that word's value, as in `--trailer -m -n`), the message word is still judged as a flag word.
+// that word's value, as in `--trailer -m -n`), a message word that is a literal flag word blocks,
+// and so does one holding an expansion whose literal text begins with `-` or whose text holds
+// --no-v (`-m "-$N"`). A message word there that is wholly an expansion (`-m "$N"`) is not
+// judged: a stated limit.
 const MESSAGE_OPTIONS = new Set(['-m', '--message', '-F', '--file']);
 const GLUED_LONG_MESSAGE = /^(--message=|--file=)/;
 const bundleBefore = (text, at) => [...text.slice(1, at)].every((letter) => /[A-Za-z]/.test(letter) && letter !== 'n' && !COMMIT_VALUED_LETTERS.includes(letter));
@@ -1569,6 +1578,7 @@ function judgeGated(sub, rest) {
     if (message !== null) {
       if (message !== undefined && splitsIntoFlags(message)) refuse(MESSAGES.hiddenOption);
       if (message !== undefined && message !== word && swallowable && (variantsOf(message) ?? [message.text]).some((text) => skipsHooks(sub, text))) refuse(MESSAGES.noVerify);
+      if (message !== undefined && message !== word && swallowable && message.expands && (literalOf(message).startsWith('-') || message.text.includes(NO_VERIFY_PREFIX))) refuse(MESSAGES.hiddenOption);
       continue;
     }
     const variants = variantsOf(word);
@@ -1711,11 +1721,11 @@ const DANGER = [
 //   interpreter's long inline options (node --eval, --print) or a short group holding one of
 //   its letters (node e p, python c, perl e E n p, ruby e n p, php r, lua, Rscript and
 //   osascript e), wherever it stands.
-// Each text is scanned as written and with quotes, backslashes and parentheses (zsh's glob
-// groups, `.git/h(o)oks`) taken out.
+// Each text is scanned with `$IFS` and `${IFS}` read as a space, as written and with quotes,
+// backslashes and parentheses (zsh's glob groups, `.git/h(o)oks`) taken out.
 function holdsAny(tokens, texts) {
   return texts.some((text) => {
-    const normal = normalizePath(text);
+    const normal = normalizePath(text.replace(/\$\{?IFS\}?/g, ' '));
     const stripped = normal.replace(/['"\\()]/g, '');
     return tokens.some((pattern) => pattern.test(normal) || pattern.test(stripped));
   });
@@ -1833,7 +1843,7 @@ function judgeInterpreter(command, args, inlineOptions, context) {
   else if (operand === null || stdinOperand(operand)) scanFedScript(command, context);
 }
 
-// A word holding whitespace is possibly code: every assignment value (leading or through env:
+// A word holding whitespace is possibly code: every assignment value holding whitespace or $IFS (leading or through env:
 // BASH_ENV, PROMPT_COMMAND, GIT_EDITOR, GIT_SSH_COMMAND...), and every operand that is not a
 // text value, whatever runs it (ssh, docker, tmux, watch, guile -c, make ARGS=...), unless the
 // command word is a reader used as one (find with -exec is not). sed's programs have their own
@@ -1841,7 +1851,7 @@ function judgeInterpreter(command, args, inlineOptions, context) {
 // code without whitespace, a script on disk, or a variable exported earlier.
 function judgeWhitespaceOperands(command, resolved, values, loose) {
   for (const word of [...command.assignments, ...resolved.envAssignments]) {
-    if (/\s/.test(word.text)) scanned(MESSAGES.runsCode, word.text);
+    if (/\s|\$\{?IFS\b/.test(word.text)) scanned(MESSAGES.runsCode, word.text);
   }
   if (resolved.word === undefined) return;
   const writing = WRITING_OPTIONS[resolved.name];

@@ -368,6 +368,13 @@ const BLOCKED = [
   ['awk \'{print > ".git/hooks/x"}\' f', MESSAGES.guardedPath], ['perl -ne \'open(F,">.git/hooks/pre-commit")\' f', MESSAGES.guardedPath],
   ["ruby -ne 'File.write(\".git/config\", 1)' f", MESSAGES.guardedPath],
 
+  // cap adjudication
+  ['pushd "$(echo ./.git)" && chmod a-x hooks/pre-commit', MESSAGES.guardedPath], ['cd "$(echo ./.git)"', MESSAGES.guardedPath], ['cd $(echo x/../.git)', MESSAGES.guardedPath],
+  ['cd "$(echo "$PWD/.git")"', MESSAGES.guardedPath],
+  ['N=n; git commit --trailer -m "-$N"', MESSAGES.hiddenOption], ['N=n; git commit --author -m "-$N"', MESSAGES.hiddenOption], ['git commit --trailer -m "${X}--no-verify"', MESSAGES.hiddenOption],
+  ["sh -c 'git${IFS}commit${IFS}-n${IFS}-m${IFS}y'", MESSAGES.hiddenCommand], ["bash -c 'git commit${IFS}-n -m y'", MESSAGES.runsCode],
+  ["GIT_EDITOR='git${IFS}commit${IFS}--no-verify${IFS}-m${IFS}y;true' git tag -a v1", MESSAGES.runsCode], ["X='git$IFS''commit$IFS-n' sh -c true", MESSAGES.runsCode],
+  ['git commit --author=$A -m x', MESSAGES.hiddenOption], ['git commit --author="x$(echo y)" -m x', MESSAGES.hiddenOption],
   // fourth re-review
   ['git commit --trailer -m -n', MESSAGES.noVerify], ['git merge --into-name -m --no-verify side', MESSAGES.noVerify], ['git merge --into -m --no-verify side', MESSAGES.noVerify],
   ['git merge --into-name -F --no-verify side', MESSAGES.noVerify], ['git pull --no-rebase -o -m --no-verify . side', MESSAGES.noVerify],
@@ -509,6 +516,13 @@ const ALLOWED = [
   'tar czf out.tgz --exclude=.git .', 'rsync -a --exclude .git ./ /tmp/x/', 'rsync -a --exclude .git/hooks src/ dst/', 'grep -rn foo --exclude-dir=.git .',
   "zip -r x.zip . -x '.git/*'", "zip -r x.zip . -x '.git/*' '*.tmp'", "find . -path ./.git -prune -o -name '*.py' -print", 'rsync -a --exclude-from=.git/info/exclude src/ dst/',
   'tar -czf x.tgz --exclude-vcs .', "find . -name .git -prune -o -type f -print",
+  // cap adjudication: near misses
+  'ls "$(echo src/.github)"', 'git commit --amend -m "fix: $ISSUE"', 'IFS=, read -r a b <<< "x,y"', 'while IFS= read -r line; do echo "$line"; done < f',
+  'git commit --author="$A" -m x', 'git commit --date="$D" -m x', 'git commit --author="${A}" -m x',
+  // A stated limit, documented as allowed: a message word that is wholly an expansion, after an
+  // option that may take `-m` as its value, holds a flag in a variable (`N=-n`); closing it would
+  // need a table of git's value-taking options and their abbreviations.
+  'N=-n; git commit --trailer -m "$N"',
   // fourth re-review: near misses
   'git commit -am "$MSG"', 'git commit -am"$MSG"', 'git commit -sm "$MSG"', 'git commit -qam "$MSG"', 'git commit -vam "$MSG"', 'git commit -aF "$F"', 'git commit --amend -m "$MSG"',
   'git commit -am "$(cat <<\'EOF\'\nfeat: x mentions --no-verify and .git/hooks/pre-commit\nEOF\n)"', 'git merge -m "merge it" side', 'git commit -a -m "fix -n"',
