@@ -52,6 +52,12 @@
 //   behind a glob inside code (`sed '1e rm .gi?/hooks/x'`).
 // - a shell write to a tracked protected file such as officers.json: only the
 //   edit tools are guarded there, and the digest refuses the commit.
+// - environment variables that git or a shell runs as commands (GIT_EDITOR,
+//   GIT_SSH_COMMAND, BASH_ENV, PROMPT_COMMAND...) when exported earlier rather
+//   than set in the command's own assignments, which are scanned.
+// - a glob or a search whose output becomes another command's words (`chmod a-x
+//   $(find . -name pre-commit)`, `find . -name pre-commit | xargs chmod a-x`,
+//   `.g*/hooks`), and a ko.mjs name found by a search or a substitution.
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 
@@ -271,7 +277,8 @@ const unparseable = () => {
 const newWord = () => ({ text: '', plain: 0, quoted: false, expands: false, spans: [], special: false, name: undefined });
 // A simple command: `raw`, its text as written; `pipe`, whether its input is a pipe, and
 // `pipedFrom`/`pipedTo`, the commands on either side of that pipe.
-const newCommand = (pipedFrom, pipe) => ({ assignments: [], words: [], redirects: [], heredocs: [], pipe, pipedFrom, pipedTo: null, start: null, raw: '' });
+// `substituted`, whether its output becomes another command's words (set when it ends).
+const newCommand = (pipedFrom, pipe) => ({ assignments: [], words: [], redirects: [], heredocs: [], pipe, pipedFrom, pipedTo: null, start: null, raw: '', substituted: false });
 
 function addLiteral(word, char) {
   if (word.plain === word.text.length) word.plain++;
@@ -309,6 +316,8 @@ const FUNCTION_NAME = /^[A-Za-z_][A-Za-z0-9_.:-]*$/;
 function parseList(p, nested) {
   if (p.depth > MAX_DEPTH) unparseable();
   const { src } = p;
+  // Whether these commands' output becomes another command's words: a $( ), backtick or <( ) body.
+  const substituted = nested || p.substituted === true;
   let command = newCommand(null, false);
   let word = null;
   let redirect = null;
@@ -352,6 +361,7 @@ function parseList(p, nested) {
       cases.pop();
       kept = false;
     }
+    ended.substituted = substituted;
     if (kept) p.out.push(ended);
     command = newCommand(pipeNext && kept ? ended : null, pipeNext);
     if (command.pipedFrom !== null) ended.pipedTo = command;
@@ -640,7 +650,7 @@ function parseBacktick(p, word, quoted = false) {
     }
   }
   p.pos = index + 1;
-  parseList({ src: inner, pos: 0, depth: p.depth + 1, out: p.out }, false);
+  parseList({ src: inner, pos: 0, depth: p.depth + 1, out: p.out, substituted: true }, false);
   addExpansion(word, src.slice(start, p.pos), quoted);
 }
 
@@ -1069,7 +1079,8 @@ function resolveCommand(command) {
   return resolved;
 }
 
-// Text values: words that are a message, a body, a search pattern or echo's output, never a
+// Text values: words that are a message, a body, a search pattern or echo's output (only while
+// that output goes to readers and is not substituted into another command's words), never a
 // path or a flag. `git` is the command's git invocation, or null.
 const MESSAGE_SUBCOMMANDS = new Set(['commit', 'tag', 'merge', 'stash', 'notes']);
 const SEARCH_SUBCOMMANDS = new Set(['log', 'show', 'shortlog', 'whatchanged', 'rev-list']);
@@ -1110,11 +1121,17 @@ function optionValues(args, longNames, shortLetters, pastDoubleDash = false) {
   return values;
 }
 
-// Options whose values are text for any command: messages, titles, test-name patterns. These
-// values are free of the flag and code checks; unlike the text values above they are still
-// judged as paths, since an unknown command may read such an option's value as a file.
+// Long options whose values are text for any command: messages, titles, test-name patterns; and
+// -k for pytest alone (pytest, py.test, python -m pytest), since -k is code or a path elsewhere
+// (`parallel -k`, `tar -k`). These values are free of the flag, owner and code checks; unlike the
+// text values above they are still judged as paths, since an unknown command may read such an
+// option's value as a file.
 const LOOSE_TEXT_OPTIONS = ['--grep', '--testNamePattern', '--test-name-pattern', '--title', '--body', '--message', '--description', '--label', '--name'];
-const looseTextValues = (resolved) => optionValues(resolved.words.slice(resolved.index + 1), LOOSE_TEXT_OPTIONS, 'k', true);
+function looseTextValues(resolved) {
+  const args = resolved.words.slice(resolved.index + 1);
+  const pytest = /^(pytest|py\.test)$/.test(resolved.name) || (/^python[0-9.]*$/.test(resolved.name) && args[0]?.text === '-m' && args[1]?.text === 'pytest');
+  return optionValues(args, LOOSE_TEXT_OPTIONS, pytest ? 'k' : '', true);
+}
 
 // The first operand of a search command (its pattern), unless -e or -f gave the pattern.
 function firstOperand(args) {
@@ -1138,16 +1155,16 @@ function exclusions(resolved, outputReadOnly) {
   return values;
 }
 
-function textValues(resolved, git, outputReadOnly) {
-  const values = ownTextValues(resolved, git, outputReadOnly);
+function textValues(resolved, git, outputReadOnly, substituted = false) {
+  const values = ownTextValues(resolved, git, outputReadOnly, substituted);
   const excluded = exclusions(resolved, outputReadOnly);
   return excluded.size === 0 ? values : new Set([...values, ...excluded]);
 }
 
-function ownTextValues(resolved, git, outputReadOnly) {
+function ownTextValues(resolved, git, outputReadOnly, substituted) {
   const args = resolved.words.slice(resolved.index + 1);
   const { name } = resolved;
-  if ((name === 'echo' || name === 'printf') && outputReadOnly) return new Set(args);
+  if ((name === 'echo' || name === 'printf') && outputReadOnly && !substituted) return new Set(args);
   if (git !== null) {
     const values = new Set();
     if (MESSAGE_SUBCOMMANDS.has(git.sub)) for (const word of optionValues(git.rest, ['--message'], 'm')) values.add(word);
@@ -1159,7 +1176,7 @@ function ownTextValues(resolved, git, outputReadOnly) {
     }
     return values;
   }
-  if (name === 'gh') return optionValues(args, ['--body', '--title', '--notes'], 'bt');
+  if (name === 'gh') return optionValues(args, ['--body', '--title', '--notes', '--raw-field', '--field'], 'btfF');
   if (name === 'node') return optionValues(args, ['--test-name-pattern', '--test-skip-pattern'], '');
   if (PATTERN_COMMANDS.has(name)) {
     const values = optionValues(args, ['--regexp', '--expression'], 'e');
@@ -1300,19 +1317,22 @@ function expansionBeforeGuardedSegment(word) {
 }
 
 // A `.git` segment followed by /hooks, /config or /kh-orchestration, as a token in a text with
-// quotes and backslashes removed: at the start or after a character that is not a word
-// character. In a sed program also after one of w W r R not preceded by a letter, since GNU sed
+// quotes and backslashes removed: at the start, after a short option glued to it
+// (`-o.git/hooks/x`), or after a character that is not a word character. In a sed program also after one of w W r R not preceded by a letter, since GNU sed
 // takes a file name straight after those commands (`w.git/hooks/pre-commit`).
-const GUARDED_TOKEN = /(?:^|[^A-Za-z0-9_])\.git\/+(?:hooks|config|kh-orchestration)(?![A-Za-z0-9_])/i;
+const GUARDED_TOKEN = /(?:^|^-[A-Za-z]+|[^A-Za-z0-9_])\.git\/+(?:hooks|config|kh-orchestration)(?![A-Za-z0-9_])/i;
 const SED_GUARDED_TOKEN = /(?:^|[^A-Za-z0-9_]|(?<![A-Za-z])[wWrR])\.git\/+(?:hooks|config|kh-orchestration)(?![A-Za-z0-9_])/i;
 const stripQuotes = (text) => normalizePath(text.replace(/['"\\]/g, ''));
 
+// A bare `.git` token inside a substitution, whose output becomes the word (`cd $(echo .git)`).
+const GIT_IN_SUBSTITUTION = /(?:^|[\s(`])\.git(?=$|[\s)/`])/;
 // A substitution asking git where its directory is (`$(git rev-parse --git-path hooks)`).
 const GIT_DIR_QUERY = /\brev-parse\b[^)`]*?--(?:git-dir|git-common-dir|absolute-git-dir|git-path)\b/;
 
 function guardedWord(word, context) {
   if (expansionBeforeGuardedSegment(word) || word.spans.some(([start, end]) => GIT_DIR_QUERY.test(word.text.slice(start, end)))) return true;
   if (GUARDED_TOKEN.test(stripQuotes(word.text))) return true;
+  if (word.spans.some(([start, end]) => GIT_IN_SUBSTITUTION.test(stripQuotes(word.text.slice(start, end))))) return true;
   const variants = variantsOf(word);
   if (variants === null) return /\.g/i.test(word.text);
   return variants.some((text) => guardedText(text, word.special, context));
@@ -1499,10 +1519,21 @@ function hidesOption(sub, word) {
   return word.spans.some(([start, end]) => !PLAIN_PARAMETER.test(word.text.slice(start, end)));
 }
 
-// A message or message file: the word after an exact -m, --message, -F or --file, or a value
-// glued to one (-mText, --message=Text, -m"Fix $ISSUE"). The one place a flag word is free.
+// A message or message file, on commit and merge (pull has none): the word after -m, --message,
+// -F or --file, or after a short bundle ending in m or F whose letters before it are no `n` and
+// no value letter (-am, -sm, -qam, -aF); or a value glued to one (-mText, -am"$MSG",
+// --message=Text). The one place a flag word is free, and only while the option itself stands
+// in option position: after a word that begins with `-` and has no `=` (which git may take as
+// that word's value, as in `--trailer -m -n`), the message word is still judged as a flag word.
 const MESSAGE_OPTIONS = new Set(['-m', '--message', '-F', '--file']);
-const GLUED_MESSAGE = /^(-m.|-F.|--message=|--file=)/s;
+const GLUED_LONG_MESSAGE = /^(--message=|--file=)/;
+const bundleBefore = (text, at) => [...text.slice(1, at)].every((letter) => /[A-Za-z]/.test(letter) && letter !== 'n' && !COMMIT_VALUED_LETTERS.includes(letter));
+const isMessageOption = (text) => MESSAGE_OPTIONS.has(text) || (/^-[A-Za-z]+[mF]$/.test(text) && bundleBefore(text, text.length - 1));
+function isGluedMessage(text) {
+  if (GLUED_LONG_MESSAGE.test(text)) return true;
+  const at = text.search(/[mF]/);
+  return text.startsWith('-') && !text.startsWith('--') && at > 0 && at < text.length - 1 && bundleBefore(text, at);
+}
 // commit's short letters that take a value: a bundle's letters after one of them are its value.
 const COMMIT_VALUED_LETTERS = 'mFCctuS';
 
@@ -1527,13 +1558,17 @@ const splitsIntoFlags = (word) => word.spans.some(([start, end, quoted]) => !quo
 // precedes it (git's abbreviations let `--mess -- -n` take `--` as a value and keep `-n` live):
 // a flag that turns the hooks off (skipsHooks), an expanding word whose raw text holds --no-v
 // (`${X:---no-verify}`), or an expanding word that may hide a flag (hidesOption). The one
-// exception is a message (MESSAGE_OPTIONS, GLUED_MESSAGE), unless it is split into flags.
+// exception is a message (isMessageOption, isGluedMessage), unless it is split into flags or,
+// after a word that may take the message option as its value, is itself a flag word.
 function judgeGated(sub, rest) {
   for (let i = 0; i < rest.length; i++) {
     const word = rest[i];
-    const message = MESSAGE_OPTIONS.has(word.text) ? rest[++i] : GLUED_MESSAGE.test(word.text) ? word : null;
+    const before = rest[i - 1]?.text;
+    const swallowable = before !== undefined && before.startsWith('-') && !before.includes('=');
+    const message = sub === 'pull' ? null : isMessageOption(word.text) ? rest[++i] : isGluedMessage(word.text) ? word : null;
     if (message !== null) {
       if (message !== undefined && splitsIntoFlags(message)) refuse(MESSAGES.hiddenOption);
+      if (message !== undefined && message !== word && swallowable && (variantsOf(message) ?? [message.text]).some((text) => skipsHooks(sub, text))) refuse(MESSAGES.noVerify);
       continue;
     }
     const variants = variantsOf(word);
@@ -1653,19 +1688,23 @@ const DANGER = [
 // - judgeScript: a shell's -c, a COMMAND_STRING command's -c/--command or an env -S string that
 //   cannot be split, that string; DANGER.
 // - judgeWhitespaceOperands: every operand holding whitespace that is not a text value, in a
-//   command whose command word is not read-only, that word; DANGER. This is the net for eval,
-//   trap, alias, awk, find -exec, ssh, docker and every runner no table names.
+//   command whose command word is not read-only, that word, and every assignment value holding
+//   whitespace; DANGER. It reaches eval, trap, alias, awk, find -exec, ssh, docker and any runner
+//   no table names when the code is one word with a space in it; not code without whitespace,
+//   a script on disk, or a variable exported earlier.
 // - judgeGuardedArea (via guardedWord, not `scanned`): every path word, quote-stripped, for
 //   GUARDED_TOKEN.
 // - judgeUnseen: a command word that is a variable or a substitution, that command's raw text;
 //   deno eval, that command's raw text; source or `.`
 //   reading standard input, the command and its here-document bodies; DANGER. A -S string that
 //   cannot be split; DANGER.
-// - judgeUnseen's sed check calls holdsAny directly on sed's program operands (every -e value,
-//   or the first operand): SED_PATH_TOKENS (no left boundary), since a sed pattern legitimately
-//   holds words such as hooksPath; SED_PATH_TOKENS and DANGER when a program holds `git` or
-//   `ko.mjs`, since sed's e command and s///e flag run a shell command.
-// - judgeShell and judgeInterpreter (via scanFedScript): a script fed on standard input, from a
+// - judgeSed calls holdsAny directly on sed's program operands (every -e value, or the first
+//   operand): SED_PATH_TOKENS, since a sed pattern legitimately holds words such as hooksPath;
+//   SED_PATH_TOKENS and DANGER when a program runs a shell command (SED_RUNS: an e command or
+//   an s///e flag). sed programs are left out of judgeWhitespaceOperands.
+// - judgeShell, judgeInterpreter and judgeUnseen's runner check (via scanFedScript): a script fed
+//   on standard input to a shell, an interpreter, a command-string runner without -c, or a command
+//   with a later shell word (unshare sh), from a
 //   pipe the whole command line, from a here-document or here-string the command and its
 //   bodies, from /dev/stdin, `-` or <( ) the command; and an interpreter's inline code, the
 //   command and its bodies; DANGER. Inline code is any word before `--` that is one of an
@@ -1684,6 +1723,18 @@ function holdsAny(tokens, texts) {
 const scanned = (message, ...texts) => {
   if (holdsAny(DANGER, texts)) refuse(message);
 };
+
+// A sed program that runs a shell command: an `e` command (after an address, `!`, `;` or a
+// brace, or at the start) or an `s` command whose flags hold `e`.
+const SED_RUNS = [/(?:^|[;\n{}!$0-9/])\s*e(?:\s|;|$)/, /[^A-Za-z0-9\s][gpiImMw0-9]*e[gpiImMw0-9]*\s*(?:;|}|$)/m];
+
+// sed's programs: SED_PATH_TOKENS always; the full danger scan only when a program runs a shell
+// command (SED_RUNS), so a sed edit of a document mentioning `git commit -n` is allowed.
+function judgeSed(args) {
+  const programs = sedPrograms(args).map((word) => word.text);
+  const runs = programs.some((text) => SED_RUNS.some((pattern) => pattern.test(text)));
+  if (holdsAny(runs ? [...SED_PATH_TOKENS, ...DANGER] : SED_PATH_TOKENS, programs)) refuse(MESSAGES.runsCode);
+}
 
 // sed's program operands: every -e or --expression value, or else its first operand; none with
 // -f (a script on disk, a stated limit).
@@ -1782,19 +1833,26 @@ function judgeInterpreter(command, args, inlineOptions, context) {
   else if (operand === null || stdinOperand(operand)) scanFedScript(command, context);
 }
 
-// Any operand holding whitespace that is not a text value is possibly code, whatever runs it
-// (ssh, docker, tmux, watch, guile -c, make ARGS=...), unless the command word is a reader used
-// as one (find with -exec is not).
-function judgeWhitespaceOperands(resolved, values, loose) {
+// A word holding whitespace is possibly code: every assignment value (leading or through env:
+// BASH_ENV, PROMPT_COMMAND, GIT_EDITOR, GIT_SSH_COMMAND...), and every operand that is not a
+// text value, whatever runs it (ssh, docker, tmux, watch, guile -c, make ARGS=...), unless the
+// command word is a reader used as one (find with -exec is not). sed's programs have their own
+// rule (judgeSed). This reaches code given as one word with a space in it; it does not reach
+// code without whitespace, a script on disk, or a variable exported earlier.
+function judgeWhitespaceOperands(command, resolved, values, loose) {
+  for (const word of [...command.assignments, ...resolved.envAssignments]) {
+    if (/\s/.test(word.text)) scanned(MESSAGES.runsCode, word.text);
+  }
   if (resolved.word === undefined) return;
   const writing = WRITING_OPTIONS[resolved.name];
   if (READ_ONLY.has(resolved.name) && (writing === undefined || !resolved.words.some((word) => writing.test(word.text)))) return;
+  const programs = resolved.name === 'sed' ? new Set(sedPrograms(resolved.words.slice(resolved.index + 1))) : NO_VALUES;
   for (const word of resolved.words) {
-    if (!values.has(word) && !loose.has(word) && /\s/.test(word.text)) scanned(MESSAGES.runsCode, word.text);
+    if (!values.has(word) && !loose.has(word) && !programs.has(word) && /\s/.test(word.text)) scanned(MESSAGES.runsCode, word.text);
   }
 }
 
-function judgeUnseen(command, resolved, context, depth) {
+function judgeUnseen(command, resolved, values, context, depth) {
   if (resolved.unseen !== null) scanned(MESSAGES.unsplittable, resolved.unseen);
   if (resolved.word === undefined) return;
   if (resolved.word.expands) {
@@ -1804,14 +1862,14 @@ function judgeUnseen(command, resolved, context, depth) {
   const { name } = resolved;
   const args = resolved.words.slice(resolved.index + 1);
   if (name === 'deno' && args[0]?.text === 'eval') scanned(MESSAGES.runsCode, command.raw);
-  if (name === 'sed') {
-    const programs = sedPrograms(args).map((word) => word.text);
-    const runsCommands = programs.some((text) => /git|ko\.mjs/i.test(text));
-    if (holdsAny(runsCommands ? [...SED_PATH_TOKENS, ...DANGER] : SED_PATH_TOKENS, programs)) refuse(MESSAGES.runsCode);
-  }
+  if (name === 'sed') judgeSed(args);
   if (SHELLS.has(name)) judgeShell(command, args, context, depth);
   const script = commandString(resolved);
   if (script !== null) judgeScript(script, context, depth);
+  // A command-string runner without -c, or a command with a later word that is a shell (unshare
+  // sh, docker run img sh), reads a script from its standard input.
+  const runner = COMMAND_STRING.has(name) || resolved.wrappers.includes('flock');
+  if ((runner && script === null) || args.some((word) => !values.has(word) && SHELLS.has(commandName(word)))) scanFedScript(command, context);
   if ((name === 'source' || name === '.') && (args.length === 0 || stdinOperand(args[0]))) {
     scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
     scanFedScript(command, context);
@@ -1835,15 +1893,15 @@ function judgeCommand(command, context, depth) {
   const resolved = resolveCommand(command);
   const git = gitInvocation(resolved);
   const outputReadOnly = command.pipedTo === null || pipelineReadsOnly(command.pipedTo);
-  const values = textValues(resolved, git, outputReadOnly);
+  const values = textValues(resolved, git, outputReadOnly, command.substituted);
   judgeGuardedArea(command, resolved, git, values, context);
   judgeGitEnvironment(command, resolved, git);
   if (git !== null) judgeGit(resolved, git, values);
   const loose = looseTextValues(resolved);
   judgeOwner(command, resolved, values, loose);
   judgeInnerCommand(resolved, values);
-  judgeUnseen(command, resolved, context, depth);
-  judgeWhitespaceOperands(resolved, values, loose);
+  judgeUnseen(command, resolved, values, context, depth);
+  judgeWhitespaceOperands(command, resolved, values, loose);
 }
 
 // A git word after the command word, behind a wrapper the tables above do not know (ssh,
