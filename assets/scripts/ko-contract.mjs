@@ -75,15 +75,18 @@ export function ownEntry(root) {
  * this plugin's entry: no problem and no warning from `checkContract1`, and no
  * problem from `probeContract1` on PROBE_PAYLOAD. Otherwise `{ ok: false,
  * problems }`, warnings counted as problems. The probe starts one process and
- * runs only after the files check out. Never throws: a throw is a problem.
+ * runs only after the files check out. `probeRoot` is where the probe runs
+ * and the entry is built from: the gate passes a private copy of the approved
+ * tree, so it never executes the working copy; `checkContract1` always
+ * inspects `root`. Never throws: a throw is a problem.
  */
-export function contractHolds(root) {
+export function contractHolds(root, { probeRoot = root } = {}) {
   try {
-    const entry = ownEntry(root);
+    const entry = ownEntry(probeRoot);
     const { problems, warnings } = checkContract1(root, entry);
     const found = [...problems, ...warnings];
     if (found.length > 0) return { ok: false, problems: found };
-    const probe = probeContract1(root, entry, { ...PROBE_PAYLOAD, cwd: root });
+    const probe = probeContract1(probeRoot, entry, { ...PROBE_PAYLOAD, cwd: probeRoot });
     return probe.problems.length > 0 ? { ok: false, problems: probe.problems } : { ok: true };
   } catch (error) {
     return { ok: false, problems: [error instanceof ContractError ? error.message : unexpectedMessage] };

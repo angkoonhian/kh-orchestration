@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
   GitError, OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
-  listEntries, readBlob, repoRoot, tidy, treeEntry, treeOfCommit,
+  listEntries, ownIndexEntry, readBlob, readBlobs, repoRoot, tidy, treeEntry, treeOfCommit,
 } from '../../assets/scripts/ko-git.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -407,5 +407,53 @@ test('treeEntry gives the mode, type and object id of one path in a tree, null w
     assert.equal(treeEntry(repo.root, tree, 'd').type, 'tree');
     assert.equal(treeEntry(repo.root, tree, 'missing'), null);
     assert.throws(() => treeEntry(repo.root, 'not-a-tree', 'a.txt'), { message: gitFailedMessage('read the file') });
+  });
+});
+
+test('readBlobs reads many blobs in one git process, byte for byte, and throws for one that is missing or not a blob', () => {
+  withRepo({ files: { 'a.txt': 'x\n', 'b.bin': '' } }, (repo) => {
+    writeFileSync(join(repo.root, 'c.bin'), Buffer.from([0, 10, 255, 13, 10]));
+    repo.commitAll('c');
+    const tree = headTree(repo.root);
+    const ids = ['a.txt', 'b.bin', 'c.bin'].map((path) => repo.git('rev-parse', `${tree}:${path}`).stdout.trim());
+    const blobs = readBlobs(repo.root, ids);
+    assert.deepEqual([...blobs.keys()], ids);
+    assert.deepEqual(blobs.get(ids[2]), Buffer.from([0, 10, 255, 13, 10]));
+    assert.equal(blobs.get(ids[0]).toString(), 'x\n');
+    assert.equal(blobs.get(ids[1]).length, 0);
+    assert.throws(() => readBlobs(repo.root, ['f'.repeat(40)]), { message: gitFailedMessage('read the file') });
+    assert.throws(() => readBlobs(repo.root, [tree]), { message: gitFailedMessage('read the file') });
+  });
+});
+
+test('ownIndexEntry reads the repository\'s own index, not a hook\'s GIT_INDEX_FILE, and takes the path literally', () => {
+  withRepo({ files: { 'a.txt': 'x\n' } }, (repo) => {
+    repo.write('[x].txt', 'y\n');
+    repo.git('add', '[x].txt');
+    const oid = repo.git('rev-parse', ':[x].txt').stdout.trim();
+    assert.deepEqual(ownIndexEntry(repo.root, '[x].txt'), { mode: '100644', oid });
+    assert.equal(ownIndexEntry(repo.root, 'x.txt'), null);
+    assert.equal(ownIndexEntry(repo.root, 'missing'), null);
+    const saved = process.env.GIT_INDEX_FILE;
+    process.env.GIT_INDEX_FILE = join(repo.root, '.git', 'other-index');
+    try {
+      assert.deepEqual(ownIndexEntry(repo.root, '[x].txt'), { mode: '100644', oid });
+    } finally {
+      if (saved === undefined) delete process.env.GIT_INDEX_FILE;
+      else process.env.GIT_INDEX_FILE = saved;
+    }
+  });
+});
+
+test('every git call runs with core.fsmonitor off, so a configured monitor never runs', () => {
+  withRepo({ files: { 'a.txt': 'x\n' } }, (repo) => {
+    const marker = join(repo.root, '..', 'monitor-ran');
+    const script = join(repo.root, '..', 'monitor.sh');
+    writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+    spawnSync('chmod', ['+x', script]);
+    repo.git('config', 'core.fsmonitor', script);
+    indexTree(repo.root);
+    tidy(repo.root);
+    assert.equal(existsSync(marker), false);
   });
 });

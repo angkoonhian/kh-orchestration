@@ -11,13 +11,25 @@
 // is closed. Where it is not (missing, not executable, or not ours), git skips it, and a change in
 // the instant between the gate's exit and git's re-read remains a STATED LIMIT, with verify-branch
 // as the remedy: the head then has no verdict for its tree.
-import { join } from 'node:path';
+//
+// The gate executes only approved bytes, in a clean environment (after Task 6's third re-review).
+// - The hooks unset NODE_*, LD_*, DYLD_* before starting node; every git call runs with
+//   core.fsmonitor off, and none reads working-tree content (no filter or monitor runs).
+// - The live files are compared with the tree in this process, byte for byte, as git blobs.
+// - The only repository code the gate runs is kh-harness's entry script in the contract probe, and
+//   it runs a private copy of the approved tree's blobs, outside the repository, never the working
+//   copy; the project env may not set NODE_*, LD_* or DYLD_*.
+// STATED LIMIT: the shared state is not tamper-proof. Code an agent manages to run OUTSIDE the gate
+// (a script on disk, a command git runs from configuration before the hook, such as core.fsmonitor
+// inside git commit itself) can write a verdict or an approval. The extension blocks the one-line
+// ways, and verify-branch, which re-runs the officers, is the remedy.
+import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, constants, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, sep } from 'node:path';
 import { COMMANDS } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
-import { digestOfTree } from './ko-digest.mjs';
-import { readFileSync } from 'node:fs';
-import { GitError, baseOf, currentBranch, filesNotInIndex, indexTree, repoRoot, stagedDifferences, treeEntry, treeOfCommitId, workingDifferences } from './ko-git.mjs';
-import { OFFICERS } from './ko-digest.mjs';
+import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
+import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
 import { StateError, isOff, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, stateDir, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
@@ -36,7 +48,17 @@ const FILE_MODES = ['100644', '100755'];
 const NAMED_AT_MOST = 10;
 // What this session's hooks run from the working directory (amended decision 17): kh-harness's
 // files and settings and this plugin's scripts. Their working copies must equal the tree.
-const LIVE_PATHS = ['.claude/settings.json', '.claude/kh-harness', '.claude/scripts', '.claude/kh-orchestration/scripts'];
+const LIVE_FILE = '.claude/settings.json';
+const LIVE_DIRS = ['.claude/kh-harness', '.claude/scripts', '.claude/kh-orchestration/scripts'];
+// Directories a live path is reached through; each must be a real directory, not a link.
+const LIVE_ANCESTORS = ['.claude', '.claude/kh-orchestration', ...LIVE_DIRS];
+const isLive = (path) => path === LIVE_FILE || LIVE_DIRS.some((dir) => path.startsWith(`${dir}/`));
+// The most a live file may hold (kh-harness's own cap on a listed script): larger is refused unread.
+const MAX_LIVE_BYTES = 4 * 1024 * 1024;
+const SETTINGS_FILES = ['.claude/settings.json', '.claude/settings.local.json'];
+const MAX_SETTINGS_BYTES = 1024 * 1024;
+// Project env names that would load code into every hook process of a session.
+const LOADER_ENV = /^(?:NODE_|LD_|DYLD_)/i;
 const REASON_SHOWN_AT_MOST = 200;
 // C0 and C1 controls, DEL, and the zero-width and bidi characters: what can make a terminal show
 // other text than the record holds.
@@ -64,6 +86,9 @@ export const REASONS = Object.freeze({
   extensionAbsent: `${EXTENSION} is not a file in this tree.`,
   officersAbsent: `${OFFICERS} is not a file in this tree.`,
   officersProblem: (problem) => `The officers file ${OFFICERS} in this tree cannot be used, so the commit gate refuses it: ${sentence(problem)} Fix the file and stage it; the owner approves the change.`,
+  liveTooLarge: (path) => `${path} is larger than 4 MiB, more than the gate compares; a live file of that size is not part of an install. Remove it from the tree, then commit again.`,
+  projectEnv: (file, key) => `${file} sets ${key} under env, which would load code into every hook process of the session. Remove it outside Claude Code, then commit again.`,
+  probeDirInside: 'the temporary directory for the private copy of the approved tree lies inside the repository; set TMPDIR to a directory outside it',
   liveDiffers: (path) => `The working copy of ${path} differs from the tree being committed, and the working copy is what this session's hooks run. Stage it for the owner to approve, or restore it as below, then commit again.`,
   liveStagedElsewhere: (path) => `${path} is staged with a change this partial commit leaves out, so its working copy, which this session's hooks run, differs from the tree being committed. Commit without a path list, or restore it, then commit again.`,
   liveUntracked: (path) => `${path} is in the working directory beside the files this session's hooks run but is not in the tree being committed (an editor's swap file or a .DS_Store looks like this too). Remove it as below, or add it and have the owner approve it, then commit again.`,
@@ -120,20 +145,129 @@ function installOf(root, tree) {
 }
 
 // 4. The live files equal the tree: the contract check reads the working copy, the digest
-// approves the tree, and this ties the two together. Refused: a working copy under LIVE_PATHS that
-// differs from the tree in bytes or mode, and any file there the index does not hold, untracked or
-// ignored. (The index tree is the tree being committed, so "not in the index" is "not in the tree".)
-function liveRefusal(root, tree) {
-  const differing = workingDifferences(root, tree, LIVE_PATHS)[0];
-  if (differing !== undefined) {
-    // Staged in the repository's own index but left out of this tree: a partial commit (`git commit
-    // <path>`) while a live file has a staged change. Restoring the working copy would lose it.
-    if (stagedDifferences(root, tree, [differing]).length > 0) return refuse(REASONS.liveStagedElsewhere(differing), 'git commit');
-    return refuse(REASONS.liveDiffers(differing), `git restore -- ${shellWord(differing)}`);
+// approves the tree, and this ties the two together. Compared here, in this process, never through
+// a git command that reads the working tree (a clean filter or a monitor configured outside the tree
+// could make git report what it likes). Every tree file under the live paths must be a regular
+// working file (lstat, never followed) whose bytes hash, as a git blob, to the tree's object id,
+// with the executable bit as the tree's mode says; every directory is listed directly, and a file
+// there the tree lacks is refused. Line endings count: a checkout that converts them differs.
+function readNoFollow(path) {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { differs: true };
+    if (stat.size > MAX_LIVE_BYTES) return { tooLarge: true };
+    const bytes = Buffer.alloc(stat.size);
+    let read = 0;
+    while (read < bytes.length) {
+      const count = readSync(fd, bytes, read, bytes.length - read, read);
+      if (count === 0) break;
+      read += count;
+    }
+    return { bytes: bytes.subarray(0, read), executable: (stat.mode & 0o100) !== 0 };
+  } catch {
+    return { differs: true };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
-  const extra = filesNotInIndex(root, LIVE_PATHS)[0];
-  if (extra !== undefined) return refuse(REASONS.liveUntracked(extra), `rm -- ${shellWord(extra)}`);
+}
+
+const lstatOrNull = (path) => {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
+  }
+};
+
+// Every path under `dir` that is not a directory, relative to `root`: files, links and anything
+// else, never following a link.
+function listedUnder(root, dir) {
+  const found = [];
+  const walk = (relative) => {
+    for (const name of readdirSync(join(root, relative)).sort()) {
+      const path = `${relative}/${name}`;
+      if (lstatSync(join(root, path)).isDirectory()) walk(path);
+      else found.push(path);
+    }
+  };
+  walk(dir);
+  return found;
+}
+
+// A differing path's refusal: staged in the repository's own index with other content than the
+// tree's means a partial commit leaves it out, and restoring or removing it would lose the change.
+function differsRefusal(root, path, entry) {
+  const staged = ownIndexEntry(root, path);
+  if (staged !== null && (entry === undefined || staged.oid !== entry.oid || staged.mode !== entry.mode)) return refuse(REASONS.liveStagedElsewhere(path), 'git commit');
+  return entry === undefined ? refuse(REASONS.liveUntracked(path), `rm -- ${shellWord(path)}`) : refuse(REASONS.liveDiffers(path), `git restore -- ${shellWord(path)}`);
+}
+
+function liveRefusal(root, live) {
+  for (const dir of LIVE_ANCESTORS) {
+    const stat = lstatOrNull(join(root, dir));
+    if (stat !== null && !stat.isDirectory()) return refuse(REASONS.liveDiffers(dir), `git restore -- ${shellWord(dir)}`);
+  }
+  const inTree = new Map(live.map((entry) => [entry.path, entry]));
+  for (const entry of live) {
+    const read = entry.type === 'blob' && FILE_MODES.includes(entry.mode) ? readNoFollow(join(root, entry.path)) : { differs: true };
+    if (read.tooLarge) return refuse(REASONS.liveTooLarge(entry.path), COMMANDS.status);
+    if (read.differs || !hashesTo(entry.oid, read.bytes) || read.executable !== (entry.mode === '100755')) return differsRefusal(root, entry.path, entry);
+  }
+  const present = [
+    ...(lstatOrNull(join(root, LIVE_FILE)) === null ? [] : [LIVE_FILE]),
+    ...LIVE_DIRS.filter((dir) => lstatOrNull(join(root, dir))?.isDirectory()).flatMap((dir) => listedUnder(root, dir)),
+  ];
+  const extra = present.find((path) => !inTree.has(path));
+  return extra === undefined ? null : differsRefusal(root, extra, undefined);
+}
+
+// 7a. The project env (amended decision 17, rule 5): neither settings file may set NODE_*, LD_* or
+// DYLD_* under env. A file that cannot be read is left to checkContract1, which refuses it.
+function projectEnvRefusal(root) {
+  for (const file of SETTINGS_FILES) {
+    const read = readNoFollow(join(root, file));
+    if (read.bytes === undefined || read.bytes.length > MAX_SETTINGS_BYTES) continue;
+    let value;
+    try {
+      value = JSON.parse(read.bytes.toString('utf8'));
+    } catch {
+      continue;
+    }
+    const env = value !== null && typeof value === 'object' ? value.env : undefined;
+    if (env === null || typeof env !== 'object') continue;
+    const key = Object.keys(env).find((name) => LOADER_ENV.test(name));
+    if (key !== undefined) return refuse(REASONS.projectEnv(file, key), COMMANDS.status);
+  }
   return null;
+}
+
+// 7b. A private copy of the approved tree's live files, for the probe to run (rule 4): each blob
+// read from the object store, verified against its id, written with its mode into a fresh 0700
+// directory under the system's temporary directory. `{ dir }`, or `{ problem }` when that
+// directory lies inside the repository. The caller removes it.
+function privateCopy(root, live) {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'ko-probe-'));
+  const real = realpathSync(dir);
+  const repository = realpathSync(root);
+  if (real === repository || real.startsWith(`${repository}${sep}`)) {
+    rmSync(dir, { recursive: true, force: true });
+    return { problem: REASONS.probeDirInside };
+  }
+  const blobs = readBlobs(root, live.map((entry) => entry.oid));
+  for (const entry of live) {
+    const bytes = blobs.get(entry.oid);
+    if (!hashesTo(entry.oid, bytes)) {
+      rmSync(dir, { recursive: true, force: true });
+      return { problem: objectMismatchMessage(entry.path) };
+    }
+    const target = join(dir, entry.path);
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+    writeFileSync(target, bytes, { mode: 0o600 });
+    chmodSync(target, entry.mode === '100755' ? 0o700 : 0o600);
+  }
+  return { dir };
 }
 
 // 6. Whether the owner approved this digest. Approval is by content: an approval's `branch` is a
@@ -156,9 +290,11 @@ function verdictRefusal(verdict, { tree, base }, digest, officers) {
  * Decision 17's checks in their final order (after Task 6's re-review), stopping at the first that
  * decides: `{ allow, reason, next }`, `next` the exact command to run ('' on an allow). Nothing from
  * the repository is EXECUTED before the owner's approval of those exact bytes is established:
- *   1 off switch, 2 exempt branch, 3 install in the tree, 4 live files equal the tree,
- *   5 RULES.md and the digest, 6 digest approved, 7 contract 1 (checkContract1, then the probe,
- *   the first step that runs repository code), 8 a passing verdict for this tree and base.
+ *   1 off switch, 2 exempt branch, 3 install in the tree, 4 live files equal the tree (compared
+ *   in this process), 5 RULES.md and the digest, 6 digest approved, 7 contract 1: the project env
+ *   (no NODE_*, LD_*, DYLD_*), checkContract1 on the working directory, then the probe on a
+ *   private copy of the approved tree (the one step that runs repository code, and only approved
+ *   bytes), 8 a passing verdict for this tree and base.
  * runGate then adds 9 (the index tree unchanged) and 10 (the in-flight record, then the token).
  * The approvals and the verdict are read into memory BEFORE the probe runs, and judged on those
  * copies: the probe starts the repository's entry script, and nothing its process writes to the
@@ -179,13 +315,23 @@ export function judge(root, { tree, base, branch }) {
       : refuse(REASONS.noInstall(install.absent), exemptCommand(root, branch));
   }
   if (install.problem !== undefined) return refuse(REASONS.officersProblem(install.problem), COMMANDS.status);
-  const live = liveRefusal(root, tree);
-  if (live !== null) return live;
+  const live = listEntries(root, tree).filter((entry) => isLive(entry.path)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const liveProblem = liveRefusal(root, live);
+  if (liveProblem !== null) return liveProblem;
   const digest = digestOfTree(root, tree);
   if (digest.problem !== undefined) return refuse(REASONS.undigestable(digest.problem), COMMANDS.run);
   if (!approved(root, digest.digest)) return refuse(REASONS.unapproved(digest.digest), COMMANDS.approve);
   const verdict = readVerdict(root, tree, base);
-  const holds = contractHolds(root);
+  const envProblem = projectEnvRefusal(root);
+  if (envProblem !== null) return envProblem;
+  const copy = privateCopy(root, live);
+  if (copy.problem !== undefined) return refuse(REASONS.couldNotDecide(copy.problem), COMMANDS.status);
+  let holds;
+  try {
+    holds = contractHolds(root, { probeRoot: copy.dir });
+  } finally {
+    rmSync(copy.dir, { recursive: true, force: true });
+  }
   if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), COMMANDS.status);
   return verdictRefusal(verdict, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
 }

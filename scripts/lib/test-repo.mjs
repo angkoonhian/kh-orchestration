@@ -131,11 +131,29 @@ const REFUSED_LINE = 'echo "kh-orchestration: the commit gate did not allow this
 // The hooks decision 18 (further amended) words: allow only on the gate's exit 0 AND its token on
 // standard output; node named by its absolute path, never found through PATH; the git process id
 // ($PPID) passed on. reference-transaction starts no node unless that process has an in-flight record.
+// Unsets every NODE_*, LD_* and DYLD_* variable before node starts (amended decision 18, rule 1),
+// with shell built-ins only: `export -p` lists the exported names, one `export NAME=…` (or bash's
+// `declare -x NAME=…`) per variable, each at the start of a line. A value holding a newline can only
+// add lines, which at worst unset one more such name; a name with any other character is skipped.
+const CLEAN_ENV = [
+  'ko_clean() {',
+  '  unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT',
+  '  while IFS= read -r ko_line; do',
+  "    case $ko_line in 'export '*) ko_name=${ko_line#export } ;; 'declare -x '*) ko_name=${ko_line#declare -x } ;; *) continue ;; esac",
+  '    ko_name=${ko_name%%=*}',
+  "    case $ko_name in *[!A-Za-z0-9_]*|'') ;; NODE_*|LD_*|DYLD_*) unset \"$ko_name\" ;; esac",
+  '  done <<KO_EOF',
+  '$(export -p)',
+  'KO_EOF',
+  '}',
+];
+
 function hookScript(hook, node = process.execPath) {
-  const header = ['#!/bin/sh', `# kh-orchestration ${KIT_VERSION} ${hook}. Do not edit.`];
+  const header = ['#!/bin/sh', `# kh-orchestration ${KIT_VERSION} ${hook}. Do not edit.`, ...CLEAN_ENV];
   if (hook !== 'reference-transaction') {
     return [
       ...header,
+      'ko_clean',
       `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" ${hook} "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
       REFUSED_LINE,
       'exit 1',
@@ -149,7 +167,7 @@ function hookScript(hook, node = process.execPath) {
     'f="$d/kh-orchestration/inflight-$PPID.json"',
     '[ -e "$f" ] || [ -L "$f" ] || exit 0',
     'case "$1" in',
-    `prepared) out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    `prepared) ko_clean; out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
     `  ${REFUSED_LINE}`,
     '  exit 1 ;;',
     'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -rf "$f" ;; esac; done ;;',

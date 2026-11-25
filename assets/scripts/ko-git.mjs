@@ -28,7 +28,8 @@ function exec(root, argv, { input, readOnly, binary, ownIndex } = {}) {
   // The repository's own index, not the one a hook names (a partial commit's temporary index).
   if (ownIndex) delete env.GIT_INDEX_FILE;
   if (readOnly) env.GIT_OPTIONAL_LOCKS = '0';
-  const result = spawnSync('git', argv, {
+  // A monitor is a command git runs from configuration made outside the tree; none runs here.
+  const result = spawnSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
     cwd: root,
     env,
     input,
@@ -140,24 +141,35 @@ export function treeOfCommitId(root, id) {
   return oneLine(mustSucceed(git(root, ['rev-parse', '--verify', '--end-of-options', `${id}^{tree}`]), 'read the commit'));
 }
 
-// The paths under `pathspecs` whose working copy differs from `tree` in bytes or mode (a file
-// changed, added to the index or deleted), in git's order. No external diff or textconv runs.
-export function workingDifferences(root, tree, pathspecs) {
-  const argv = ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--end-of-options', tree, '--', ...pathspecs];
-  return nulSeparated(mustSucceed(git(root, argv), 'compare the working tree'));
+// `{ mode, oid }` of `path` in the repository's own index (never a hook's GIT_INDEX_FILE, which
+// names a partial commit's temporary index), or null when the index does not hold it. Reads the
+// index only. The path is taken literally, not as a pattern.
+export function ownIndexEntry(root, path) {
+  const result = exec(root, ['--literal-pathspecs', 'ls-files', '-s', '-z', '--', path], { readOnly: true, ownIndex: true });
+  const out = mustSucceed(result, 'read the index');
+  if (out === '') return null;
+  const match = out.match(/^(\d+) ([0-9a-f]+) 0\t/);
+  if (!match) throw new GitError(gitFailedMessage('read the index'));
+  return { mode: match[1], oid: match[2] };
 }
 
-// The paths under `pathspecs` where the repository's own index (not a partial commit's temporary
-// one) differs from `tree`: what is staged and left out of the commit being made.
-export function stagedDifferences(root, tree, pathspecs) {
-  const argv = ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--end-of-options', tree, '--', ...pathspecs];
-  return nulSeparated(mustSucceed(exec(root, argv, { readOnly: true, ownIndex: true }), 'compare the index'));
-}
-
-// The files under `pathspecs` in the working directory that the index does not hold, ignored
-// ones included (no exclude rules are applied).
-export function filesNotInIndex(root, pathspecs) {
-  return nulSeparated(mustSucceed(git(root, ['ls-files', '-z', '--others', '--', ...pathspecs]), 'list the untracked files'));
+// The bytes of each blob `oids` names, in one `cat-file --batch`, as a Map in the given order.
+// Throws when one is missing or is not a blob. The caller verifies the bytes against the id.
+export function readBlobs(root, oids) {
+  const result = exec(root, ['cat-file', '--batch'], { readOnly: true, binary: true, input: Buffer.from(oids.map((oid) => `${oid}\n`).join('')) });
+  const out = mustSucceed(result, 'read the file');
+  const blobs = new Map();
+  let at = 0;
+  for (const oid of oids) {
+    const end = out.indexOf(10, at);
+    const header = end === -1 ? null : out.subarray(at, end).toString('latin1').match(/^([0-9a-f]+) blob (\d+)$/);
+    if (header === null || header[1] !== oid) throw new GitError(gitFailedMessage('read the file'));
+    const size = Number(header[2]);
+    if (end + 1 + size + 1 > out.length) throw new GitError(gitFailedMessage('read the file'));
+    blobs.set(oid, out.subarray(end + 1, end + 1 + size));
+    at = end + 1 + size + 1;
+  }
+  return blobs;
 }
 
 // `{ mode, type, oid }` of one path in a tree, or null only when the path is not in it.

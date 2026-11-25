@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import {
   StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readInflight, readState, removeInflight, removeStaleInflight, shapeMessage, stateDir,
-  invalidPidMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
+  invalidPidMessage, stateUnreadableMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
 } from '../../assets/scripts/ko-state.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -283,5 +283,18 @@ test('removeStaleInflight removes the records of processes that no longer exist 
 test('removeStaleInflight on a repository with no state directory removes nothing', () => {
   withRepo((repo) => {
     assert.deepEqual(removeStaleInflight(repo.root), []);
+  });
+});
+
+test('removeStaleInflight on a state directory that cannot be read says so, not that something could not be written', () => {
+  withRepo((repo) => {
+    mkdirSync(stateDir(repo.root), { recursive: true });
+    chmodSync(stateDir(repo.root), 0o000);
+    try {
+      assert.throws(() => removeStaleInflight(repo.root), { name: 'StateError', message: stateUnreadableMessage });
+    } finally {
+      chmodSync(stateDir(repo.root), 0o755);
+    }
+    assert.equal(stateUnreadableMessage, 'The shared state directory could not be read; nothing proceeds on state that cannot be read.');
   });
 });

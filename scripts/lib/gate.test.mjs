@@ -18,7 +18,7 @@ import { baseOf, currentBranch, indexTree } from '../../assets/scripts/ko-git.mj
 import { corruptMessage, readInflight, shapeMessage, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
-import { produceVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
+import { produceVerdict, readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 // The git process id the tests stand in for: alive for as long as the test runs.
 const PID = String(process.pid);
@@ -502,12 +502,28 @@ test('Review Focus 1 and Important 3: the hook runs the node recorded at install
   assert.ok(moved.stderr.endsWith(HOOK_LINE), moved.stderr);
 });
 
+// The environment cleaner every hook carries (amended decision 18, rule 1).
+const CLEAN_ENV = [
+  'ko_clean() {',
+  '  unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT',
+  '  while IFS= read -r ko_line; do',
+  "    case $ko_line in 'export '*) ko_name=${ko_line#export } ;; 'declare -x '*) ko_name=${ko_line#declare -x } ;; *) continue ;; esac",
+  '    ko_name=${ko_name%%=*}',
+  "    case $ko_name in *[!A-Za-z0-9_]*|'') ;; NODE_*|LD_*|DYLD_*) unset \"$ko_name\" ;; esac",
+  '  done <<KO_EOF',
+  '$(export -p)',
+  'KO_EOF',
+  '}',
+];
+
 test('installGate writes the three hooks as decision 18 (further amended) words them, naming node by its absolute path', () => {
   const repo = installed();
   const hook = (name) => readFileSync(join(repo.root, '.git', 'hooks', name), 'utf8');
   assert.equal(hook('pre-merge-commit'), [
     '#!/bin/sh',
     `# kh-orchestration ${KIT_VERSION} pre-merge-commit. Do not edit.`,
+    ...CLEAN_ENV,
+    'ko_clean',
     `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" pre-merge-commit "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
     'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
     'exit 1',
@@ -516,12 +532,13 @@ test('installGate writes the three hooks as decision 18 (further amended) words 
   assert.equal(hook('reference-transaction'), [
     '#!/bin/sh',
     `# kh-orchestration ${KIT_VERSION} reference-transaction. Do not edit.`,
+    ...CLEAN_ENV,
     'd=${0%/hooks/reference-transaction}',
     '[ "$d" != "$0" ] && [ -d "$d/kh-orchestration" ] || d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1',
     'f="$d/kh-orchestration/inflight-$PPID.json"',
     '[ -e "$f" ] || [ -L "$f" ] || exit 0',
     'case "$1" in',
-    `prepared) out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    `prepared) ko_clean; out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
     '  echo "kh-orchestration: the commit gate did not allow this commit." >&2',
     '  exit 1 ;;',
     'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -rf "$f" ;; esac; done ;;',
@@ -933,11 +950,13 @@ test('no check that runs repository code comes before the approval check: an una
 
 test('the verdict is read before the probe runs: an approved dispatcher that writes a passing verdict when probed does not make one count', async () => {
   const repo = await committedInstall();
-  replaceDispatcher(repo.root, forger(false));
+  // The probe runs in a private copy, so this forger names the repository by its absolute path.
+  replaceDispatcher(repo.root, forger(false).replace('const root = process.env.CLAUDE_PROJECT_DIR;', `const root = ${JSON.stringify(repo.root)};`));
   stage(repo);
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
   assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assert.notEqual(readVerdict(repo.root, at.tree, at.base), null, 'the forger did write a verdict while probed');
 });
 
 // ---- stale in-flight records and the hook's own removal ----
@@ -1030,4 +1049,177 @@ test('the entry prints its literal text, never undefined, for a decision without
   const outcome = spawnSync(process.execPath, [join(bin, 'gate.mjs'), 'pre-commit', PID], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
   assert.deepEqual([outcome.status, outcome.stdout], [1, '']);
   assert.equal(outcome.stderr, gateText('the gate could not decide: an unexpected error stopped the check. The commit is refused.', COMMANDS.status));
+});
+
+// ---- the gate executes only approved bytes, in a clean environment (after the third re-review) ----
+
+// A test bin/gate.mjs that records which loader variables reached it, per hook, and lets the
+// commit through: pre-commit writes the in-flight record the third hook needs to start node.
+function envRecordingGate(repo, log) {
+  const bin = join(stateDir(repo.root), 'bin');
+  writeFileSync(join(bin, 'gate.mjs'), `import { appendFileSync, writeFileSync } from 'node:fs';
+const [hook, pid] = process.argv.slice(2);
+const seen = Object.keys(process.env).filter((name) => /^(NODE_|LD_|DYLD_)/.test(name)).sort();
+appendFileSync(${JSON.stringify(log)}, JSON.stringify({ hook, seen }) + '\\n');
+if (hook === 'pre-commit') writeFileSync(${JSON.stringify(join(stateDir(repo.root), 'inflight-'))} + pid + '.json', '{}');
+process.stdout.write('kh-orchestration: allowed\\n');
+`);
+}
+
+test('rule 1: NODE_*, LD_* and DYLD_* on the commit never reach the gate, whatever another variable\'s value holds', () => {
+  const repo = installed();
+  const log = join(repo.root, '..', 'env-seen.jsonl');
+  envRecordingGate(repo, log);
+  const env = {
+    ...testEnv(), NODE_OPTIONS: '--require=/nonexistent/x.js', NODE_PATH: '/x', NODE_EXTRA_CA_CERTS: '/x', NODE_X: "a\nexport NODE_Y='1'",
+    LD_LIBRARY_PATH: '/nonexistent', LD_AUDIT: '/nonexistent.so', DYLD_INSERT_LIBRARIES: '/x', KO_HOSTILE: "x'\nexport NODE_OPTIONS='--require=/y'\nexport KEEP=1",
+  };
+  const outcome = gitIn(repo.root, ['commit', '-q', '-m', 'env'], env);
+  assert.equal(outcome.status, 0, outcome.stderr);
+  const lines = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => line.hook), ['pre-commit', 'reference-transaction']);
+  assert.deepEqual(lines.map((line) => line.seen), [[], []]);
+});
+
+test('rule 1 (L3): NODE_OPTIONS that prints the token itself does not land a failing, unverdicted tree', async () => {
+  const repo = await committedInstall();
+  const before = head(repo.root);
+  const outcome = spawnSync('sh', ['-c', "NODE_OPTIONS='--import=data:text/javascript,process.stdout.write(%22kh-orchestration:%20allowed%5Cn%22);process.exit(0)' git commit -q -m forged"], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
+  assertRefused(repo.root, outcome, before);
+  assert.equal(gitIn(repo.root, ['cat-file', '-e', 'HEAD:fail.txt']).status === 0, false);
+});
+
+test('rule 2: no git call of the gate runs core.fsmonitor', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  const marker = join(repo.root, '..', 'fsmonitor-ran');
+  const script = join(repo.root, '..', 'fsm.sh');
+  writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+  chmodSync(script, 0o755);
+  assert.equal(gitIn(repo.root, ['config', 'core.fsmonitor', script]).status, 0);
+  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
+  const outcome = spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
+  assert.deepEqual([outcome.status, outcome.stdout], [0, 'kh-orchestration: allowed\n'], outcome.stderr);
+  assert.equal(existsSync(marker), false, 'the gate ran the fsmonitor');
+  gitIn(repo.root, ['status', '-s']);
+  assert.equal(existsSync(marker), true, 'the marker script works: git status runs it');
+});
+
+test('rule 3 (L1): a clean filter that makes git see the approved bytes does not blind the live-files check, and the evil dispatcher never runs', async () => {
+  const repo = await committedInstall();
+  const marker = join(repo.root, '..', 'filter-dispatcher-ran');
+  assert.equal(gitIn(repo.root, ['config', 'filter.x.clean', 'git show HEAD:%f']).status, 0);
+  writeFileSync(join(repo.root, '.gitattributes'), '.claude/** filter=x\n');
+  replaceDispatcher(repo.root, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, '');\n${forger(false).split('\n').slice(2).join('\n')}`);
+  assert.equal(gitIn(repo.root, ['diff', '--name-only', 'HEAD', '--', '.claude']).stdout, '', 'the filter blinds git diff against a tree');
+  for (const attempt of [1, 2]) {
+    const before = head(repo.root);
+    assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.liveDiffers(CONTRACT_FILE), `git restore -- ${CONTRACT_FILE}`));
+    assert.equal(existsSync(marker), false, `attempt ${attempt}: the working dispatcher ran`);
+  }
+});
+
+test('rule 3: bytes are compared, so a CRLF working copy of a live file differs; a missing file, a link, a directory link and an oversized file are refused', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  const settings = join(repo.root, '.claude/settings.json');
+  const original = readFileSync(settings);
+  writeFileSync(settings, original.toString('utf8').replaceAll('\n', '\r\n'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/settings.json'), 'git restore -- .claude/settings.json'));
+  rmSync(settings);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/settings.json'), 'git restore -- .claude/settings.json'));
+  symlinkSync('../a.txt', settings);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/settings.json'), 'git restore -- .claude/settings.json'));
+  rmSync(settings);
+  writeFileSync(settings, original);
+  const scripts = join(repo.root, '.claude/kh-orchestration/scripts');
+  renameSync(scripts, `${scripts}-real`);
+  symlinkSync(`${scripts}-real`, scripts);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/kh-orchestration/scripts'), 'git restore -- .claude/kh-orchestration/scripts'));
+  rmSync(scripts);
+  renameSync(`${scripts}-real`, scripts);
+  writeFileSync(join(repo.root, '.claude/scripts/big.mjs'), Buffer.alloc(4 * 1024 * 1024 + 1));
+  stage(repo);
+  assert.deepEqual(judge(repo.root, subject(repo.root)), refused(REASONS.liveTooLarge('.claude/scripts/big.mjs'), COMMANDS.status));
+  assert.equal(REASONS.liveTooLarge('x'), 'x is larger than 4 MiB, more than the gate compares; a live file of that size is not part of an install. Remove it from the tree, then commit again.');
+});
+
+test('rule 3: a partial commit that leaves out a NEW staged live file is told to commit without a path list, not to remove it', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  repo.write('.claude/scripts/new.mjs', 'x\n');
+  assert.equal(gitIn(repo.root, ['add', '.claude/scripts/new.mjs']).status, 0);
+  repo.write('a.txt', 'partial\n');
+  const before = head(repo.root);
+  assertRefused(repo.root, commit(repo.root, '--', 'a.txt'), before, refusalText(REASONS.liveStagedElsewhere('.claude/scripts/new.mjs'), 'git commit'));
+});
+
+test('rule 4: the probe runs a private copy of the approved tree, never the working copy (live check stubbed out in a test bin/)', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  const marker = join(repo.root, '..', 'working-dispatcher-ran');
+  replaceDispatcher(repo.root, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, '');\nprocess.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'kh-harness extension kh-orchestration: x' } }));\n`);
+  const koGate = join(stateDir(repo.root), 'bin', 'ko-gate.mjs');
+  const text = readFileSync(koGate, 'utf8');
+  assert.ok(text.includes('const liveProblem = liveRefusal('));
+  writeFileSync(koGate, text.replace(/const liveProblem = liveRefusal\([^)]*\);/, 'const liveProblem = null;'));
+  repo.write('b.txt', 'b\n');
+  assert.equal(gitIn(repo.root, ['add', 'b.txt']).status, 0);
+  await runAndApprove(repo.root);
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'ko-gate-tmp-')));
+  try {
+    const outcome = gitIn(repo.root, ['commit', '-q', '-m', 'b'], { ...testEnv(), TMPDIR: scratch });
+    assert.deepEqual([outcome.status, outcome.stderr], [0, '']);
+    assert.equal(existsSync(marker), false, 'the gate executed the working copy');
+    assert.deepEqual(readdirSync(scratch), [], 'the private copy is removed');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('rule 4: a temporary directory inside the repository is refused for the private copy', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  const inside = join(repo.root, '..', 'repo', 'tmp-inside');
+  mkdirSync(inside);
+  writeFileSync(join(repo.root, '.git', 'info', 'exclude'), 'tmp-inside/\n');
+  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
+  const outcome = spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: { ...testEnv(), TMPDIR: inside }, encoding: 'utf8' });
+  assert.deepEqual([outcome.status, outcome.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirInside), COMMANDS.status)]);
+  assert.deepEqual(readdirSync(inside), []);
+});
+
+test('rule 5 (L5): an env in settings.local.json or settings.json that sets NODE_*, LD_* or DYLD_* is refused, naming the file and the key', async () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  writeFileSync(join(repo.root, '.claude/settings.local.json'), '{ "env": { "LD_PRELOAD": "/x/evil.so" } }\n');
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.projectEnv('.claude/settings.local.json', 'LD_PRELOAD'), COMMANDS.status));
+  writeFileSync(join(repo.root, '.claude/settings.local.json'), '{ "env": { "dyld_x": "1" } }\n');
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.projectEnv('.claude/settings.local.json', 'dyld_x'), COMMANDS.status));
+  rmSync(join(repo.root, '.claude/settings.local.json'));
+  const settings = JSON.parse(readFileSync(join(repo.root, '.claude/settings.json'), 'utf8'));
+  settings.env = { NODE_PATH: '/x' };
+  writeFileSync(join(repo.root, '.claude/settings.json'), `${JSON.stringify(settings, null, 2)}\n`);
+  stage(repo);
+  const changed = subject(repo.root);
+  approveTree(repo.root, changed.tree);
+  assert.deepEqual(judge(repo.root, changed), refused(REASONS.projectEnv('.claude/settings.json', 'NODE_PATH'), COMMANDS.status));
+  assert.equal(REASONS.projectEnv('f', 'K'), 'f sets K under env, which would load code into every hook process of the session. Remove it outside Claude Code, then commit again.');
+});
+
+test('the owner\'s flow still lands: edit a live file, stage, approve, run, commit', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  const live = '.claude/kh-orchestration/scripts/ko-git.mjs';
+  repo.write(live, `${readFileSync(join(repo.root, live), 'utf8')}// owner's change\n`);
+  stage(repo);
+  const at = subject(repo.root);
+  assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
 });

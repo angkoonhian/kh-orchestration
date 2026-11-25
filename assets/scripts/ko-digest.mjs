@@ -32,7 +32,7 @@ const decode = (bytes) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: tru
 
 // Whether bytes are the blob an object id names: the id is the hash of `blob <length> NUL` and the bytes.
 // git does not check a loose object against its name when it reads it.
-function hashesTo(oid, bytes) {
+export function hashesTo(oid, bytes) {
   const hash = createHash(oid.length === 64 ? 'sha256' : 'sha1');
   return hash.update(`blob ${bytes.length}\0`).update(bytes).digest('hex') === oid;
 }

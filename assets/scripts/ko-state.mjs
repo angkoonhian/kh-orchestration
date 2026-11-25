@@ -18,6 +18,7 @@ export const unknownNameMessage = (name) => `"${name}" is not the name of a shar
 export const invalidValueMessage = (name) => `The value for ${name} cannot be written as JSON.`;
 export const invalidVerdictKeyMessage = 'A verdict is named by a full hexadecimal tree id and a full hexadecimal base id or none.';
 export const writeFailedMessage = (name) => `The shared state file ${name} could not be written.`;
+export const stateUnreadableMessage = 'The shared state directory could not be read; nothing proceeds on state that cannot be read.';
 export const invalidPidMessage = 'An in-flight record is named by the process id of a git command: digits only, without a leading zero.';
 export const shapeMessage = (name) =>
   `The shared state file ${name} is not of the shape kh-orchestration writes. Restore it from a backup or ask the owner to remove it; nothing proceeds on a state file that cannot be read.`;
@@ -187,7 +188,7 @@ export function removeStaleInflight(root) {
     names = readdirSync(stateDir(root));
   } catch (error) {
     if (error.code === 'ENOENT') return [];
-    throw new StateError(writeFailedMessage('inflight records'));
+    throw new StateError(stateUnreadableMessage);
   }
   const removed = [];
   for (const name of names.filter((entry) => INFLIGHT_NAME.test(entry)).sort()) {
