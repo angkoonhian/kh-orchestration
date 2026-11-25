@@ -1,0 +1,9 @@
+{
+  "name": "kh-orchestration",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test \"scripts/lib/*.test.mjs\" \"examples/**/*.test.mjs\""
+  }
+}
