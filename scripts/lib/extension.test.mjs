@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { reachesOtherFiles } from './self-contained.mjs';
-import { PROTECTED_FILES, PROTECTED_PREFIXES, compileGlob, isProtected, readOfficers } from '../../assets/scripts/extension.mjs';
+import { MAX_GLOBS, PROTECTED_FILES, PROTECTED_PREFIXES, isProtected, isValidGlob, matchesGlob, readOfficers } from '../../assets/scripts/extension.mjs';
 
 const EXTENSION = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'assets', 'scripts', 'extension.mjs');
 const officersText = (argvs, extra = {}) => JSON.stringify({
@@ -49,15 +50,52 @@ test('a compiled glob: **/ matches zero or more directories, a trailing /** what
     ['a?c', 'abc', true], ['a?c', 'a/c', false], ['a?c', 'ac', false], ['*', 'a/b', false], ['*', 'ab', true], ['a.b', 'aXb', false], ['a.b', 'a.b', true],
     ['a+b', 'a+b', true], ['a(b)', 'a(b)', true], ['a.js', 'A.js', false], ['x/*/y', 'x/m/y', true], ['x/*/y', 'x/m/n/y', false], ['a$b', 'a$b', true],
   ];
-  for (const [glob, path, expected] of table) assert.equal(compileGlob(glob)(path), expected, `${glob} ${path}`);
+  for (const [glob, path, expected] of table) assert.equal(matchesGlob(glob, path), expected, `${glob} ${path}`);
 });
 
-test('compiling a glob twice gives the same matcher, so a hot path does not compile again', () => {
-  assert.equal(compileGlob('a/**'), compileGlob('a/**'));
+// Runs a match in a child process that is killed after 5 s, so a matcher that never returns fails
+// the test instead of hanging the suite. The child times the match itself. The algorithm's step
+// count is bounded by the product of the glob's and the path's lengths, a few million steps at most
+// here, so 100 ms is generous and does not depend on load.
+function timedMatch(glob, path) {
+  const code = `import { matchesGlob } from ${JSON.stringify(new URL(EXTENSION, 'file:').href)};
+    const [glob, path] = JSON.parse(process.argv[1]);
+    const started = performance.now();
+    const result = matchesGlob(glob, path);
+    console.log(JSON.stringify({ result, ms: performance.now() - started }));`;
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', code, JSON.stringify([glob, path])], { encoding: 'utf8', timeout: 5000 });
+  return run.status === 0 ? JSON.parse(run.stdout) : { result: null, ms: Infinity };
+}
+
+test('a glob built to make a backtracking matcher blow up is answered correctly within 100 ms', () => {
+  const cases = [
+    ['*'.repeat(30) + 'b', 'a'.repeat(200), false],
+    ['*a*a*a*a*ab', 'a'.repeat(200), false],
+    ['*a*a*a*a*ab', `${'a'.repeat(200)}b`, true],
+    ['**/a/**/a/**/a/**/a/**/a/**/a/b', 'a/'.repeat(100), false],
+    ['**/a/**/a/**/a/**/a/**/a/**/a/b', `${'a/'.repeat(100)}b`, true],
+    ['*a'.repeat(256), 'a'.repeat(4096), true],
+    ['*a'.repeat(255) + '*b', 'a'.repeat(4096), false],
+  ];
+  for (const [glob, path, expected] of cases) {
+    const { result, ms } = timedMatch(glob, path);
+    assert.equal(result, expected, glob.slice(0, 40));
+    assert.ok(ms < 100, `${glob.slice(0, 40)} took ${ms} ms`);
+  }
+});
+
+test('a glob over 512 characters or more than 64 protected globs make the officers file unreadable', () => {
+  assert.equal(isValidGlob('a'.repeat(512)), true);
+  assert.equal(isValidGlob('a'.repeat(513)), false);
+  assert.equal(MAX_GLOBS, 64);
+  const globs = (count) => Array.from({ length: count }, (_, index) => `d${index}/**`);
+  assert.notEqual(readOfficers(officersText([['node', 'a.mjs']], { protected: globs(64) })), null);
+  assert.equal(readOfficers(officersText([['node', 'a.mjs']], { protected: globs(65) })), null);
+  assert.equal(readOfficers(officersText([['node', 'a.mjs']], { protected: ['a'.repeat(513)] })), null);
 });
 
 test('an invalid glob makes the officers file unreadable: empty, absolute, a .., . or empty segment, a trailing /, or [ ] { } \\', () => {
-  for (const glob of ['', '/abs/x', '../x', 'a/../x', './x', 'a/./b', '.', '..', 'a//b', 'docs/', '/', 'a[b]', 'a]', '{a,b}', 'a}', 'a\\b']) {
+  for (const glob of ['', '/abs/x', '../x', 'a/../x', './x', 'a/./b', '.', '..', 'a//b', 'docs/', '/', 'a**b', 'a/**b', '**b', 'a**', '***', 'a/**/b**', 'a[b]', 'a]', '{a,b}', 'a}', 'a\\b']) {
     assert.equal(readOfficers(officersText([['node', 'a.mjs']], { protected: [glob] })), null, JSON.stringify(glob));
   }
   for (const glob of ['a', 'a/b.js', '**', '**/*.py', 'lib/**', 'a.b/c?', '.hidden/**']) {

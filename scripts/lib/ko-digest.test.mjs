@@ -15,6 +15,7 @@ isolateProcessEnv();
 const RULES = 'docs/harness/RULES.md';
 const OFFICERS = '.claude/kh-orchestration/officers.json';
 const SETTINGS = '.claude/settings.json';
+const MODE = '100644';
 const sha = (data) => createHash('sha256').update(data).digest('hex');
 
 const agentRule = (id = 'A1', why = 'a reason') => `## ${id} — an agent rule\n- why: ${why}\n- enforced-by: officer\n- pointer: tools/officers/a1.mjs\n- approval: agent\n`;
@@ -51,7 +52,7 @@ const digestAfter = (repo, path, text) => {
   return digestOf(repo);
 };
 
-test('the digest is the SHA-256 of the canonical text: sorted path NUL object-id lines, with RULES.md by the hash of its canonical form', () => {
+test('the digest is the SHA-256 of the canonical text: sorted path NUL mode NUL object-id lines, with RULES.md by the hash of its canonical form', () => {
   withRepo({}, (repo) => {
     const files = baseFiles();
     const rulesHash = sha(canonicalRegistry(parseRegistry(files[RULES])));
@@ -60,7 +61,7 @@ test('the digest is the SHA-256 of the canonical text: sorted path NUL object-id
       [OFFICERS, oid(OFFICERS)], [SETTINGS, oid(SETTINGS)], [RULES, rulesHash], ['tools/officers/a1.mjs', oid('tools/officers/a1.mjs')],
     ].sort((a, b) => (a[0] < b[0] ? -1 : 1));
     const result = digestOf(repo);
-    assert.deepEqual(result, { digest: sha(lines.map(([path, hash]) => `${path}\0${"100644"}\0${hash}\n`).join('')), paths: lines.map(([path]) => path) });
+    assert.deepEqual(result, { digest: sha(lines.map(([path, hash]) => `${path}\0${MODE}\0${hash}\n`).join('')), paths: lines.map(([path]) => path) });
     assert.deepEqual(result.paths, ['.claude/kh-orchestration/officers.json', '.claude/settings.json', 'docs/harness/RULES.md', 'tools/officers/a1.mjs']);
   });
 });
@@ -410,5 +411,25 @@ test('agentRuleChanges treats an absent RULES.md in either tree as no rules', ()
     repo.commitAll('remove');
     assert.deepEqual(agentRuleChanges(repo.root, base, treeOf(repo)), []);
     assert.deepEqual(agentRuleChanges(repo.root, treeOf(repo), base), []);
+  });
+});
+
+test('agentRuleChanges throws a fixed message when the RULES.md of either tree is not the blob its id names, so a forged base cannot hide a rewording', () => {
+  withRepo({}, (repo) => {
+    const base = treeOf(repo);
+    repo.write(RULES, registry(ownerRule(), agentRule('A1', 'a different reason')));
+    repo.commitAll('reword');
+    const head = treeOf(repo);
+    assert.deepEqual(agentRuleChanges(repo.root, base, head), [{ id: 'A1', change: 'reworded' }]);
+    const forge = (text, otherTree) => {
+      const oid = repo.git('rev-parse', `${otherTree}:${RULES}`).stdout.trim();
+      const object = join(repo.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+      rmSync(object);
+      const body = Buffer.from(text);
+      writeFileSync(object, deflateSync(Buffer.concat([Buffer.from(`blob ${body.length}\0`), body])));
+    };
+    forge(registry(ownerRule(), agentRule('A1', 'a different reason')), base);
+    assert.throws(() => agentRuleChanges(repo.root, base, head), { message: objectMismatchMessage(RULES) });
+    
   });
 });

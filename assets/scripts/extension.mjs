@@ -8,48 +8,89 @@ export const PROTECTED_PREFIXES = ['.claude/kh-orchestration/scripts/', '.claude
 export const PROTECTED_FILES = ['docs/harness/RULES.md', '.claude/kh-orchestration/officers.json', '.claude/settings.json'];
 
 const INVALID_GLOB_CHARACTERS = /[[\]{}\\]/;
-
-// A valid glob is not empty, not absolute, ends in no `/`, has no empty, `.` or `..`
-// segment, and has none of `[ ] { } \`.
-const isValidGlob = (glob) => !INVALID_GLOB_CHARACTERS.test(glob) && glob.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
-
-const matchers = new Map();
+const MAX_GLOB_LENGTH = 512;
+// The most globs one list in an officers file may hold (`protected`, and an officer's `appliesTo`).
+export const MAX_GLOBS = 64;
 
 /**
- * Decision 9, compiled once per glob: a function from a repository-relative
- * path with `/` separators to whether the glob matches it. `*` matches any run
- * of characters but `/`, `?` one character but `/`; `**/` matches zero or more
- * directories (`**` + `/*.py` matches `a.py` and `x/a.py`); a trailing `/**`
- * matches everything under the directory, not the directory itself; a lone
- * `**` matches every path; any other `**` matches any run of characters,
- * `/` and dot-directories included. Everything else is literal and
- * case-sensitive. The glob must be valid (see `readOfficers`).
+ * A valid glob is at most 512 characters, not empty, not absolute, ends in no
+ * `/`, has no empty, `.` or `..` segment and none of `[ ] { } \`, and uses
+ * `**` only as a whole segment (`a**b` is invalid).
  */
-export function compileGlob(glob) {
-  let matcher = matchers.get(glob);
-  if (matcher === undefined) {
-    let source = '';
-    for (let index = 0; index < glob.length;) {
-      const rest = glob.slice(index);
-      if (rest.startsWith('**/')) {
-        source += '(?:.*/)?';
-        index += 3;
-      } else if (rest === '/**') {
-        source += '/.+';
-        index += 3;
-      } else if (rest.startsWith('**')) {
-        source += '.*';
-        index += 2;
-      } else {
-        source += rest[0] === '*' ? '[^/]*' : rest[0] === '?' ? '[^/]' : rest[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        index += 1;
+export function isValidGlob(glob) {
+  return glob.length <= MAX_GLOB_LENGTH && !INVALID_GLOB_CHARACTERS.test(glob)
+    && glob.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..' && (segment === '**' || !segment.includes('**')));
+}
+
+// One glob segment against one path segment, with no `/` in either: `*` is zero or more
+// characters, `?` exactly one, anything else itself. Characters are UTF-16 code units, so
+// `?` matches half of a surrogate pair. The two-pointer algorithm remembers only the last
+// `*`, so it takes at most (glob length x path length) steps and cannot backtrack deeply.
+function segmentMatches(glob, text) {
+  let g = 0;
+  let t = 0;
+  let star = -1;
+  let resume = 0;
+  while (t < text.length) {
+    if (g < glob.length && glob[g] === '*') {
+      star = g++;
+      resume = t;
+    } else if (g < glob.length && (glob[g] === '?' || glob[g] === text[t])) {
+      g++;
+      t++;
+    } else if (star !== -1) {
+      g = star + 1;
+      t = ++resume;
+    } else {
+      return false;
+    }
+  }
+  while (g < glob.length && glob[g] === '*') g++;
+  return g === glob.length;
+}
+
+const compiled = new Map();
+
+/**
+ * Decision 9. Whether a valid glob matches a repository-relative path with `/`
+ * separators. Both are split at `/`. A `**` segment matches zero or more whole
+ * path segments (so `**` + `/*.py` matches `a.py` and `x/a.py`, and `src/**` +
+ * `/a.js` matches `src/a.js`), except that a trailing `/**` needs at least one
+ * segment under the directory, so it does not match the directory itself; a
+ * lone `**` matches every path. Other segments match by `segmentMatches`, so
+ * `*` and `?` never cross `/`. Everything else is literal, case-sensitive,
+ * and dot-directories are nothing special. The table has one row per glob
+ * segment and one column per path segment and each cell takes one
+ * segment match, so the work is bounded by (glob length x path length)
+ * whatever the glob holds; no regular expression is built from a glob.
+ */
+export function matchesGlob(glob, path) {
+  let segments = compiled.get(glob);
+  if (segments === undefined) {
+    segments = glob.split('/');
+    compiled.set(glob, segments);
+  }
+  if (glob === '**') return true;
+  const parts = path.split('/');
+  const rows = segments.length;
+  const columns = parts.length;
+  // below[j]: does the glob from the next row on match the path from segment j on?
+  let below = Array.from({ length: columns + 1 }, (_, column) => column === columns);
+  for (let row = rows - 1; row >= 0; row--) {
+    const here = new Array(columns + 1).fill(false);
+    if (segments[row] === '**') {
+      const trailing = row === rows - 1;
+      for (let column = columns; column >= 0; column--) {
+        here[column] = trailing ? column < columns : below[column] || (column < columns && here[column + 1]);
+      }
+    } else {
+      for (let column = 0; column < columns; column++) {
+        here[column] = below[column + 1] && segmentMatches(segments[row], parts[column]);
       }
     }
-    const expression = new RegExp(`^${source}$`, 's');
-    matcher = (path) => expression.test(path);
-    matchers.set(glob, matcher);
+    below = here;
   }
-  return matcher;
+  return below[0];
 }
 
 /**
@@ -65,7 +106,7 @@ export function isProtected(relPath, officerScripts, protectedGlobs) {
   return PROTECTED_FILES.includes(relPath)
     || PROTECTED_PREFIXES.some((prefix) => relPath.startsWith(prefix))
     || officerScripts.includes(relPath)
-    || protectedGlobs.some((glob) => compileGlob(glob)(relPath));
+    || protectedGlobs.some((glob) => matchesGlob(glob, relPath));
 }
 
 // The path an argv element names, as a candidate: the element, or the value after the
@@ -98,7 +139,7 @@ export function readOfficers(officersJsonText) {
   }
   if (parsed === null || typeof parsed !== 'object' || parsed.schema !== 1) return null;
   const globs = parsed.protected;
-  if (!Array.isArray(globs) || !globs.every((glob) => typeof glob === 'string' && isValidGlob(glob))) return null;
+  if (!Array.isArray(globs) || globs.length > MAX_GLOBS || !globs.every((glob) => typeof glob === 'string' && isValidGlob(glob))) return null;
   if (!Array.isArray(parsed.officers)) return null;
   const officerCandidates = [];
   for (const officer of parsed.officers) {

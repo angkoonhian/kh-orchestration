@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { listEntries, notBlobMessage, readBlob } from './ko-git.mjs';
 import { parseRegistry, canonicalRegistry, coveredPart } from './ko-registry.mjs';
-import { PROTECTED_FILES, PROTECTED_PREFIXES, compileGlob, readOfficers } from './extension.mjs';
+import { PROTECTED_FILES, PROTECTED_PREFIXES, matchesGlob, readOfficers } from './extension.mjs';
 
 const RULES = 'docs/harness/RULES.md';
 const OFFICERS = '.claude/kh-orchestration/officers.json';
@@ -34,13 +34,22 @@ function hashesTo(oid, bytes) {
   return hash.update(`blob ${bytes.length}\0`).update(bytes).digest('hex') === oid;
 }
 
+class ObjectMismatch extends Error {}
+
+// The bytes of a listed blob, checked against its object id; throws a fixed message when they differ.
+function readVerified(root, tree, entry) {
+  const bytes = readBlob(root, tree, entry.path);
+  if (!hashesTo(entry.oid, bytes)) throw new ObjectMismatch(objectMismatchMessage(entry.path));
+  return bytes;
+}
+
 // `a/b/c` gives `a`, `a/b` and `a/b/c`.
 const ancestorsAndSelf = (path) => path.split('/').map((_, index, segments) => segments.slice(0, index + 1).join('/'));
 
 /**
  * `{ digest, paths }` for a tree, or `{ problem }` (fixed text) when the digest
  * cannot be trusted. `tree` must be a full object id. The canonical text is
- * one line `path NUL object-id NEWLINE` for each covered file, sorted by path
+ * one line `path NUL mode NUL object-id NEWLINE` for each covered file, sorted by path
  * in plain UTF-16 code-unit order; `docs/harness/RULES.md` contributes the
  * SHA-256 of its canonical registry form in place of its object id. Covered
  * files are the protected files, every file under a protected prefix, every
@@ -54,7 +63,7 @@ export function digestOfTree(root, tree) {
   try {
     return compute(root, tree);
   } catch (error) {
-    return { problem: readFailedMessage(error.message) };
+    return { problem: error instanceof ObjectMismatch ? error.message : readFailedMessage(error.message) };
   }
 }
 
@@ -67,8 +76,7 @@ function compute(root, tree) {
   if (linkedOfficers !== undefined) return { problem: linkMessage(linkedOfficers) };
   const officersEntry = files.get(OFFICERS);
   if (officersEntry === undefined) return { problem: officersUnreadableMessage };
-  const officersBytes = readBlob(root, tree, OFFICERS);
-  if (!hashesTo(officersEntry.oid, officersBytes)) return { problem: objectMismatchMessage(OFFICERS) };
+  const officersBytes = readVerified(root, tree, officersEntry);
   let officers = null;
   try {
     officers = readOfficers(decode(officersBytes));
@@ -78,9 +86,8 @@ function compute(root, tree) {
   if (officers === null) return { problem: officersUnreadableMessage };
 
   const { officerCandidates, protectedGlobs } = officers;
-  const globs = protectedGlobs.map((glob) => ({ glob, matches: compileGlob(glob) }));
-  const underPrefix = (path) => PROTECTED_PREFIXES.some((prefix) => path.startsWith(prefix));
-  const matchesProtectedGlob = (path) => globs.some(({ matches }) => matches(path));
+    const underPrefix = (path) => PROTECTED_PREFIXES.some((prefix) => path.startsWith(prefix));
+  const matchesProtectedGlob = (path) => protectedGlobs.some((glob) => matchesGlob(glob, path));
 
   const directories = new Set(entries.flatMap((entry) => ancestorsAndSelf(entry.path).slice(0, -1)));
   for (const path of PROTECTED_FILES) {
@@ -105,8 +112,7 @@ function compute(root, tree) {
     const { mode, oid } = files.get(path);
     let id = oid;
     if (path === RULES) {
-      const bytes = readBlob(root, tree, path);
-      if (!hashesTo(oid, bytes)) return { problem: objectMismatchMessage(RULES) };
+      const bytes = readVerified(root, tree, files.get(path));
       let text;
       try {
         text = decode(bytes);
@@ -130,13 +136,15 @@ function hidesGlob(link, glob) {
   const firstWild = segments.findIndex((segment) => segment.includes('**'));
   const fixed = firstWild === -1 ? segments : segments.slice(0, firstWild);
   const linkSegments = link.split('/');
-  return linkSegments.length <= fixed.length && linkSegments.every((segment, index) => compileGlob(fixed[index])(segment));
+  return linkSegments.length <= fixed.length && linkSegments.every((segment, index) => matchesGlob(fixed[index], segment));
 }
 
 // The rules of a tree's RULES.md by id; empty when the file is absent.
 function rulesOf(root, tree) {
-  const bytes = readBlob(root, tree, RULES);
-  return new Map(bytes === null ? [] : parseRegistry(decode(bytes)).rules.map((rule) => [rule.id, rule]));
+  const entry = listEntries(root, tree).find((candidate) => candidate.path === RULES);
+  if (entry === undefined) return new Map();
+  if (entry.type !== 'blob' || entry.mode === SYMLINK) throw new Error(notBlobMessage(RULES));
+  return new Map(parseRegistry(decode(readVerified(root, tree, entry))).rules.map((rule) => [rule.id, rule]));
 }
 
 /**
@@ -145,8 +153,8 @@ function rulesOf(root, tree) {
  * covered part (everything but the free parts) is identical. Anything else
  * that changed, a rule added or removed, an owner rule edited, an agent rule's
  * covered line changed, changes the digest, so it is the owner's to approve
- * and is not listed. No base tree, no changes. A read that fails throws, so
- * the caller must refuse on a throw, never treat it as no changes.
+ * and is not listed. No base tree, no changes. A read that fails, or bytes that do not hash to their
+ * object id, throws a fixed message, so the caller must refuse on a throw, never treat it as no changes.
  */
 export function agentRuleChanges(root, baseTree, tree) {
   if (baseTree === null) return [];
