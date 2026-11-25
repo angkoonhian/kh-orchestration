@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
+import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
   OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
-  listTree, readBlob, repoRoot, tidy,
+  listEntries, readBlob, repoRoot, tidy,
 } from '../../assets/scripts/ko-git.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -257,13 +258,30 @@ test('readBlob reads from the tree, not the working directory', () => {
   });
 });
 
-test('listTree lists the files under a prefix, all files for an empty prefix, and none for an absent one', () => {
-  withRepo({ files: { 'a.txt': 'a\n', 'docs/x.md': 'x\n', 'docs/deep/y.md': 'y\n', 'other/z.md': 'z\n' } }, (repo) => {
+test('listEntries lists every entry of the tree, whole, with mode, type and object id, and throws for a tree git cannot read', () => {
+  withRepo({ files: { 'a.txt': 'a\n', 'docs/x.md': 'x\n', 'docs/deep/y.md': 'y\n' } }, (repo) => {
+    symlinkSync('a.txt', join(repo.root, 'link'));
+    repo.commitAll('link');
     const tree = headTree(repo.root);
-    assert.deepEqual(listTree(repo.root, tree, 'docs/'), ['docs/deep/y.md', 'docs/x.md']);
-    assert.deepEqual(listTree(repo.root, tree, ''), ['a.txt', 'docs/deep/y.md', 'docs/x.md', 'other/z.md']);
-    assert.deepEqual(listTree(repo.root, tree, 'nothing/'), []);
-    assert.throws(() => listTree(repo.root, 'not-a-tree', ''), { message: gitFailedMessage('list the tree') });
+    const oid = (path) => repo.git('rev-parse', `HEAD:${path}`).stdout.trim();
+    assert.deepEqual(listEntries(repo.root, tree), [
+      { mode: '100644', type: 'blob', oid: oid('a.txt'), path: 'a.txt' },
+      { mode: '100644', type: 'blob', oid: oid('docs/deep/y.md'), path: 'docs/deep/y.md' },
+      { mode: '100644', type: 'blob', oid: oid('docs/x.md'), path: 'docs/x.md' },
+      { mode: '120000', type: 'blob', oid: oid('link'), path: 'link' },
+    ]);
+    assert.throws(() => listEntries(repo.root, 'not-a-tree'), { message: gitFailedMessage('list the tree') });
+  });
+});
+
+test('a replace ref does not change what git reads: a replaced blob reads as its real content', () => {
+  withRepo({ files: { 'a.txt': 'real\n' } }, (repo) => {
+    const tree = headTree(repo.root);
+    const real = repo.git('rev-parse', 'HEAD:a.txt').stdout.trim();
+    const other = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: repo.root, input: 'fake\n', encoding: 'utf8', env: testEnv() }).stdout.trim();
+    assert.equal(repo.git('replace', real, other).status, 0);
+    assert.equal(readBlob(repo.root, tree, 'a.txt').toString(), 'real\n');
+    assert.equal(listEntries(repo.root, tree)[0].oid, real);
   });
 });
 
@@ -272,7 +290,7 @@ test('readBlob throws, never null, when the blob object is missing', () => {
     const tree = headTree(repo.root);
     const sha = repo.git('rev-parse', 'HEAD:a.txt').stdout.trim();
     rmSync(join(repo.root, '.git', 'objects', sha.slice(0, 2), sha.slice(2)));
-    assert.deepEqual(listTree(repo.root, tree, ''), ['a.txt']);
+    assert.deepEqual(listEntries(repo.root, tree).map((entry) => entry.path), ['a.txt']);
     assert.throws(() => readBlob(repo.root, tree, 'a.txt'), { message: gitFailedMessage('read the file') });
   });
 });

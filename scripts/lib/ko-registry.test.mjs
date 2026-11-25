@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { KH_HARNESS_DIR, siblingAbsentMessage } from './test-repo.mjs';
-import { MINOR_WORDING_PROBLEM, NOT_A_RULE_HEADING, canonicalRegistry, duplicateIdMessage, parseRegistry } from '../../assets/scripts/ko-registry.mjs';
+import { MINOR_WORDING_PROBLEM, NOT_A_RULE_HEADING, canonicalRegistry, coveredPart, duplicateIdMessage, parseRegistry } from '../../assets/scripts/ko-registry.mjs';
 
 const FIXTURE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'contract-1', 'RULES.md'), 'utf8');
 const lf = (text) => text.replace(/\r\n/g, '\n');
@@ -305,4 +305,14 @@ test('each parsed rule says whether it is an agent rule, by the same reading the
   const twice = agentRule('- approval: agent\n').replace('A1', 'T1');
   const parsed = parseRegistry(registry(agentRule(), owner, twice));
   assert.deepEqual(parsed.rules.map((rule) => [rule.id, rule.agent]), [['A1', true], ['O1', false], ['T1', false]]);
+});
+
+test('coveredPart of an agent rule is its block without the free parts, so two wordings differ in the block and agree in the covered part', () => {
+  const [one, two, three] = ['a reason', 'another reason', 'a reason'].map((why, index) => {
+    const text = index === 2 ? agentRule().replace('- enforced-by: officer', '- enforced-by: test') : agentRule().replace('a reason', why);
+    return parseRegistry(registry(text)).rules[0];
+  });
+  assert.notEqual(one.block, two.block);
+  assert.equal(coveredPart(one), coveredPart(two));
+  assert.notEqual(coveredPart(one), coveredPart(three));
 });

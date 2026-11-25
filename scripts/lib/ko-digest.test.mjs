@@ -1,17 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import { MINOR_WORDING_PROBLEM, canonicalRegistry, parseRegistry } from '../../assets/scripts/ko-registry.mjs';
-import { agentRuleChanges, digestOfTree, invalidRulesMessage, notUtf8Message, officersUnreadableMessage, readFailedMessage } from '../../assets/scripts/ko-digest.mjs';
-import { PROTECTED_FILES, PROTECTED_PREFIXES, isProtected, officerScriptsOf } from '../../assets/scripts/extension.mjs';
+import { agentRuleChanges, digestOfTree, directoryMessage, invalidRulesMessage, linkMessage, notUtf8Message, officersUnreadableMessage, readFailedMessage, treeNotIdMessage } from '../../assets/scripts/ko-digest.mjs';
+import { notBlobMessage } from '../../assets/scripts/ko-git.mjs';
 
 isolateProcessEnv();
 
-const EXTENSION = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'assets', 'scripts', 'extension.mjs');
 const RULES = 'docs/harness/RULES.md';
 const OFFICERS = '.claude/kh-orchestration/officers.json';
 const SETTINGS = '.claude/settings.json';
@@ -20,8 +19,9 @@ const sha = (data) => createHash('sha256').update(data).digest('hex');
 const agentRule = (id = 'A1', why = 'a reason') => `## ${id} — an agent rule\n- why: ${why}\n- enforced-by: officer\n- pointer: tools/officers/a1.mjs\n- approval: agent\n`;
 const ownerRule = (id = 'R1', why = 'a reason') => `## ${id} — an owner rule\n- why: ${why}\n- enforced-by: test\n- pointer: tests/r1.test.mjs\n`;
 const registry = (...rules) => `# Rules\n\nPreamble.\n\n${rules.join('\n')}`;
-const officers = (...argvs) => JSON.stringify({
-  schema: 1, baseBranch: 'main',
+const officers = (...argvs) => officersWith({}, ...argvs);
+const officersWith = (extra, ...argvs) => JSON.stringify({
+  schema: 1, baseBranch: 'main', protected: [], ...extra,
   officers: argvs.map((argv, index) => ({ id: `o${index}`, rule: 'A1', argv, appliesTo: ['**'], timeoutSeconds: 60, options: {} })),
 });
 const baseFiles = () => ({
@@ -50,42 +50,13 @@ const digestAfter = (repo, path, text) => {
   return digestOf(repo);
 };
 
-test('extension.mjs has no import specifier that does not start with node:', () => {
-  const source = readFileSync(EXTENSION, 'utf8');
-  const specifiers = [...source.matchAll(/^\s*import\b[^'"]*['"]([^'"]+)['"]/gm), ...source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]/g), ...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]/g)]
-    .map((match) => match[1]);
-  assert.deepEqual(specifiers.filter((specifier) => !specifier.startsWith('node:')), []);
-});
-
-test('the protected prefixes and files are the brief\'s lists', () => {
-  assert.deepEqual(PROTECTED_PREFIXES, ['.claude/kh-orchestration/scripts/', '.claude/kh-harness/', '.claude/scripts/']);
-  assert.deepEqual(PROTECTED_FILES, [RULES, OFFICERS, SETTINGS]);
-});
-
-test('isProtected is true for a protected file, a path under a protected prefix and an officer script, and false otherwise', () => {
-  const scripts = ['tools/officers/a1.mjs'];
-  for (const path of [...PROTECTED_FILES, '.claude/scripts/x.sh', '.claude/kh-harness/deep/er/y.mjs', '.claude/kh-orchestration/scripts/gate.mjs', 'tools/officers/a1.mjs']) {
-    assert.equal(isProtected(path, scripts), true, path);
-  }
-  for (const path of ['src/app.js', 'docs/harness/RULES.md.bak', 'docs/harness/rules.md', '.claude/Settings.json', '.claude/scripts', '.claude/scriptsx/a', '.claude/kh-orchestration/state.json', 'tools/officers/a1.mjs.orig']) {
-    assert.equal(isProtected(path, scripts), false, path);
-  }
-});
-
-test('officerScriptsOf gives the relative, non-option elements of every argv, and null for anything not of the shape', () => {
-  assert.deepEqual(officerScriptsOf(officers(['node', './tools/a.mjs', '--flag', '-x', '/etc/passwd', '../up.mjs', 'a/../b.mjs', '', 'tools/a.mjs'], ['sh', 'run.sh'])), ['node', 'tools/a.mjs', 'sh', 'run.sh']);
-  assert.deepEqual(officerScriptsOf(officers()), []);
-  for (const text of ['', 'not json', 'null', '[]', '{}', '{"officers":{}}', '{"officers":[null]}', '{"officers":[{}]}', '{"officers":[{"argv":"node"}]}', '{"officers":[{"argv":["node",1]}]}']) {
-    assert.equal(officerScriptsOf(text), null, text);
-  }
-});
-
-test('the digest is the SHA-256 of the canonical text: sorted path NUL hash lines, with RULES.md by its canonical form', () => {
+test('the digest is the SHA-256 of the canonical text: sorted path NUL object-id lines, with RULES.md by the hash of its canonical form', () => {
   withRepo({}, (repo) => {
     const files = baseFiles();
     const rulesHash = sha(canonicalRegistry(parseRegistry(files[RULES])));
+    const oid = (path) => repo.git('rev-parse', `HEAD:${path}`).stdout.trim();
     const lines = [
-      [OFFICERS, sha(files[OFFICERS])], [SETTINGS, sha(files[SETTINGS])], [RULES, rulesHash], ['tools/officers/a1.mjs', sha(files['tools/officers/a1.mjs'])],
+      [OFFICERS, oid(OFFICERS)], [SETTINGS, oid(SETTINGS)], [RULES, rulesHash], ['tools/officers/a1.mjs', oid('tools/officers/a1.mjs')],
     ].sort((a, b) => (a[0] < b[0] ? -1 : 1));
     const result = digestOf(repo);
     assert.deepEqual(result, { digest: sha(lines.map(([path, hash]) => `${path}\0${hash}\n`).join('')), paths: lines.map(([path]) => path) });
@@ -134,7 +105,7 @@ test('the digest does not change with a file that is neither protected nor named
     assert.deepEqual(digestAfter(repo, 'src/app.js', 'two\n'), before);
     assert.deepEqual(digestAfter(repo, 'tools/other.mjs', 'x\n'), before);
   });
-  withRepo({ [OFFICERS]: officers(['node', 'tools/officers/a1.mjs', 'tools', 'missing.mjs', '--flag']) }, (repo) => {
+  withRepo({ [OFFICERS]: officers(['node', 'tools/officers/a1.mjs', 'missing.mjs', '--flag']) }, (repo) => {
     assert.deepEqual(digestOf(repo).paths, ['.claude/kh-orchestration/officers.json', '.claude/settings.json', 'docs/harness/RULES.md', 'tools/officers/a1.mjs']);
   });
 });
@@ -146,17 +117,127 @@ test('CRLF and LF script bytes digest differently, since the hash is of the blob
   });
 });
 
-test('a symlink at a protected path is hashed as its link target, so changing the target changes the digest', () => {
+const commitLink = (repo, path, target) => {
+  rmSync(join(repo.root, path), { recursive: true, force: true });
+  mkdirSync(join(repo.root, path, '..'), { recursive: true });
+  symlinkSync(target, join(repo.root, path));
+};
+
+test('a symlink or submodule at, above or under a protected path is a problem, so a link cannot hide what it points at', () => {
+  const cases = {
+    'docs is a link': (repo) => { repo.write('rd/harness/RULES.md', registry(ownerRule())); repo.git('rm', '-rq', 'docs'); commitLink(repo, 'docs', 'rd'); return 'docs'; },
+    'RULES.md is a link': (repo) => { repo.git('rm', '-q', RULES); commitLink(repo, RULES, '../../elsewhere.md'); return RULES; },
+    'settings.json is a link': (repo) => { repo.git('rm', '-q', SETTINGS); commitLink(repo, SETTINGS, 'other.json'); return SETTINGS; },
+    '.claude/kh-harness is a link': (repo) => { repo.write('vendor/kh/x.mjs', 'x\n'); commitLink(repo, '.claude/kh-harness', '../vendor/kh'); return '.claude/kh-harness'; },
+    '.claude/scripts is a link': (repo) => { repo.write('vendor/kh/x.mjs', 'x\n'); commitLink(repo, '.claude/scripts', '../vendor/kh'); return '.claude/scripts'; },
+    'a link under a protected prefix': (repo) => { commitLink(repo, '.claude/scripts/run.sh', '../../src/app.js'); return '.claude/scripts/run.sh'; },
+    '.claude is a link': (repo) => { repo.git('rm', '-rq', '.claude'); repo.write('dot/settings.json', '{}\n'); commitLink(repo, '.claude', 'dot'); return '.claude'; },
+    'an officer script is a link': (repo) => { repo.git('rm', '-q', 'tools/officers/a1.mjs'); commitLink(repo, 'tools/officers/a1.mjs', '../../src/app.js'); return 'tools/officers/a1.mjs'; },
+    'a directory above an officer script is a link': (repo) => {
+      repo.write(OFFICERS, officers(['node', 'scripts/check.mjs'])); repo.write('lib/check.mjs', 'x\n'); commitLink(repo, 'scripts', 'lib'); return 'scripts';
+    },
+    'a directory above a spelled-out officer script is a link': (repo) => {
+      repo.write(OFFICERS, officers(['node', './x/../scripts/./check.mjs'])); repo.write('lib/check.mjs', 'x\n'); commitLink(repo, 'scripts', 'lib'); return 'scripts';
+    },
+    'a file matching a protected glob is a link': (repo) => {
+      repo.write(OFFICERS, officersWith({ protected: ['config/**'] }, ['node', 'tools/officers/a1.mjs'])); commitLink(repo, 'config/app.yml', '../src/app.js'); return 'config/app.yml';
+    },
+  };
+  for (const [name, build] of Object.entries(cases)) {
+    withRepo({}, (repo) => {
+      const path = build(repo);
+      repo.commitAll('link');
+      assert.deepEqual(digestOf(repo), { problem: linkMessage(path) }, name);
+    });
+  }
+});
+
+test('a gitlink at a protected prefix is a problem', () => {
   withRepo({}, (repo) => {
-    rmSync(join(repo.root, SETTINGS));
-    symlinkSync('one.json', join(repo.root, SETTINGS));
+    const commit = repo.git('rev-parse', 'HEAD').stdout.trim();
+    assert.equal(repo.git('update-index', '--add', '--cacheinfo', `160000,${commit},.claude/scripts`).status, 0);
+    assert.equal(repo.git('commit', '-q', '-m', 'gitlink').status, 0);
+    assert.deepEqual(digestOf(repo), { problem: linkMessage('.claude/scripts') });
+  });
+});
+
+test('a link that is not at, above or under anything covered is no problem and is not hashed', () => {
+  withRepo({}, (repo) => {
+    const before = digestOf(repo);
+    commitLink(repo, 'other/link', '../src/app.js');
     repo.commitAll('link');
-    const first = digestOf(repo);
-    assert.ok(first.paths.includes(SETTINGS));
-    rmSync(join(repo.root, SETTINGS));
-    symlinkSync('two.json', join(repo.root, SETTINGS));
-    repo.commitAll('retarget');
-    assert.notEqual(digestOf(repo).digest, first.digest);
+    assert.deepEqual(digestOf(repo), before);
+  });
+});
+
+test('every officer-argv spelling of a script is covered: normalised, doubled or dotted separators, an option value; a directory is a problem naming the officer and the element', () => {
+  const spellings = ['./scripts/../scripts/check.mjs', 'scripts/./check.mjs', 'scripts//check.mjs', '././scripts/check.mjs', '--import=./scripts/check.mjs', 'scripts/check.mjs'];
+  for (const spelling of spellings) {
+    withRepo({ 'scripts/check.mjs': 'one\n', [OFFICERS]: officers(['node', spelling]) }, (repo) => {
+      const before = digestOf(repo);
+      assert.ok(before.paths.includes('scripts/check.mjs'), spelling);
+      assert.notEqual(digestAfter(repo, 'scripts/check.mjs', 'two\n').digest, before.digest, spelling);
+    });
+  }
+  for (const element of ['scripts', 'scripts/', './scripts//', '--require=scripts']) {
+    withRepo({ 'scripts/check.mjs': 'one\n', [OFFICERS]: officers(['node', 'x.mjs'], ['node', element]) }, (repo) => {
+      assert.deepEqual(digestOf(repo), { problem: directoryMessage('o1', element) }, element);
+    });
+  }
+  withRepo({ 'scripts/check.mjs': 'one\n', [OFFICERS]: officers(['node', '../scripts/check.mjs', '/scripts/check.mjs', 'scripts\\check.mjs', 'nothing.mjs', '.']) }, (repo) => {
+    assert.deepEqual(digestOf(repo).paths, ['.claude/kh-orchestration/officers.json', '.claude/settings.json', 'docs/harness/RULES.md']);
+  });
+});
+
+test('every file matching a protected glob is covered; one that does not match is not', () => {
+  withRepo({ 'config/a.yml': 'a\n', 'config/deep/b.yml': 'b\n', 'src/c.yml': 'c\n', [OFFICERS]: officersWith({ protected: ['config/**', 'package.json'] }, ['node', 'tools/officers/a1.mjs']), 'package.json': '{}\n' }, (repo) => {
+    const before = digestOf(repo);
+    assert.deepEqual(before.paths.filter((path) => !path.startsWith('.claude') && !path.startsWith('docs')), ['config/a.yml', 'config/deep/b.yml', 'package.json', 'tools/officers/a1.mjs']);
+    assert.notEqual(digestAfter(repo, 'config/deep/b.yml', 'b2\n').digest, before.digest);
+    assert.notEqual(digestAfter(repo, 'package.json', '{"a":1}\n').digest, before.digest);
+    const next = digestOf(repo);
+    assert.deepEqual(digestAfter(repo, 'src/c.yml', 'c2\n'), next);
+  });
+});
+
+test('a tree that is not a full object id is a problem, whatever git would make of it', () => {
+  withRepo({}, (repo) => {
+    for (const tree of ['HEAD', 'main', '--help', 'HEAD^{tree}', 'abc', 'A'.repeat(40), `${treeOf(repo)}x`, '', '-r']) {
+      assert.deepEqual(digestOfTree(repo.root, tree), { problem: treeNotIdMessage }, tree);
+    }
+  });
+});
+
+test('a byte-order mark in RULES.md is kept: the digest differs with and without it', () => {
+  withRepo({}, (repo) => {
+    const plain = digestOf(repo);
+    const withBom = digestAfter(repo, RULES, `﻿${registry(ownerRule(), agentRule())}`);
+    assert.notEqual(withBom.digest, plain.digest);
+  });
+});
+
+test('a replace ref cannot make a changed tree digest as the approved one', () => {
+  withRepo({}, (repo) => {
+    const approved = digestOf(repo);
+    const oldBlob = repo.git('rev-parse', `HEAD:${SETTINGS}`).stdout.trim();
+    repo.write(SETTINGS, '{"changed":true}\n');
+    repo.commitAll('change settings');
+    const newBlob = repo.git('rev-parse', `HEAD:${SETTINGS}`).stdout.trim();
+    assert.equal(repo.git('replace', '-f', newBlob, oldBlob).status, 0);
+    const after = digestOf(repo);
+    assert.notDeepEqual(after, approved);
+  });
+});
+
+test('a tree with 2,000 files under a protected prefix is digested in a bounded time, since it needs a fixed number of git calls', () => {
+  const files = {};
+  for (let index = 0; index < 2000; index++) files[`.claude/scripts/f${index}.sh`] = `echo ${index}\n`;
+  withRepo(files, (repo) => {
+    const started = Date.now();
+    const result = digestOf(repo);
+    // A generous bound, not a measurement: two git calls per file took about 6 s for these; a fixed number takes well under 1 s.
+    assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+    assert.equal(result.paths.length, 2004);
   });
 });
 
@@ -212,13 +293,13 @@ test('an absent officers.json, and one not of the expected shape, give a problem
 
 test('a failed read becomes a problem, never a digest without the file: an unknown tree, and a protected path that is a directory', () => {
   withRepo({}, (repo) => {
-    assert.deepEqual(digestOfTree(repo.root, '0'.repeat(40)), { problem: readFailedMessage('git failed to read the file.') });
+    assert.deepEqual(digestOfTree(repo.root, 'f'.repeat(40)), { problem: readFailedMessage('git failed to list the tree.') });
   });
   withRepo({}, (repo) => {
     repo.git('rm', '-q', RULES);
     repo.write(`${RULES}/inner`, 'x\n');
     repo.commitAll('directory at a protected path');
-    assert.deepEqual(digestOf(repo), { problem: readFailedMessage(`${RULES} is in the tree but is not a file.`) });
+    assert.deepEqual(digestOf(repo), { problem: notBlobMessage(RULES) });
   });
 });
 
@@ -241,6 +322,10 @@ test('agentRuleChanges lists a reworded agent rule and nothing for an owner rule
     assert.deepEqual(agentRuleChanges(repo.root, added, base), []);
     const becameOwner = commitRules(registry(ownerRule(), agentRule().replace('approval: agent', 'approval: owner')));
     assert.deepEqual(agentRuleChanges(repo.root, base, becameOwner), []);
+    const edited = commitRules(registry(ownerRule(), agentRule().replace('enforced-by: officer', 'enforced-by: test')));
+    assert.deepEqual(agentRuleChanges(repo.root, base, edited), [], 'an edited covered line changes the digest, so it is not listed');
+    const spaced = commitRules(`${registry(ownerRule(), agentRule())}\n\n`);
+    assert.deepEqual(agentRuleChanges(repo.root, base, spaced), [], 'blank lines are covered too');
     const two = commitRules(registry(agentRule('A1', 'x'), agentRule('A2', 'y')));
     const twoReworded = commitRules(registry(agentRule('A1', 'x2'), agentRule('A2', 'y2')));
     assert.deepEqual(agentRuleChanges(repo.root, two, twoReworded), [{ id: 'A1', change: 'reworded' }, { id: 'A2', change: 'reworded' }]);

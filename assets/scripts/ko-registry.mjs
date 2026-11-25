@@ -130,7 +130,9 @@ function freeParts(block) {
   return parts;
 }
 
-// The block with each free part removed.
+// What owner approval covers of an agent rule: its block with each free part removed.
+export const coveredPart = (rule) => withoutFreeParts(rule.block);
+
 function withoutFreeParts(block) {
   let kept = '';
   let from = 0;

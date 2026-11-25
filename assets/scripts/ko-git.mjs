@@ -14,7 +14,8 @@ const SPAWN_FAILED_STATUS = 127;
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 function exec(root, argv, { input, readOnly, binary } = {}) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' };
+  // Replace refs are off: a ref in the repository must not change what an object reads as.
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', GIT_NO_REPLACE_OBJECTS: '1' };
   if (readOnly) env.GIT_OPTIONAL_LOCKS = '0';
   const result = spawnSync('git', argv, {
     cwd: root,
@@ -124,8 +125,14 @@ export function readBlob(root, tree, path) {
   return mustSucceed(result, 'read the file');
 }
 
-export function listTree(root, tree, prefix) {
-  const argv = ['ls-tree', '-r', '-z', '--name-only', tree];
-  if (prefix !== '') argv.push('--', prefix);
-  return nulSeparated(mustSucceed(git(root, argv), 'list the tree'));
+// Every entry of a tree, recursively and from its root: `{ mode, type, oid, path }`.
+// A symbolic link is a blob of mode 120000 and a submodule a commit of mode 160000;
+// neither is followed, so a path under one is not listed.
+export function listEntries(root, tree) {
+  const out = mustSucceed(git(root, ['ls-tree', '-r', '-z', '--full-tree', tree]), 'list the tree');
+  return nulSeparated(out).map((line) => {
+    const match = line.match(/^(\d+) (\w+) ([0-9a-f]+)\t([\s\S]*)$/);
+    if (!match) throw new Error(gitFailedMessage('list the tree'));
+    return { mode: match[1], type: match[2], oid: match[3], path: match[4] };
+  });
 }
