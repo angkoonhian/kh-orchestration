@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, symlinkSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import {
-  StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readState, shapeMessage, stateDir,
-  unknownNameMessage, verdictName, writeFailedMessage, writeState,
+  StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readInflight, readState, removeInflight, removeStaleInflight, shapeMessage, stateDir,
+  invalidPidMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
 } from '../../assets/scripts/ko-state.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
@@ -234,5 +235,53 @@ test('readExemptions throws a StateError with fixed text for any other shape, ne
       writeState(repo.root, 'exemptions.json', value);
       assert.throws(() => readExemptions(repo.root), (error) => error instanceof StateError && error.message === shapeMessage('exemptions.json'), JSON.stringify(value));
     }
+  });
+});
+
+const INFLIGHT_TREE = 'c'.repeat(40);
+
+test('an in-flight record: written by temporary file and rename, read back, removed; absent reads as null', () => {
+  withRepo((repo) => {
+    assert.equal(readInflight(repo.root, '4242'), null);
+    writeInflight(repo.root, '4242', INFLIGHT_TREE);
+    assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'inflight-4242.json'), 'utf8')), { tree: INFLIGHT_TREE });
+    assert.deepEqual(readdirSync(stateDir(repo.root)).filter((name) => name.endsWith('.tmp')), []);
+    assert.equal(readInflight(repo.root, '4242'), INFLIGHT_TREE);
+    removeInflight(repo.root, '4242');
+    assert.equal(readInflight(repo.root, '4242'), null);
+    removeInflight(repo.root, '4242');
+  });
+});
+
+test('an in-flight record is named by digits only, holds a full tree id, and any other shape is a StateError', () => {
+  withRepo((repo) => {
+    for (const pid of ['', '0', '01', '12a', '../x', '1/2', ' 1', '12345678901', 12]) {
+      assert.throws(() => writeInflight(repo.root, pid, INFLIGHT_TREE), { name: 'StateError', message: invalidPidMessage }, String(pid));
+      assert.throws(() => readInflight(repo.root, pid), { name: 'StateError', message: invalidPidMessage }, String(pid));
+    }
+    assert.throws(() => writeInflight(repo.root, '7', 'abc'), { name: 'StateError', message: shapeMessage('inflight-7.json') });
+    for (const value of [{}, { tree: 'x' }, { tree: INFLIGHT_TREE, more: 1 }, [INFLIGHT_TREE]]) {
+      writeState(repo.root, 'inflight-7.json', value);
+      assert.throws(() => readInflight(repo.root, '7'), { name: 'StateError', message: shapeMessage('inflight-7.json') });
+    }
+  });
+});
+
+test('removeStaleInflight removes the records of processes that no longer exist and keeps a live one\'s', () => {
+  withRepo((repo) => {
+    const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
+    writeInflight(repo.root, dead, INFLIGHT_TREE);
+    writeInflight(repo.root, String(process.pid), INFLIGHT_TREE);
+    writeFileSync(join(stateDir(repo.root), 'inflight-x.json'), '{}');
+    assert.deepEqual(removeStaleInflight(repo.root), [dead]);
+    assert.equal(readInflight(repo.root, dead), null);
+    assert.equal(readInflight(repo.root, String(process.pid)), INFLIGHT_TREE);
+    assert.ok(existsSync(join(stateDir(repo.root), 'inflight-x.json')), 'a name that is not ours is left alone');
+  });
+});
+
+test('removeStaleInflight on a repository with no state directory removes nothing', () => {
+  withRepo((repo) => {
+    assert.deepEqual(removeStaleInflight(repo.root), []);
   });
 });

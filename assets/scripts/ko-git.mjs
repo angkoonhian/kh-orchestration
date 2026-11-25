@@ -130,6 +130,14 @@ export function tidy(root) {
   return { tidy: unstaged.length === 0 && untracked.length === 0, unstaged, untracked };
 }
 
+// The tree of the commit `id` names, or null when `id` names no object or an object that is not a
+// commit (a tag is not peeled). `id` must be a full object id; the caller checks that.
+export function treeOfCommitId(root, id) {
+  const type = git(root, ['cat-file', '-t', '--end-of-options', id]);
+  if (type.status !== 0 || oneLine(type.stdout) !== 'commit') return null;
+  return oneLine(mustSucceed(git(root, ['rev-parse', '--verify', '--end-of-options', `${id}^{tree}`]), 'read the commit'));
+}
+
 // The paths under `pathspecs` whose working copy differs from `tree` in bytes or mode (a file
 // changed, added to the index or deleted), in git's order. No external diff or textconv runs.
 export function workingDifferences(root, tree, pathspecs) {

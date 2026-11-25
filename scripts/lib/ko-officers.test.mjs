@@ -152,7 +152,9 @@ test('KO_OPTIONS, KO_BASE, KO_TREE and KO_CHANGED_FILE reach the officer, and th
     const out = join(repo.root, '..', 'seen.json');
     const code = `const fs = require("node:fs"); const file = process.env.KO_CHANGED_FILE;
       fs.writeFileSync(${JSON.stringify(out)}, JSON.stringify({ options: process.env.KO_OPTIONS, base: process.env.KO_BASE, tree: process.env.KO_TREE, file, text: fs.readFileSync(file, "utf8"), cwd: process.cwd() }));`;
-    const before = readdirSync(tmpdir()).length;
+    // Only this module's own directories are counted: other test files make temporary directories at the same time.
+    const changedDirs = () => readdirSync(tmpdir()).filter((name) => name.startsWith('ko-changed-')).length;
+    const before = changedDirs();
     const [result] = await run(repo, [{ id: 'env', options: { level: 2 }, argv: node(code) }], { changed: ['a b.js', 'dir/c.js'] });
     assert.equal(result.result, 'pass', result.output);
     const seen = JSON.parse(readFileSync(out, 'utf8'));
@@ -163,7 +165,7 @@ test('KO_OPTIONS, KO_BASE, KO_TREE and KO_CHANGED_FILE reach the officer, and th
     assert.equal(seen.cwd, repo.root);
     assert.equal(seen.file.startsWith(repo.root), false);
     assert.equal(existsSync(seen.file), false);
-    assert.equal(readdirSync(tmpdir()).length, before);
+    assert.equal(changedDirs(), before);
   });
 });
 

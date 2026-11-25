@@ -126,22 +126,41 @@ function gitCommonDir(root) {
 // A word sh reads as itself, in single quotes.
 const shQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
 
-// The hook decision 18 (amended after Task 6's review) words: allow only on the gate's exit 0 AND
-// its token on standard output; node named by its absolute path, never found through PATH.
+const REFUSED_LINE = 'echo "kh-orchestration: the commit gate did not allow this commit." >&2';
+
+// The hooks decision 18 (further amended) words: allow only on the gate's exit 0 AND its token on
+// standard output; node named by its absolute path, never found through PATH; the git process id
+// ($PPID) passed on. reference-transaction starts no node unless that process has an in-flight record.
 function hookScript(hook, node = process.execPath) {
+  const header = ['#!/bin/sh', `# kh-orchestration ${KIT_VERSION} ${hook}. Do not edit.`];
+  if (hook !== 'reference-transaction') {
+    return [
+      ...header,
+      `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" ${hook} "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+      REFUSED_LINE,
+      'exit 1',
+      '',
+    ].join('\n');
+  }
   return [
-    '#!/bin/sh',
-    `# kh-orchestration ${KIT_VERSION} ${hook}. Do not edit.`,
-    `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" ${hook}) && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
-    'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
-    'exit 1',
+    ...header,
+    'case "$0" in */hooks/reference-transaction) d=${0%/hooks/reference-transaction} ;; *) d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1 ;; esac',
+    'f="$d/kh-orchestration/inflight-$PPID.json"',
+    '[ -e "$f" ] || exit 0',
+    'case "$1" in',
+    `prepared) out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    `  ${REFUSED_LINE}`,
+    '  exit 1 ;;',
+    'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -f "$f" ;; esac; done ;;',
+    'esac',
+    'exit 0',
     '',
   ].join('\n');
 }
 
 // Test-only stand-in for Task 9's installer: every script of assets/scripts, stamped, into
 // <common-dir>/kh-orchestration/bin/ (and into the working tree's
-// .claude/kh-orchestration/scripts/ with `inTree`), and the two git hooks, naming `node`.
+// .claude/kh-orchestration/scripts/ with `inTree`), and the three git hooks, naming `node`.
 export function installGate(root, { inTree = false, node = process.execPath } = {}) {
   const common = gitCommonDir(root);
   const bin = join(common, 'kh-orchestration', 'bin');
@@ -153,7 +172,7 @@ export function installGate(root, { inTree = false, node = process.execPath } = 
     if (inTree) writeFileSync(join(root, INSTALLED_SCRIPTS, name), text);
   }
   mkdirSync(join(common, 'hooks'), { recursive: true });
-  for (const hook of ['pre-commit', 'pre-merge-commit']) {
+  for (const hook of ['pre-commit', 'pre-merge-commit', 'reference-transaction']) {
     const path = join(common, 'hooks', hook);
     writeFileSync(path, hookScript(hook, node));
     chmodSync(path, 0o755);

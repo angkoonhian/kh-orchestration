@@ -3,7 +3,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,12 +12,14 @@ import { REASONS, exemptCommand, judge, runGate } from '../../assets/scripts/ko-
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, currentBranch, indexTree } from '../../assets/scripts/ko-git.mjs';
-import { corruptMessage, shapeMessage, stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
+import { corruptMessage, readInflight, shapeMessage, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 import { produceVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 isolateProcessEnv();
+// The git process id the tests stand in for: alive for as long as the test runs.
+const PID = String(process.pid);
 const KO_REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // The probe runs kh-harness's real hook: its session log and markers go to this run's directories.
 const hookDirs = realpathSync(mkdtempSync(join(tmpdir(), 'ko-gate-hook-')));
@@ -358,7 +360,7 @@ test('Critical 2: an index changed after the tree was judged is refused before t
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('check', 'pass')]);
-  assert.deepEqual(runGate(['pre-commit'], repo.root), allowed(REASONS.allowed));
+  assert.deepEqual(runGate(['pre-commit', PID], repo.root), allowed(REASONS.allowed));
   let reads = 0;
   const changingTree = (root) => {
     const tree = indexTree(root);
@@ -369,7 +371,8 @@ test('Critical 2: an index changed after the tree was judged is refused before t
     }
     return tree;
   };
-  assert.deepEqual(runGate(['pre-commit'], repo.root, changingTree), refused(REASONS.indexChanged, COMMANDS.run));
+  assert.deepEqual(runGate(['pre-commit', PID], repo.root, { readTree: changingTree }), refused(REASONS.indexChanged, COMMANDS.run));
+  assert.equal(readInflight(repo.root, PID), null, 'a refusal leaves no in-flight record');
   assert.equal(reads, 2);
   assert.equal(REASONS.indexChanged, 'The index changed while the gate ran, so the tree git would commit is not the one judged. Run the officers again on the staged tree.');
 });
@@ -545,34 +548,57 @@ test('Review Focus 1 and Important 3: the hook runs the node recorded at install
   assert.ok(moved.stderr.endsWith(HOOK_LINE), moved.stderr);
 });
 
-test('installGate writes the hooks as decision 18 (amended) words them, naming node by its absolute path', () => {
+test('installGate writes the three hooks as decision 18 (further amended) words them, naming node by its absolute path', () => {
   const repo = installed();
-  const hook = readFileSync(join(repo.root, '.git', 'hooks', 'pre-merge-commit'), 'utf8');
-  assert.equal(hook, [
+  const hook = (name) => readFileSync(join(repo.root, '.git', 'hooks', name), 'utf8');
+  assert.equal(hook('pre-merge-commit'), [
     '#!/bin/sh',
     `# kh-orchestration ${KIT_VERSION} pre-merge-commit. Do not edit.`,
-    `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" pre-merge-commit) && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" pre-merge-commit "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
     'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
     'exit 1',
     '',
   ].join('\n'));
+  assert.equal(hook('reference-transaction'), [
+    '#!/bin/sh',
+    `# kh-orchestration ${KIT_VERSION} reference-transaction. Do not edit.`,
+    'case "$0" in */hooks/reference-transaction) d=${0%/hooks/reference-transaction} ;; *) d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1 ;; esac',
+    'f="$d/kh-orchestration/inflight-$PPID.json"',
+    '[ -e "$f" ] || exit 0',
+    'case "$1" in',
+    `prepared) out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    '  echo "kh-orchestration: the commit gate did not allow this commit." >&2',
+    '  exit 1 ;;',
+    'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -f "$f" ;; esac; done ;;',
+    'esac',
+    'exit 0',
+    '',
+  ].join('\n'));
 });
 
-test('the gate refuses when started with no hook name or an unknown one', () => {
+test('the gate refuses when started with no hook name, an unknown one, or without a valid git process id', () => {
   const repo = installed();
   const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
-  for (const argv of [[], ['post-commit'], ['pre-commit', 'extra']]) {
+  for (const argv of [[], ['post-commit', PID], ['pre-commit'], ['pre-commit', '12x'], ['pre-commit', '0'], ['pre-commit', PID, 'extra'], ['reference-transaction']]) {
     const outcome = spawnSync(process.execPath, [gate, ...argv], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
     assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [1, '', gateText(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status)], argv.join(' '));
   }
 });
 
-test('the gate prints the token kh-orchestration: allowed on standard output only when it allows', async () => {
+test('on an allow the gate records the tree for the git process before printing its token on standard output', async () => {
+  const repo = installed();
+  const { tree } = await runAndApprove(repo.root);
+  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
+  const outcome = spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
+  assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [0, 'kh-orchestration: allowed\n', '']);
+  assert.equal(readInflight(repo.root, PID), tree);
+});
+
+test('an in-flight record that cannot be written refuses the commit', async () => {
   const repo = installed();
   await runAndApprove(repo.root);
-  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
-  const outcome = spawnSync(process.execPath, [gate, 'pre-commit'], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
-  assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [0, 'kh-orchestration: allowed\n', '']);
+  mkdirSync(join(stateDir(repo.root), `inflight-${PID}.json`, 'blocker'), { recursive: true });
+  assert.deepEqual(runGate(['pre-commit', PID], repo.root), refused(REASONS.couldNotDecide(`The shared state file inflight-${PID}.json could not be written.`), COMMANDS.status));
 });
 
 test('the gate prints one line for the off switch and for an exemption, and nothing on a plain allow', async () => {
@@ -724,4 +750,170 @@ test('a failing verdict refuses the commit naming the officer; the same tree aft
   stage(repo);
   await runAndApprove(repo.root);
   assert.equal(commit(repo.root).status, 0);
+});
+
+// ---- the reference-transaction hook (decision 18, further amended) ----
+// What git sends it, observed with git 2.56.1 in a throwaway repository (`<old> <new> <ref>` per
+// line, states preparing, prepared, then committed or aborted):
+// - git commit: preparing `<head> <commit> HEAD`; prepared and committed `<head> <commit> refs/heads/main`;
+//   then `0…0 0…0 AUTO_MERGE` in a transaction of its own (preparing/aborted, then prepared/committed).
+// - the first commit (unborn HEAD): prepared `0…0 <commit> refs/heads/main`.
+// - git commit --amend: prepared `<amended> <new commit> refs/heads/main`.
+// - git merge --no-ff: before pre-merge-commit, `0…0 <head> ORIG_HEAD` and `0…0 <merge tree> AUTO_MERGE`;
+//   after it, prepared `<head> <merge commit> refs/heads/main`.
+// - a conflicted merge concluded by git commit: pre-commit, then prepared `<head> <merge commit> refs/heads/main`.
+// - git switch: `0…0 ref:refs/heads/<b> HEAD`, a symbolic update (no in-flight record: never judged).
+// - $PPID is the same git process in pre-commit or pre-merge-commit and in reference-transaction,
+//   also from a linked worktree and for the git merge child that git pull starts.
+// - In prepared the new commit object exists and is readable. A non-zero exit there leaves HEAD
+//   unmoved, the change staged, and git commit exits 128, printing
+//   "fatal: in 'prepared' phase, update aborted by the reference-transaction hook".
+
+const NULL_ID = '0'.repeat(40);
+const commitOf = (root, tree) => gitIn(root, ['commit-tree', '-m', 'x', tree]).stdout.trim();
+
+test('reference-transaction: an update of a branch or HEAD to a commit of the recorded tree is allowed; other refs and deletions are not judged', () => {
+  const repo = installed();
+  const tree = indexTree(repo.root);
+  writeInflight(repo.root, PID, tree);
+  const commitId = commitOf(repo.root, tree);
+  const head = gitIn(repo.root, ['rev-parse', 'HEAD']).stdout.trim();
+  const input = [
+    `${head} ${commitId} HEAD`, `${head} ${commitId} refs/heads/main`, `${NULL_ID} ${head} ORIG_HEAD`,
+    `${NULL_ID} ${tree} AUTO_MERGE`, `${head} ${NULL_ID} refs/heads/gone`, `${NULL_ID} ${head} refs/tags/v1`, '',
+  ].join('\n');
+  assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input }), allowed(REASONS.updateAllowed));
+  assert.equal(readInflight(repo.root, PID), tree, 'the hook removes the record once the update is committed');
+});
+
+test('reference-transaction: a commit of another tree, a non-commit, a symbolic update, an unreadable line or no record is refused, and the record removed', () => {
+  const repo = installed();
+  const tree = indexTree(repo.root);
+  const head = gitIn(repo.root, ['rev-parse', 'HEAD']).stdout.trim();
+  const other = gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
+  assert.notEqual(other, tree);
+  const swapped = refused(REASONS.treeSwapped, COMMANDS.run);
+  for (const [line, expected] of [
+    [`${head} ${commitOf(repo.root, other)} refs/heads/main`, swapped],
+    [`${head} ${tree} refs/heads/main`, swapped],
+    [`${NULL_ID} ref:refs/heads/x HEAD`, swapped],
+    [`${head} ${'f'.repeat(40)} HEAD`, swapped],
+    ['not an update', refused(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)],
+  ]) {
+    writeInflight(repo.root, PID, tree);
+    assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${line}\n` }), expected, line);
+    assert.equal(readInflight(repo.root, PID), null, line);
+  }
+  assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: '' }), refused(REASONS.noRecord, COMMANDS.run));
+  assert.equal(REASONS.treeSwapped, 'The tree being committed is not the tree the gate allowed: the index changed after the gate ran. Stage what you mean to commit and run the officers again.');
+});
+
+// A pre-commit hook that runs the real gate and then changes the index, as a background
+// `git add` racing the commit would: deterministic, so the hook's last line of defence is tested.
+function racingPreCommit(repo) {
+  const path = join(repo.root, '.git', 'hooks', 'pre-commit');
+  writeFileSync(path, [
+    '#!/bin/sh',
+    `out=$('${process.execPath}' "$(git rev-parse --git-common-dir)/kh-orchestration/bin/gate.mjs" pre-commit "$PPID") && [ "$out" = "kh-orchestration: allowed" ] || exit 1`,
+    'echo evil > evil.txt && git add evil.txt',
+    'exit 0',
+    '',
+  ].join('\n'));
+  chmodSync(path, 0o755);
+}
+
+test('an index changed after the gate allowed it is caught at the ref update: HEAD does not move and no in-flight record is left', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  racingPreCommit(repo);
+  const before = head(repo.root);
+  const outcome = commit(repo.root);
+  assertRefused(repo.root, outcome, before);
+  assert.ok(outcome.stderr.includes(gateText(REASONS.treeSwapped, COMMANDS.run)), outcome.stderr);
+  assert.ok(outcome.stderr.includes("update aborted by the reference-transaction hook"), outcome.stderr);
+  assert.deepEqual(readdirSync(stateDir(repo.root)).filter((name) => name.startsWith('inflight-')), []);
+});
+
+test('without the reference-transaction hook (missing or not executable) git skips it: the index race is then a stated limit', async () => {
+  for (const disable of [(path) => rmSync(path), (path) => chmodSync(path, 0o644)]) {
+    const repo = installed();
+    await runAndApprove(repo.root);
+    racingPreCommit(repo);
+    disable(join(repo.root, '.git', 'hooks', 'reference-transaction'));
+    const before = head(repo.root);
+    assert.equal(commit(repo.root).status, 0);
+    assert.notEqual(head(repo.root), before);
+    assert.equal(gitIn(repo.root, ['show', 'HEAD:evil.txt']).stdout, 'evil\n', 'the race lands without the third hook');
+  }
+});
+
+test('with everything in place, a conflicted merge concluded by git commit lands', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'side']).status, 0);
+  repo.write('x.txt', 'side\n');
+  stage(repo);
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'main']).status, 0);
+  repo.write('x.txt', 'main\n');
+  stage(repo);
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  assert.notEqual(gitIn(repo.root, ['merge', '-q', 'side', '-m', 'merge side']).status, 0, 'the merge conflicts');
+  repo.write('x.txt', 'both\n');
+  stage(repo);
+  await runAndApprove(repo.root);
+  const before = head(repo.root);
+  const concluded = gitIn(repo.root, ['commit', '-q', '--no-edit']);
+  assert.deepEqual([concluded.status, concluded.stderr], [0, '']);
+  assert.equal(gitIn(repo.root, ['rev-parse', 'HEAD^2']).stdout.trim(), gitIn(repo.root, ['rev-parse', 'side']).stdout.trim());
+  assert.notEqual(head(repo.root), before);
+  assert.deepEqual(readdirSync(stateDir(repo.root)).filter((name) => name.startsWith('inflight-')), []);
+});
+
+test('ref updates of commands with no in-flight record (rebase, cherry-pick, reset, branch, update-ref, a fetch-like update) are unaffected', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  const base = head(repo.root);
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'topic']).status, 0);
+  for (const name of ['t1', 't2']) {
+    repo.write(`${name}.txt`, `${name}\n`);
+    stage(repo);
+    await runAndApprove(repo.root);
+    assert.equal(commit(repo.root).status, 0);
+  }
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'main']).status, 0);
+  repo.write('m.txt', 'm\n');
+  stage(repo);
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  for (const argv of [
+    ['rebase', '-q', 'main', 'topic'], ['switch', '-q', 'main'], ['cherry-pick', 'topic'], ['reset', '-q', '--hard', 'HEAD~1'],
+    ['branch', 'kept', base], ['branch', '-D', 'kept'], ['update-ref', 'refs/remotes/origin/main', base], ['update-ref', 'refs/heads/plumbing', base],
+  ]) {
+    const outcome = gitIn(repo.root, argv);
+    assert.equal(outcome.status, 0, `${argv.join(' ')}: ${outcome.stderr}`);
+  }
+});
+
+test('the real race: a background git add during git commit never lands a HEAD whose tree has no passing verdict (41 runs)', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'race']).status, 0);
+  const judged = new Set([gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim()]);
+  for (let step = 0; step <= 40; step += 1) {
+    const delay = (step * 0.005).toFixed(3);
+    repo.write(`n${step}.txt`, 'ok\n');
+    assert.equal(gitIn(repo.root, ['add', `n${step}.txt`]).status, 0);
+    repo.write('evil.txt', `evil ${delay}\n`);
+    judged.add((await runAndApprove(repo.root)).tree);
+    spawnSync('sh', ['-c', `(sleep ${delay}; git add evil.txt 2>/dev/null) & git commit -q -m "n${step}" 2>/dev/null; wait`], { cwd: repo.root, env: testEnv() });
+    const landed = gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
+    assert.ok(judged.has(landed), `delay ${delay}: HEAD's tree ${landed} has no verdict`);
+    gitIn(repo.root, ['rm', '-q', '--cached', '--ignore-unmatch', 'evil.txt']);
+  }
 });

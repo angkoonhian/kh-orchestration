@@ -2,21 +2,34 @@
 // and every text the gate prints. gate.mjs, the entry the hooks run, calls runGate; tests import
 // this file, never gate.mjs, whose main always runs.
 //
-// STATED LIMIT: git reads the index again after the hook returns. runGate computes the index tree
-// a second time just before it allows and refuses a change, but a change made in the instant
-// between the gate's exit and git's re-read is not seen by the hook. verify-branch is the remedy:
-// the head then has no verdict for its tree.
+// The index race (decision 18, further amended). git reads the index again after pre-commit
+// returns, so a change made while or just after the gate runs could be committed unjudged. runGate
+// reads the index tree a second time before it allows, and on an allow records the tree for the git
+// process that started the hook (inflight-<pid>.json). The reference-transaction hook then runs the
+// gate in the `prepared` state of that process's ref update, and the update is refused unless every
+// branch or HEAD it moves names a commit of exactly that tree. Where that hook is installed the race
+// is closed. Where it is not (missing, not executable, or not ours), git skips it, and a change in
+// the instant between the gate's exit and git's re-read remains a STATED LIMIT, with verify-branch
+// as the remedy: the head then has no verdict for its tree.
 import { join } from 'node:path';
 import { COMMANDS } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
 import { digestOfTree } from './ko-digest.mjs';
-import { GitError, baseOf, currentBranch, filesNotInIndex, indexTree, repoRoot, treeEntry, workingDifferences } from './ko-git.mjs';
+import { readFileSync } from 'node:fs';
+import { GitError, baseOf, currentBranch, filesNotInIndex, indexTree, repoRoot, treeEntry, treeOfCommitId, workingDifferences } from './ko-git.mjs';
 import { OFFICERS } from './ko-digest.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { StateError, isOff, readApprovals, readExemptions, stateDir } from './ko-state.mjs';
+import { StateError, isOff, readApprovals, readExemptions, readInflight, removeInflight, stateDir, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
-const HOOKS = ['pre-commit', 'pre-merge-commit'];
+const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
+const REFERENCE_HOOK = 'reference-transaction';
+const PID = /^[1-9][0-9]{0,9}$/;
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const NULL_ID = /^(?:0{40}|0{64})$/;
+const TOKEN = /^\S+$/;
+// A symbolic ref's value as the hook is given it: `ref:refs/heads/main`.
+const SYMBOLIC = /^ref:\S+$/;
 const EXTENSION = '.claude/kh-orchestration/scripts/extension.mjs';
 // git file modes of a regular file; a link (120000) or a submodule (160000) is not one.
 const FILE_MODES = ['100644', '100755'];
@@ -62,7 +75,11 @@ export const REASONS = Object.freeze({
   failing: (ids) => `These officers did not pass on this tree: ${namedList(ids)}. Fix what they report, stage the fix, and run the officers again.`,
   allowed: 'This tree has a passing verdict against its base and its protected files are approved.',
   couldNotDecide: (reason) => `the gate could not decide: ${sentence(reason)} The commit is refused.`,
-  notAHook: 'it was not started as the pre-commit or pre-merge-commit hook',
+  notAHook: 'it was not started as the pre-commit, pre-merge-commit or reference-transaction hook with the id of the git process',
+  updateAllowed: 'The branch update holds the tree the gate allowed.',
+  treeSwapped: 'The tree being committed is not the tree the gate allowed: the index changed after the gate ran. Stage what you mean to commit and run the officers again.',
+  noRecord: 'No record of the tree the gate allowed is kept for this git process, so its branch update cannot be checked. Run the officers on the staged tree and commit again.',
+  unreadableUpdates: 'the reference updates git sent the hook cannot be read',
   notARepository: 'the working directory is not inside a git working tree',
   unexpected: 'an unexpected error stopped the check',
   indexChanged: 'The index changed while the gate ran, so the tree git would commit is not the one judged. Run the officers again on the staged tree.',
@@ -166,25 +183,76 @@ function failureReason(error) {
   return error instanceof StateError || error instanceof GitError ? error.message : REASONS.unexpected;
 }
 
+// The hook's judgement of the index: the tree git is about to commit (a hook's GIT_INDEX_FILE
+// names the index of a partial commit), its base from the tree's own officers file, its branch;
+// then, when judge allows on the checks, the index tree once more, refused if it changed, and the
+// tree recorded for git process `pid`. Any earlier record of `pid` is removed first, so a reused
+// process id never inherits one; the off switch and an exemption judge no tree and record none.
+function judgeIndex(root, pid, readTree) {
+  removeInflight(root, pid);
+  const tree = readTree(root);
+  const branch = currentBranch(root);
+  const read = officersOfTree(root, tree);
+  const base = read.problem === undefined ? baseOf(root, read.baseBranch) : null;
+  const decision = judge(root, { tree, base, branch });
+  if (decision.reason !== REASONS.allowed) return decision;
+  if (readTree(root) !== tree) return refuse(REASONS.indexChanged, COMMANDS.run);
+  writeInflight(root, pid, tree);
+  return decision;
+}
+
+// The updates of one reference transaction, `<old> <new> <ref>` per line, each value an object id
+// or a symbolic `ref:<name>`, or null when a line is not of that form.
+function parseUpdates(input) {
+  const updates = [];
+  for (const line of input.split('\n').filter((text) => text !== '')) {
+    const parts = line.split(' ');
+    if (parts.length !== 3 || !parts.slice(0, 2).every((value) => OBJECT_ID.test(value) || SYMBOLIC.test(value)) || !TOKEN.test(parts[2])) return null;
+    updates.push({ next: parts[1], ref: parts[2] });
+  }
+  return updates;
+}
+
+// Whether a branch or HEAD update keeps to the recorded tree: a deletion (the null id) is not a
+// commit and passes; anything else must be a commit whose tree is `tree`. A symbolic update
+// (`ref:refs/heads/x`) or any non-commit is refused.
+function keepsTree(root, update, tree) {
+  if (update.ref !== 'HEAD' && !update.ref.startsWith('refs/heads/')) return true;
+  if (NULL_ID.test(update.next)) return true;
+  return OBJECT_ID.test(update.next) && treeOfCommitId(root, update.next) === tree;
+}
+
+// The reference-transaction hook's judgement, in the `prepared` state of git process `pid`'s
+// update: allowed only when every branch or HEAD it moves names a commit of the recorded tree.
+// Other refs (ORIG_HEAD, AUTO_MERGE, tags, remotes) are not judged. A refusal removes the record.
+function judgeUpdate(root, pid, input) {
+  const tree = readInflight(root, pid);
+  if (tree === null) return refuse(REASONS.noRecord, COMMANDS.run);
+  const updates = parseUpdates(input);
+  const decision = updates === null
+    ? refuse(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)
+    : updates.every((update) => keepsTree(root, update, tree)) ? allow(REASONS.updateAllowed) : refuse(REASONS.treeSwapped, COMMANDS.run);
+  if (!decision.allow) removeInflight(root, pid);
+  return decision;
+}
+
 /**
- * The hook's judgement of the index: the tree git is about to commit (a hook's GIT_INDEX_FILE
- * names the index of a partial commit), its base from the tree's own officers file, its branch;
- * then, when judge allows on the checks, the index tree once more, refused if it changed. `args`
- * is the hook name alone. `readTree` reads the index tree; a test passes one that changes the
- * index between the two reads. Never throws: any throw is a refusal with fixed text.
+ * The gate as a hook runs it: `args` is the hook name and the id of the git process that started
+ * the hook (`$PPID`). `pre-commit` and `pre-merge-commit` judge the index; `reference-transaction`
+ * judges the updates on standard input against the tree recorded for that process. `readTree`
+ * reads the index tree and `input` replaces standard input; tests pass them. Never throws: any
+ * throw is a refusal with fixed text.
  */
-export function runGate(args, cwd, readTree = indexTree) {
+export function runGate(args, cwd, { readTree = indexTree, input } = {}) {
   try {
-    if (args.length !== 1 || !HOOKS.includes(args[0])) return refuse(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status);
+    const [hook, pid] = args;
+    if (args.length !== 2 || ![...COMMIT_HOOKS, REFERENCE_HOOK].includes(hook) || !PID.test(pid)) {
+      return refuse(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status);
+    }
     const root = repoRoot(cwd);
     if (root === null) return refuse(REASONS.couldNotDecide(REASONS.notARepository), COMMANDS.status);
-    const tree = readTree(root);
-    const branch = currentBranch(root);
-    const read = officersOfTree(root, tree);
-    const base = read.problem === undefined ? baseOf(root, read.baseBranch) : null;
-    const decision = judge(root, { tree, base, branch });
-    if (decision.reason === REASONS.allowed && readTree(root) !== tree) return refuse(REASONS.indexChanged, COMMANDS.run);
-    return decision;
+    if (hook === REFERENCE_HOOK) return judgeUpdate(root, pid, input ?? readFileSync(0, 'utf8'));
+    return judgeIndex(root, pid, readTree);
   } catch (error) {
     return refuse(REASONS.couldNotDecide(failureReason(error)), COMMANDS.status);
   }

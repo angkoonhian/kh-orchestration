@@ -1,6 +1,7 @@
-// The commit gate's entry: the script git's pre-commit and pre-merge-commit hooks run from the
-// copy in <git-common-dir>/kh-orchestration/bin/ (decision 18, amended after Task 6's review), so
-// it never depends on the files of the tree being committed. The judgement is ko-gate.mjs's.
+// The commit gate's entry: the script git's pre-commit, pre-merge-commit and reference-transaction
+// hooks run from the copy in <git-common-dir>/kh-orchestration/bin/ (decision 18, further amended),
+// so it never depends on the files of the tree being committed. The judgement is ko-gate.mjs's;
+// for reference-transaction it reads the updates from standard input.
 //
 // Its main ALWAYS runs: there is no "am I the main module" test, which a symlink anywhere on the
 // path made false, turning the gate into a silent exit 0. The hook allows only on exit 0 AND the
@@ -21,7 +22,7 @@ process.exitCode = 1;
 let gate;
 try {
   gate = await import('./ko-gate.mjs');
-  if (typeof gate.runGate !== 'function' || typeof gate.REASONS?.allowed !== 'string') gate = undefined;
+  if (typeof gate.runGate !== 'function' || typeof gate.REASONS?.allowed !== 'string' || typeof gate.REASONS.updateAllowed !== 'string') gate = undefined;
 } catch {
   gate = undefined;
 }
@@ -32,7 +33,8 @@ try {
   } else {
     const decision = gate.runGate(process.argv.slice(2), process.cwd());
     if (decision.allow === true) {
-      if (decision.reason !== gate.REASONS.allowed) process.stderr.write(`kh-orchestration: ${decision.reason}\n`);
+      // Said only when nothing was checked: the off switch and an exemption.
+      if (decision.reason !== gate.REASONS.allowed && decision.reason !== gate.REASONS.updateAllowed) process.stderr.write(`kh-orchestration: ${decision.reason}\n`);
       process.stdout.write(`${ALLOWED_TOKEN}\n`);
       process.exitCode = 0;
     } else {
