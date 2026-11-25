@@ -229,8 +229,8 @@ export const MESSAGES = Object.freeze({
   noVerify: `git may not skip the commit gate from a session. Run the officers with ${RUN}, then commit without --no-verify or -n.`,
   hiddenOption: 'A flag of git commit, merge or pull is given through a variable or a substitution, which could turn the hooks off, so it is blocked. Write the flags out literally.',
   commitTree: `git commit-tree makes a commit without the commit gate and is not run from a session. Run ${RUN}, then git commit.`,
-  gitConfig: 'Git configuration that redirects or turns off hooks (core.hooksPath, include, includeIf, alias, branch.*.mergeOptions) is not changed from a session. The owner changes it in their own terminal; reading it with git config --get is allowed.',
-  gitEnv: 'GIT_CONFIG_*, HOME, XDG_CONFIG_HOME, PATH and GIT_EXEC_PATH (or --exec-path) are not set for git from a session: they change which configuration, hooks and programs git uses. Run the git command without them.',
+  gitConfig: 'Git configuration that redirects hooks or names a command git runs (core.hooksPath, include, alias, mergeOptions, filters, fsmonitor, diff and merge drivers, pagers, editors, gpg and ssh programs) is not changed from a session. The owner changes it; git config --get reads it.',
+  gitEnv: 'GIT_CONFIG_*, HOME, XDG_CONFIG_HOME, PATH, GIT_EXEC_PATH (or --exec-path), NODE_*, LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT and DYLD_* are not set for git from a session: they change what git and its hooks run. Run the git command without them.',
   xargs: 'A git command or ko.mjs run through xargs takes words the hook cannot see, so it is blocked. Run the command directly, with its subcommand and options written out.',
   guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
@@ -1440,8 +1440,9 @@ const XARGS_HIDDEN = new Set(['commit', 'merge', 'pull', 'config', 'commit-tree'
 // Environment that changes git's configuration or programs: on any command for GIT_CONFIG*,
 // on a git command for the rest.
 const GIT_CONFIG_ENV = /^GIT_CONFIG[A-Za-z0-9_]*\+?=/i;
-// PATH: a git command's PATH decides which programs its hooks start.
-const GIT_ENV = /^(HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH|PATH)\+?=/i;
+// PATH: a git command's PATH decides which programs its hooks start. NODE_*, LD_PRELOAD,
+// LD_LIBRARY_PATH, LD_AUDIT and DYLD_*: they load code into the hooks' processes, Node among them.
+const GIT_ENV = /^(HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH|PATH|NODE_[A-Za-z0-9_]*|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_[A-Za-z0-9_]*)\+?=/i;
 
 // The git invocation a resolved command is, or null: git by its basename, or git-<sub> read as
 // git <sub>. { sub, rest, configs, execPath }: the subcommand, the words after it, the k=v of
@@ -1465,12 +1466,16 @@ function gitInvocation(resolved) {
 }
 
 // A configuration key that redirects or turns off hooks.
+// Keys that name a command git runs (decision 15, addition after Task 6's third re-review): a clean
+// filter or a monitor runs inside the gate's own git calls and can blind what it reads.
+const COMMAND_KEY = /^(?:core\.(?:fsmonitor|sshcommand|editor|pager)|filter\..+|diff\.external|diff\..+\.(?:command|textconv)|merge\..+\.driver|sequence\.editor|pager\..+|gpg\.program|gpg\..+\.program)$/;
 function hookKey(key) {
   const lower = key.toLowerCase();
-  return lower === 'core.hookspath' || lower.startsWith('include.') || lower.startsWith('includeif.') || lower.startsWith('alias.') || /^branch\..*\.mergeoptions$/.test(lower);
+  return lower === 'core.hookspath' || lower.startsWith('include.') || lower.startsWith('includeif.') || lower.startsWith('alias.') || /^branch\..*\.mergeoptions$/.test(lower)
+    || COMMAND_KEY.test(lower);
 }
 // A section whose renaming or removal can do the same.
-const hookSection = (name) => /^(core|include|includeif.*|alias|branch.*)$/i.test(name);
+const hookSection = (name) => /^(core|include|includeif.*|alias|branch.*|filter.*|diff.*|merge.*|pager|gpg.*|sequence)$/i.test(name);
 
 const CONFIG_VALUED = new Set(['-f', '--file', '--blob', '--type', '--default', '--comment', '--value']);
 const CONFIG_READS = new Set(['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--get-color', '--get-colorbool', '-l', '--list']);
