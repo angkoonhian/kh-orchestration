@@ -3,18 +3,22 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { EXTENSION_MODULE, KIT_VERSION, installGate, installKhHarness, isolateProcessEnv, makeRepo, registerExtension, testEnv } from './test-repo.mjs';
-import { REASONS, REFRESH_COMMAND, exemptCommand, judge } from '../../assets/scripts/gate.mjs';
+import { REASONS, exemptCommand, judge, runGate } from '../../assets/scripts/ko-gate.mjs';
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, currentBranch, indexTree } from '../../assets/scripts/ko-git.mjs';
 import { corruptMessage, shapeMessage, stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
+import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
+import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 import { produceVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 isolateProcessEnv();
+const KO_REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // The probe runs kh-harness's real hook: its session log and markers go to this run's directories.
 const hookDirs = realpathSync(mkdtempSync(join(tmpdir(), 'ko-gate-hook-')));
 process.env.KH_DATA_DIR = join(hookDirs, 'data');
@@ -92,7 +96,6 @@ test('the command table is the one ko.mjs and the extension name', () => {
     approve: 'node .claude/kh-orchestration/scripts/ko.mjs approve',
     status: 'node .claude/kh-orchestration/scripts/ko.mjs status',
   });
-  assert.equal(REFRESH_COMMAND, COMMANDS.approve, 'the gate\'s one copy, for when the table cannot be loaded');
 });
 
 test('1. the off switch allows, saying kh-orchestration is switched off, before anything else is read', () => {
@@ -123,7 +126,7 @@ test('3. a tree without officers.json is refused as having no install, naming th
   const at = subject(repo.root);
   const ko = join(stateDir(repo.root), 'bin', 'ko.mjs');
   assert.equal(exemptCommand(repo.root, 'main'), `node ${ko} exempt main --reason "<why>"`);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.noInstall('.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.'), exemptCommand(repo.root, 'main')));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.noInstall(REASONS.officersAbsent), exemptCommand(repo.root, 'main')));
 });
 
 test('3. a tree without the extension, or with a link in its place, is refused as having no install', () => {
@@ -143,8 +146,7 @@ test('3. the exemption command quotes a branch name the shell would read otherwi
   assert.equal(exemptCommand(repo.root, "it's$x"), `node ${ko} exempt 'it'\\''s$x' --reason "<why>"`);
   rmSync(join(repo.root, OFFICERS_PATH));
   stage(repo);
-  const problem = '.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.';
-  assert.deepEqual(judge(repo.root, { ...subject(repo.root), branch: null }), refused(REASONS.noInstallDetached(problem), 'git switch -c <branch>'));
+  assert.deepEqual(judge(repo.root, { ...subject(repo.root), branch: null }), refused(REASONS.noInstallDetached(REASONS.officersAbsent), 'git switch -c <branch>'));
 });
 
 test('4. a contract problem in the working directory is refused, naming the first problem', () => {
@@ -243,11 +245,147 @@ test('judge throws the StateError of a damaged approvals or exemptions file, for
   assert.throws(() => judge(repo.root, subject(repo.root)), { name: 'StateError', message: corruptMessage('approvals.json') });
 });
 
+test('3. an officers.json that is present but invalid is an officers-file problem naming the file, with next status, not the exemption', () => {
+  const repo = installed();
+  repo.write(OFFICERS_PATH, officersFile().replace('"schema": 1', '"schema": 2'));
+  stage(repo);
+  assert.deepEqual(judge(repo.root, subject(repo.root)), refused(
+    REASONS.officersProblem('.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.'), COMMANDS.status,
+  ));
+  assert.equal(
+    REASONS.officersProblem('x is wrong.'),
+    'The officers file .claude/kh-orchestration/officers.json in this tree cannot be used, so the commit gate refuses it: x is wrong. Fix the file and stage it; the owner approves the change.',
+  );
+});
+
+test('2. an exemption\'s recorded reason is printed without control characters and cut at 200 characters', () => {
+  const repo = installed();
+  const reason = `old\u001b[31m work\u0007‮${'x'.repeat(300)}`;
+  writeState(repo.root, 'exemptions.json', { branches: [{ name: 'main', reason, at: 'x' }] });
+  const shown = `old[31m work${'x'.repeat(199 - 'old[31m work'.length)}…`;
+  assert.deepEqual(judge(repo.root, subject(repo.root)), allowed(REASONS.exempt('main', shown)));
+});
+
+// A stamped module that blocks only the probe: kh-harness's checks pass, the session is unguarded.
+const NEUTERED = `// Generated by kh-orchestration ${KIT_VERSION}. Do not edit.
+export function preToolUse(p) {
+  if (p?.tool_input?.command === 'git commit --no-verify -m probe') return { decision: 'block', message: 'no' };
+  return { decision: 'allow' };
+}
+`;
+function neuterExtension(root) {
+  writeFileSync(join(root, EXTENSION_MODULE), NEUTERED);
+  const path = join(root, '.claude/kh-harness/extensions.json');
+  const entries = JSON.parse(readFileSync(path, 'utf8'));
+  entries[0].sha256 = lfSha256(Buffer.from(NEUTERED));
+  writeFileSync(path, `${JSON.stringify(entries, null, 2)}\n`);
+}
+// A dispatcher that denies only the probe, re-hashed into contract.json.
+function neuterDispatcher(root) {
+  const script = '.claude/scripts/dispatch-pre-tool.mjs';
+  const text = "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s);if(p.tool_input?.command==='git commit --no-verify -m probe'){process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:'kh-harness extension kh-orchestration: x'}}));}});\n";
+  writeFileSync(join(root, script), text);
+  const path = join(root, '.claude/kh-harness/contract.json');
+  const contract = JSON.parse(readFileSync(path, 'utf8'));
+  contract.files[script] = lfSha256(Buffer.from(text));
+  writeFileSync(path, `${JSON.stringify(contract, null, 2)}\n`);
+}
+
+test('live files: a working extension that blocks only the probe, re-hashed and left unstaged, is refused though contract 1 holds', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  neuterExtension(repo.root);
+  assert.deepEqual(contractHolds(repo.root), { ok: true });
+  // git names the differing paths in its order: the re-hashed extensions file comes first.
+  const first = '.claude/kh-harness/extensions.json';
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers(first), `git restore -- ${first}`));
+
+  assert.equal(
+    REASONS.liveDiffers('x'),
+    'The working copy of x differs from this tree, and the working copy is what this session\'s hooks run. Restore it, or stage it for the owner to approve, then commit again.',
+  );
+});
+
+test('live files: a kh-harness dispatcher that denies only the probe, re-hashed into contract.json, is refused at the first differing path', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  neuterDispatcher(repo.root);
+  assert.deepEqual(contractHolds(repo.root), { ok: true });
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/kh-harness/contract.json'), 'git restore -- .claude/kh-harness/contract.json'));
+});
+
+test('live files: a mode change, and a file not in the tree (untracked or ignored) under the live paths, are refused', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  chmodSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs'), 0o755);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/kh-orchestration/scripts/ko-git.mjs'), 'git restore -- .claude/kh-orchestration/scripts/ko-git.mjs'));
+  chmodSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs'), 0o644);
+  repo.write('.claude/scripts/extra.mjs', 'x\n');
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'git add -- .claude/scripts/extra.mjs'));
+  rmSync(join(repo.root, '.claude/scripts/extra.mjs'));
+  writeFileSync(join(repo.root, '.git', 'info', 'exclude'), '.claude/kh-harness/*.local\n');
+  repo.write('.claude/kh-harness/x.local', 'x\n');
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/kh-harness/x.local'), 'git add -- .claude/kh-harness/x.local'));
+  assert.equal(
+    REASONS.liveUntracked('x'),
+    'x is in the working directory but not in this tree, beside the files this session\'s hooks run. Remove it, or stage it for the owner to approve, then commit again.',
+  );
+});
+
+test('live files: an unstaged edit to an ordinary file is no reason to refuse, and a staged, approved change to a live file passes', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  repo.write('a.txt', 'edited, not staged\n');
+  assert.deepEqual(judge(repo.root, at), allowed(REASONS.allowed));
+  repo.write('.claude/kh-orchestration/scripts/ko-git.mjs', `${readFileSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs'), 'utf8')}// a change\n`);
+  assert.equal(repo.git('add', '.claude/kh-orchestration/scripts/ko-git.mjs').status, 0);
+  const changed = subject(repo.root);
+  approveTree(repo.root, changed.tree);
+  recordVerdict(repo.root, changed, [result('check', 'pass')]);
+  assert.deepEqual(judge(repo.root, changed), allowed(REASONS.allowed));
+});
+
+test('Critical 2: an index changed after the tree was judged is refused before the gate allows', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  assert.deepEqual(runGate(['pre-commit'], repo.root), allowed(REASONS.allowed));
+  let reads = 0;
+  const changingTree = (root) => {
+    const tree = indexTree(root);
+    reads += 1;
+    if (reads === 1) {
+      repo.write('evil.txt', 'evil\n');
+      assert.equal(repo.git('add', 'evil.txt').status, 0);
+    }
+    return tree;
+  };
+  assert.deepEqual(runGate(['pre-commit'], repo.root, changingTree), refused(REASONS.indexChanged, COMMANDS.run));
+  assert.equal(reads, 2);
+  assert.equal(REASONS.indexChanged, 'The index changed while the gate ran, so the tree git would commit is not the one judged. Run the officers again on the staged tree.');
+});
+
 // ---- the gate as git runs it (step 3) ----
 
 const gitIn = (root, argv, env = testEnv()) => spawnSync('git', argv, { cwd: root, env, encoding: 'utf8' });
 const commit = (root, ...argv) => gitIn(root, ['commit', '-q', '-m', 'work', ...argv]);
-const refusalText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
+// What the gate prints on a refusal, and what the hook adds after it (decision 18, amended).
+const gateText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
+const HOOK_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
+const refusalText = (reason, next) => `${gateText(reason, next)}${HOOK_LINE}`;
+// The entry's own text when ko-gate.mjs or a sibling cannot be loaded: literals only.
+const UNLOADABLE = gateText(
+  'the gate could not decide: a script in <git-common-dir>/kh-orchestration/bin/ is missing, out of date or cannot be loaded. The commit is refused.', COMMANDS.approve,
+);
 
 // git did not commit: the command failed and HEAD is where it was.
 function assertRefused(root, outcome, before, stderr) {
@@ -309,30 +447,115 @@ test('Review Focus 1: a corrupt approvals.json or exemptions.json refuses the co
   assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.couldNotDecide(shapeMessage('exemptions.json')), COMMANDS.status));
 });
 
+test('Important 1 through git: a neutered live extension, unstaged, with an ordinary file staged and run, does not land', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  neuterExtension(repo.root);
+  repo.write('z.txt', 'z\n');
+  assert.equal(gitIn(repo.root, ['add', 'z.txt']).status, 0);
+  await runAndApprove(repo.root);
+  const first = '.claude/kh-harness/extensions.json';
+  assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.liveDiffers(first), `git restore -- ${first}`));
+});
+
 test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commit; a missing sibling with fixed text', async () => {
   const repo = installed();
   await runAndApprove(repo.root);
   const before = head(repo.root);
   const bin = join(stateDir(repo.root), 'bin');
   rmSync(join(bin, 'ko-git.mjs'));
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.couldNotDecide(REASONS.siblingMissing(bin)), COMMANDS.approve));
+  assertRefused(repo.root, commit(repo.root), before, `${UNLOADABLE}${HOOK_LINE}`);
   rmSync(join(bin, 'gate.mjs'));
   assertRefused(repo.root, commit(repo.root), before);
 });
 
-test('Review Focus 1: node missing from PATH, or a node that exits 1, in the hook\'s environment refuses the commit', async () => {
+test('Critical 1: an empty or a truncated bin/gate.mjs refuses: the hook allows only on the gate\'s token', async () => {
   const repo = installed();
   await runAndApprove(repo.root);
   const before = head(repo.root);
-  const tools = join(repo.root, '..', 'path-without-node');
+  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
+  const text = readFileSync(gate, 'utf8');
+  writeFileSync(gate, '');
+  assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
+  writeFileSync(gate, text.slice(0, Math.floor(text.length / 2)));
+  assertRefused(repo.root, commit(repo.root), before);
+  writeFileSync(gate, text);
+  assert.equal(commit(repo.root).status, 0);
+});
+
+test('Critical 1: reached through a symlink (bin/gate.mjs, the state directory, .git itself) the gate still judges', () => {
+  const linkGate = (repo) => {
+    const bin = join(stateDir(repo.root), 'bin');
+    renameSync(join(bin, 'gate.mjs'), join(bin, 'gate-real.mjs'));
+    symlinkSync('gate-real.mjs', join(bin, 'gate.mjs'));
+  };
+  const linkState = (repo) => {
+    const state = stateDir(repo.root);
+    const away = join(repo.root, '..', 'state-elsewhere');
+    renameSync(state, away);
+    symlinkSync(away, state);
+  };
+  const linkGitDir = (repo) => {
+    const away = join(repo.root, '..', 'gitdir-elsewhere');
+    renameSync(join(repo.root, '.git'), away);
+    symlinkSync(away, join(repo.root, '.git'));
+  };
+  for (const link of [linkGate, linkState, linkGitDir]) {
+    const repo = installed();
+    link(repo);
+    const at = subject(repo.root);
+    approveTree(repo.root, at.tree);
+    assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  }
+});
+
+test('Important 2: a bin/ whose extension.mjs is from another kit (no COMMANDS export) refuses with the literal text, no stack trace', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  const before = head(repo.root);
+  const old = spawnSync('git', ['show', 'f58b045:assets/scripts/extension.mjs'], { cwd: KO_REPO, env: testEnv(), encoding: 'utf8' });
+  assert.equal(old.status, 0);
+  writeFileSync(join(stateDir(repo.root), 'bin', 'extension.mjs'), old.stdout);
+  assertRefused(repo.root, commit(repo.root), before, `${UNLOADABLE}${HOOK_LINE}`);
+});
+
+test('Review Focus 1 and Important 3: the hook runs the node recorded at install, never one found through PATH', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  const before = head(repo.root);
+  const tools = join(repo.root, '..', 'tools');
   mkdirSync(tools);
-  const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
-  symlinkSync(realGit, join(tools, 'git'));
-  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '-m', 'work'], { ...testEnv(), PATH: tools }), before);
-  writeFileSync(join(tools, 'node'), '#!/bin/sh\nexit 1\n');
-  chmodSync(join(tools, 'node'), 0o755);
-  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '-m', 'work'], { ...testEnv(), PATH: tools }), before);
-  assert.equal(commit(repo.root).status, 0, 'with node on PATH the same commit is accepted');
+  const shim = join(tools, 'node');
+  writeFileSync(shim, '#!/bin/sh\necho "kh-orchestration: allowed"\nexit 0\n');
+  chmodSync(shim, 0o755);
+  const refusal = refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run);
+  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '-m', 'work'], { ...testEnv(), PATH: `${tools}:${process.env.PATH}` }), before, refusal);
+  const gitOnly = join(repo.root, '..', 'git-only');
+  mkdirSync(gitOnly);
+  symlinkSync(spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim(), join(gitOnly, 'git'));
+  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '-m', 'work'], { ...testEnv(), PATH: gitOnly }), before, refusal);
+  writeFileSync(shim, '#!/bin/sh\nexit 0\n');
+  installGate(repo.root, { node: shim });
+  assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
+  installGate(repo.root, { node: join(tools, 'moved', 'node') });
+  const moved = commit(repo.root);
+  assertRefused(repo.root, moved, before);
+  assert.ok(moved.stderr.endsWith(HOOK_LINE), moved.stderr);
+});
+
+test('installGate writes the hooks as decision 18 (amended) words them, naming node by its absolute path', () => {
+  const repo = installed();
+  const hook = readFileSync(join(repo.root, '.git', 'hooks', 'pre-merge-commit'), 'utf8');
+  assert.equal(hook, [
+    '#!/bin/sh',
+    `# kh-orchestration ${KIT_VERSION} pre-merge-commit. Do not edit.`,
+    `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" pre-merge-commit) && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
+    'exit 1',
+    '',
+  ].join('\n'));
 });
 
 test('the gate refuses when started with no hook name or an unknown one', () => {
@@ -340,8 +563,16 @@ test('the gate refuses when started with no hook name or an unknown one', () => 
   const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
   for (const argv of [[], ['post-commit'], ['pre-commit', 'extra']]) {
     const outcome = spawnSync(process.execPath, [gate, ...argv], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
-    assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [1, '', refusalText(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status)], argv.join(' '));
+    assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [1, '', gateText(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status)], argv.join(' '));
   }
+});
+
+test('the gate prints the token kh-orchestration: allowed on standard output only when it allows', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
+  const outcome = spawnSync(process.execPath, [gate, 'pre-commit'], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
+  assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [0, 'kh-orchestration: allowed\n', '']);
 });
 
 test('the gate prints one line for the off switch and for an exemption, and nothing on a plain allow', async () => {
@@ -364,8 +595,7 @@ test('with no copy of the scripts in the working tree, the gate in bin/ refuses 
   repo.write('b.txt', 'y\n');
   stage(repo);
   const before = head(repo.root);
-  const problem = '.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.';
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noInstall(problem), exemptCommand(repo.root, 'main')));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noInstall(REASONS.officersAbsent), exemptCommand(repo.root, 'main')));
   writeState(repo.root, 'exemptions.json', { branches: [{ name: 'main', reason: 'predates the install', at: 'x' }] });
   const exempt = commit(repo.root);
   assert.deepEqual([exempt.status, exempt.stderr], [0, `kh-orchestration: ${REASONS.exempt('main', 'predates the install')}\n`]);
@@ -453,6 +683,17 @@ test('git commit -a and a partial commit are judged on the tree actually committ
   assert.equal(gitIn(repo.root, ['add', 'b.txt']).status, 0);
   assert.equal(commit(repo.root, '--', 'a.txt').status, 0);
   assert.equal(gitIn(repo.root, ['show', 'HEAD:b.txt']).stdout, 'new b\n');
+});
+
+test('an amended commit on the base branch needs a fresh run even with its tree unchanged: its base is the commit being amended', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  const before = head(repo.root);
+  const tree = indexTree(repo.root);
+  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '--amend', '-m', 'reworded']), before, refusalText(REASONS.noVerdict(tree, before), COMMANDS.run));
+  await runAndApprove(repo.root);
+  assert.equal(gitIn(repo.root, ['commit', '-q', '--amend', '-m', 'reworded']).status, 0);
 });
 
 test('an amended commit on a feature branch is accepted for an unchanged tree and refused for a changed one', async () => {

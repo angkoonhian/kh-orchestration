@@ -130,6 +130,19 @@ export function tidy(root) {
   return { tidy: unstaged.length === 0 && untracked.length === 0, unstaged, untracked };
 }
 
+// The paths under `pathspecs` whose working copy differs from `tree` in bytes or mode (a file
+// changed, added to the index or deleted), in git's order. No external diff or textconv runs.
+export function workingDifferences(root, tree, pathspecs) {
+  const argv = ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--end-of-options', tree, '--', ...pathspecs];
+  return nulSeparated(mustSucceed(git(root, argv), 'compare the working tree'));
+}
+
+// The files under `pathspecs` in the working directory that the index does not hold, ignored
+// ones included (no exclude rules are applied).
+export function filesNotInIndex(root, pathspecs) {
+  return nulSeparated(mustSucceed(git(root, ['ls-files', '-z', '--others', '--', ...pathspecs]), 'list the untracked files'));
+}
+
 // `{ mode, type, oid }` of one path in a tree, or null only when the path is not in it.
 export function treeEntry(root, tree, path) {
   const entry = mustSucceed(git(root, ['ls-tree', '-z', '--end-of-options', tree, '--', path]), 'read the file');

@@ -123,10 +123,26 @@ function gitCommonDir(root) {
   return realpathSync(resolve(root, result.stdout.replace(/\n$/, '')));
 }
 
+// A word sh reads as itself, in single quotes.
+const shQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
+
+// The hook decision 18 (amended after Task 6's review) words: allow only on the gate's exit 0 AND
+// its token on standard output; node named by its absolute path, never found through PATH.
+function hookScript(hook, node = process.execPath) {
+  return [
+    '#!/bin/sh',
+    `# kh-orchestration ${KIT_VERSION} ${hook}. Do not edit.`,
+    `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" ${hook}) && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
+    'exit 1',
+    '',
+  ].join('\n');
+}
+
 // Test-only stand-in for Task 9's installer: every script of assets/scripts, stamped, into
 // <common-dir>/kh-orchestration/bin/ (and into the working tree's
-// .claude/kh-orchestration/scripts/ with `inTree`), and the two git hooks as decision 18 words them.
-export function installGate(root, { inTree = false } = {}) {
+// .claude/kh-orchestration/scripts/ with `inTree`), and the two git hooks, naming `node`.
+export function installGate(root, { inTree = false, node = process.execPath } = {}) {
   const common = gitCommonDir(root);
   const bin = join(common, 'kh-orchestration', 'bin');
   mkdirSync(bin, { recursive: true });
@@ -139,7 +155,7 @@ export function installGate(root, { inTree = false } = {}) {
   mkdirSync(join(common, 'hooks'), { recursive: true });
   for (const hook of ['pre-commit', 'pre-merge-commit']) {
     const path = join(common, 'hooks', hook);
-    writeFileSync(path, `#!/bin/sh\nnode "$(git rev-parse --git-common-dir)/kh-orchestration/bin/gate.mjs" ${hook}\nexit $?\n`);
+    writeFileSync(path, hookScript(hook, node));
     chmodSync(path, 0o755);
   }
   return { bin };
