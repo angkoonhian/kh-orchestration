@@ -16,10 +16,10 @@ import { COMMANDS } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
 import { digestOfTree } from './ko-digest.mjs';
 import { readFileSync } from 'node:fs';
-import { GitError, baseOf, currentBranch, filesNotInIndex, indexTree, repoRoot, treeEntry, treeOfCommitId, workingDifferences } from './ko-git.mjs';
+import { GitError, baseOf, currentBranch, filesNotInIndex, indexTree, repoRoot, stagedDifferences, treeEntry, treeOfCommitId, workingDifferences } from './ko-git.mjs';
 import { OFFICERS } from './ko-digest.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { StateError, isOff, readApprovals, readExemptions, readInflight, removeInflight, stateDir, writeInflight } from './ko-state.mjs';
+import { StateError, isOff, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, stateDir, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
@@ -64,8 +64,9 @@ export const REASONS = Object.freeze({
   extensionAbsent: `${EXTENSION} is not a file in this tree.`,
   officersAbsent: `${OFFICERS} is not a file in this tree.`,
   officersProblem: (problem) => `The officers file ${OFFICERS} in this tree cannot be used, so the commit gate refuses it: ${sentence(problem)} Fix the file and stage it; the owner approves the change.`,
-  liveDiffers: (path) => `The working copy of ${path} differs from this tree, and the working copy is what this session's hooks run. Restore it, or stage it for the owner to approve, then commit again.`,
-  liveUntracked: (path) => `${path} is in the working directory but not in this tree, beside the files this session's hooks run. Remove it, or stage it for the owner to approve, then commit again.`,
+  liveDiffers: (path) => `The working copy of ${path} differs from the tree being committed, and the working copy is what this session's hooks run. Stage it for the owner to approve, or restore it as below, then commit again.`,
+  liveStagedElsewhere: (path) => `${path} is staged with a change this partial commit leaves out, so its working copy, which this session's hooks run, differs from the tree being committed. Commit without a path list, or restore it, then commit again.`,
+  liveUntracked: (path) => `${path} is in the working directory beside the files this session's hooks run but is not in the tree being committed (an editor's swap file or a .DS_Store looks like this too). Remove it as below, or add it and have the owner approve it, then commit again.`,
   contract: (problem) => `kh-harness contract 1 does not hold in this working directory, so the extension that guards the commit gate may not be running: ${sentence(problem)} Repair the install outside Claude Code, then commit again.`,
   undigestable: (problem) => `The protected files of this tree cannot be checked: ${sentence(problem)} Fix it, stage the fix, and run the officers.`,
   unapproved: (digest) => `The protected files of this tree (digest ${digest.slice(0, 12)}) are not approved. The owner reviews and approves them in their own terminal.`,
@@ -77,7 +78,7 @@ export const REASONS = Object.freeze({
   couldNotDecide: (reason) => `the gate could not decide: ${sentence(reason)} The commit is refused.`,
   notAHook: 'it was not started as the pre-commit, pre-merge-commit or reference-transaction hook with the id of the git process',
   updateAllowed: 'The branch update holds the tree the gate allowed.',
-  treeSwapped: 'The tree being committed is not the tree the gate allowed: the index changed after the gate ran. Stage what you mean to commit and run the officers again.',
+  treeSwapped: 'The tree being committed is not the tree the gate allowed for this git process. Run the command again; if this was a commit, stage what you mean to commit and run the officers first.',
   noRecord: 'No record of the tree the gate allowed is kept for this git process, so its branch update cannot be checked. Run the officers on the staged tree and commit again.',
   unreadableUpdates: 'the reference updates git sent the hook cannot be read',
   notARepository: 'the working directory is not inside a git working tree',
@@ -118,15 +119,20 @@ function installOf(root, tree) {
   return { officers: read.officers };
 }
 
-// 4b. The live files equal the tree: the contract check reads the working copy, the digest
+// 4. The live files equal the tree: the contract check reads the working copy, the digest
 // approves the tree, and this ties the two together. Refused: a working copy under LIVE_PATHS that
 // differs from the tree in bytes or mode, and any file there the index does not hold, untracked or
 // ignored. (The index tree is the tree being committed, so "not in the index" is "not in the tree".)
 function liveRefusal(root, tree) {
   const differing = workingDifferences(root, tree, LIVE_PATHS)[0];
-  if (differing !== undefined) return refuse(REASONS.liveDiffers(differing), `git restore -- ${shellWord(differing)}`);
+  if (differing !== undefined) {
+    // Staged in the repository's own index but left out of this tree: a partial commit (`git commit
+    // <path>`) while a live file has a staged change. Restoring the working copy would lose it.
+    if (stagedDifferences(root, tree, [differing]).length > 0) return refuse(REASONS.liveStagedElsewhere(differing), 'git commit');
+    return refuse(REASONS.liveDiffers(differing), `git restore -- ${shellWord(differing)}`);
+  }
   const extra = filesNotInIndex(root, LIVE_PATHS)[0];
-  if (extra !== undefined) return refuse(REASONS.liveUntracked(extra), `git add -- ${shellWord(extra)}`);
+  if (extra !== undefined) return refuse(REASONS.liveUntracked(extra), `rm -- ${shellWord(extra)}`);
   return null;
 }
 
@@ -134,11 +140,10 @@ function liveRefusal(root, tree) {
 // record of where it was given, and a digest approved anywhere is approved on every branch.
 const approved = (root, digest) => readApprovals(root).some((entry) => entry.digest === digest);
 
-// 7. The verdict's refusal, or null when it passes. Named: the tree's officers the verdict shows
+// 8. The verdict's refusal, or null when it passes; `verdict` is the copy read before the probe. Named: the tree's officers the verdict shows
 // no pass or skip for. When there are none and it still does not pass, its list is in another
 // order or holds officers the tree does not name.
-function verdictRefusal(root, { tree, base }, digest, officers) {
-  const verdict = readVerdict(root, tree, base);
+function verdictRefusal(verdict, { tree, base }, digest, officers) {
   if (verdict === null) return refuse(REASONS.noVerdict(tree, base), COMMANDS.run);
   if (verdict.digest !== digest) return refuse(REASONS.digestDiffers, COMMANDS.run);
   if (passing(verdict, officers)) return null;
@@ -148,13 +153,20 @@ function verdictRefusal(root, { tree, base }, digest, officers) {
 }
 
 /**
- * Decision 17's checks, in order, stopping at the first that decides:
- * `{ allow, reason, next }`, `next` the exact command to run ('' on an allow).
- * `tree` is the tree being committed, `base` its base (decision 7) or null
- * when the tree's officers file cannot be read (step 3 then refuses), and
- * `branch` the current branch or null for a detached HEAD. Throws what the
- * state and git helpers throw (a StateError for a damaged approvals or
- * exemptions file): the caller refuses on a throw.
+ * Decision 17's checks in their final order (after Task 6's re-review), stopping at the first that
+ * decides: `{ allow, reason, next }`, `next` the exact command to run ('' on an allow). Nothing from
+ * the repository is EXECUTED before the owner's approval of those exact bytes is established:
+ *   1 off switch, 2 exempt branch, 3 install in the tree, 4 live files equal the tree,
+ *   5 RULES.md and the digest, 6 digest approved, 7 contract 1 (checkContract1, then the probe,
+ *   the first step that runs repository code), 8 a passing verdict for this tree and base.
+ * runGate then adds 9 (the index tree unchanged) and 10 (the in-flight record, then the token).
+ * The approvals and the verdict are read into memory BEFORE the probe runs, and judged on those
+ * copies: the probe starts the repository's entry script, and nothing its process writes to the
+ * shared state may change the outcome.
+ * `tree` is the tree being committed, `base` its base (decision 7) or null when the tree's
+ * officers file cannot be read (step 3 then refuses), and `branch` the current branch or null for
+ * a detached HEAD. Throws what the state and git helpers throw (a StateError for a damaged state
+ * file): the caller refuses on a throw.
  */
 export function judge(root, { tree, base, branch }) {
   if (isOff(root)) return allow(REASONS.off);
@@ -167,14 +179,15 @@ export function judge(root, { tree, base, branch }) {
       : refuse(REASONS.noInstall(install.absent), exemptCommand(root, branch));
   }
   if (install.problem !== undefined) return refuse(REASONS.officersProblem(install.problem), COMMANDS.status);
-  const holds = contractHolds(root);
-  if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), COMMANDS.status);
   const live = liveRefusal(root, tree);
   if (live !== null) return live;
   const digest = digestOfTree(root, tree);
   if (digest.problem !== undefined) return refuse(REASONS.undigestable(digest.problem), COMMANDS.run);
   if (!approved(root, digest.digest)) return refuse(REASONS.unapproved(digest.digest), COMMANDS.approve);
-  return verdictRefusal(root, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
+  const verdict = readVerdict(root, tree, base);
+  const holds = contractHolds(root);
+  if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), COMMANDS.status);
+  return verdictRefusal(verdict, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
 }
 
 // The fixed text of a failure: the message of a StateError or a GitError, which is fixed text, and
@@ -226,7 +239,14 @@ function keepsTree(root, update, tree) {
 // update: allowed only when every branch or HEAD it moves names a commit of the recorded tree.
 // Other refs (ORIG_HEAD, AUTO_MERGE, tags, remotes) are not judged. A refusal removes the record.
 function judgeUpdate(root, pid, input) {
-  const tree = readInflight(root, pid);
+  let tree;
+  try {
+    tree = readInflight(root, pid);
+  } catch (error) {
+    // A record that is not a readable file (a directory, a dangling symlink) is never "no record".
+    removeInflight(root, pid);
+    throw error;
+  }
   if (tree === null) return refuse(REASONS.noRecord, COMMANDS.run);
   const updates = parseUpdates(input);
   const decision = updates === null
@@ -251,6 +271,9 @@ export function runGate(args, cwd, { readTree = indexTree, input } = {}) {
     }
     const root = repoRoot(cwd);
     if (root === null) return refuse(REASONS.couldNotDecide(REASONS.notARepository), COMMANDS.status);
+    // Records left by git processes that ended before their branch update (a failing commit-msg
+    // hook, an empty message, nothing to commit) are removed on every run.
+    removeStaleInflight(root);
     if (hook === REFERENCE_HOOK) return judgeUpdate(root, pid, input ?? readFileSync(0, 'utf8'));
     return judgeIndex(root, pid, readTree);
   } catch (error) {

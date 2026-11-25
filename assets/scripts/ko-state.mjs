@@ -159,7 +159,8 @@ export function readInflight(root, pid) {
 export function removeInflight(root, pid) {
   const name = inflightName(pid);
   try {
-    rmSync(join(stateDir(root), name), { force: true });
+    // Whatever is there goes: a file, a symlink (not its target) or a directory.
+    rmSync(join(stateDir(root), name), { force: true, recursive: true });
   } catch {
     throw new StateError(writeFailedMessage(name));
   }

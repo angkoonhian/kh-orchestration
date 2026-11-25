@@ -32,7 +32,11 @@ try {
     process.stderr.write(UNLOADABLE);
   } else {
     const decision = gate.runGate(process.argv.slice(2), process.cwd());
-    if (decision.allow === true) {
+    const shaped = decision !== null && typeof decision === 'object' && typeof decision.allow === 'boolean'
+      && typeof decision.reason === 'string' && typeof decision.next === 'string';
+    if (!shaped) {
+      process.stderr.write(UNEXPECTED);
+    } else if (decision.allow) {
       // Said only when nothing was checked: the off switch and an exemption.
       if (decision.reason !== gate.REASONS.allowed && decision.reason !== gate.REASONS.updateAllowed) process.stderr.write(`kh-orchestration: ${decision.reason}\n`);
       process.stdout.write(`${ALLOWED_TOKEN}\n`);

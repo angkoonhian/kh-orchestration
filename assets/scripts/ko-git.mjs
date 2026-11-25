@@ -22,9 +22,11 @@ const NO_BASE = 'none';
 const SPAWN_FAILED_STATUS = 127;
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
-function exec(root, argv, { input, readOnly, binary } = {}) {
+function exec(root, argv, { input, readOnly, binary, ownIndex } = {}) {
   // Replace refs are off: a ref in the repository must not change what an object reads as.
   const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', GIT_NO_REPLACE_OBJECTS: '1' };
+  // The repository's own index, not the one a hook names (a partial commit's temporary index).
+  if (ownIndex) delete env.GIT_INDEX_FILE;
   if (readOnly) env.GIT_OPTIONAL_LOCKS = '0';
   const result = spawnSync('git', argv, {
     cwd: root,
@@ -143,6 +145,13 @@ export function treeOfCommitId(root, id) {
 export function workingDifferences(root, tree, pathspecs) {
   const argv = ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--end-of-options', tree, '--', ...pathspecs];
   return nulSeparated(mustSucceed(git(root, argv), 'compare the working tree'));
+}
+
+// The paths under `pathspecs` where the repository's own index (not a partial commit's temporary
+// one) differs from `tree`: what is staged and left out of the commit being made.
+export function stagedDifferences(root, tree, pathspecs) {
+  const argv = ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--end-of-options', tree, '--', ...pathspecs];
+  return nulSeparated(mustSucceed(exec(root, argv, { readOnly: true, ownIndex: true }), 'compare the index'));
 }
 
 // The files under `pathspecs` in the working directory that the index does not hold, ignored

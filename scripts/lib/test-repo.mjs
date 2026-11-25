@@ -25,7 +25,7 @@ export const spawnFailedMessage = (file) => `${file} could not be started.`;
 const DROPPED = /^(GIT_AUTHOR_|GIT_COMMITTER_|GIT_CONFIG_KEY_|GIT_CONFIG_VALUE_)/;
 const SCRUBBED = [
   'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
-  'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_EDITOR',
+  'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_EDITOR', 'GIT_ASKPASS', 'GIT_TERMINAL_PROMPT',
 ];
 
 function scrub(env) {
@@ -40,7 +40,7 @@ function scrub(env) {
 // no injected git configuration, and no prompt. Tests that spawn an installed
 // command directly, not through repo.git, pass this as its env.
 export function testEnv() {
-  return scrub({ ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+  return { ...scrub({ ...process.env }), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
 }
 
 // Installed modules take the caller's git environment (a hook's GIT_DIR and
@@ -144,14 +144,15 @@ function hookScript(hook, node = process.execPath) {
   }
   return [
     ...header,
-    'case "$0" in */hooks/reference-transaction) d=${0%/hooks/reference-transaction} ;; *) d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1 ;; esac',
+    'd=${0%/hooks/reference-transaction}',
+    '[ "$d" != "$0" ] && [ -d "$d/kh-orchestration" ] || d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1',
     'f="$d/kh-orchestration/inflight-$PPID.json"',
-    '[ -e "$f" ] || exit 0',
+    '[ -e "$f" ] || [ -L "$f" ] || exit 0',
     'case "$1" in',
     `prepared) out=$(${shQuote(node)} "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
     `  ${REFUSED_LINE}`,
     '  exit 1 ;;',
-    'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -f "$f" ;; esac; done ;;',
+    'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -rf "$f" ;; esac; done ;;',
     'esac',
     'exit 0',
     '',
