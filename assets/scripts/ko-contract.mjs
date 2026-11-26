@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { checkContract1, lfSha256, probeContract1 } from './verify-contract-1.mjs';
 
 export const EXTENSION_ID = 'kh-orchestration';
-const MODULE = '.claude/kh-orchestration/scripts/extension.mjs';
+export const MODULE = '.claude/kh-orchestration/scripts/extension.mjs';
 // kh-harness refuses a module over 1 MiB, so nothing larger is read.
 const MAX_MODULE_BYTES = 1024 * 1024;
 // Decision 2's stamp line. The version is the extension's own: apply (Task 9) writes the entry
@@ -63,8 +63,14 @@ function readModule(root) {
  * only value under which a gate holds. Throws fixed text when the module
  * cannot be read or carries no stamp line.
  */
-export function ownEntry(root) {
-  const bytes = readModule(root);
+export const ownEntry = (root) => entryOf(readModule(root));
+
+/**
+ * The entry for an extension module of `bytes`: the version of its stamp line, its hash by the
+ * contract's rule, `onFailure: "block"`. Throws fixed text when it carries no stamp line. The
+ * installer builds the entry it writes from the plugin's shipped module with it.
+ */
+export function entryOf(bytes) {
   const stamp = bytes.toString('utf8').match(STAMP);
   if (stamp === null) throw new ContractError(noStampMessage);
   return { id: EXTENSION_ID, version: stamp[1], module: MODULE, sha256: lfSha256(bytes), onFailure: 'block' };

@@ -509,8 +509,7 @@ function binProblems(root, bin) {
 }
 
 // The effective core.hooksPath across every level, `{ value, scope }`, or null when it is not set.
-// apply (Task 9) refuses on it with the same unset command.
-export function hooksPathOf(root) {
+function hooksPathOf(root) {
   const result = git(root, ['config', '--show-scope', '--get', 'core.hooksPath']);
   if (result.status === 1) return null;
   if (result.status !== 0) throw new GitError(gitFailedMessage('read the git configuration'));
@@ -520,7 +519,7 @@ export function hooksPathOf(root) {
 }
 
 const UNSET_BY_SCOPE = { local: '--local', global: '--global', system: '--system', worktree: '--worktree' };
-export const hooksPathNext = (scope) => (Object.hasOwn(UNSET_BY_SCOPE, scope) ? `git config ${UNSET_BY_SCOPE[scope]} --unset core.hooksPath` : 'git config --show-origin --get core.hooksPath');
+const hooksPathNext = (scope) => (Object.hasOwn(UNSET_BY_SCOPE, scope) ? `git config ${UNSET_BY_SCOPE[scope]} --unset core.hooksPath` : 'git config --show-origin --get core.hooksPath');
 
 // `{ version, supported }` of the git that runs in `cwd`; version null when it cannot be read.
 export function gitVersion(cwd) {

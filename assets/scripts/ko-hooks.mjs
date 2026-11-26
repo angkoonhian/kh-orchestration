@@ -34,7 +34,9 @@ const HOOK_COMMENT = [
   '# GIT_ALTERNATE_OBJECT_DIRECTORIES, which name the repository git itself uses when a caller sets',
   '# them. Nothing else reaches node: no NODE_*, no LD_*, no BASH_*.',
 ];
-const REFUSED_LINE = 'echo "kh-orchestration: the commit gate did not allow this commit." >&2';
+// The line every hook prints when the gate did not allow; the installer's self-test expects it.
+export const REFUSED_TEXT = 'kh-orchestration: the commit gate did not allow this commit.';
+const REFUSED_LINE = `echo "${REFUSED_TEXT}" >&2`;
 const gateAt = (dir) => `"$${dir}/kh-orchestration/bin/gate.mjs"`;
 
 // A word sh reads as itself, in single quotes.

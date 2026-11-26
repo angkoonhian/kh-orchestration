@@ -59,22 +59,22 @@ export function listing(dir) {
 export const everything = (root) => ({ tree: listing(root), common: listing(join(root, '.git')) });
 export const porcelain = (root) => spawnSync('git', ['status', '--porcelain', '-uall'], { cwd: root, env: testEnv(), encoding: 'utf8' }).stdout;
 
-// Leaves an install as an older kit (0.0.9) would have: every script stamped 0.0.9 with other
-// bytes and recorded as written so, and the extension entry naming that module, changed in the
-// extensions file where it stands.
-export function ageInstall(root) {
+// Leaves an install as another kit (`version`, by default an older 0.0.9) would have: every
+// script stamped with that version and other bytes and recorded as written so, and the extension
+// entry naming that module, changed in the extensions file where it stands.
+export function ageInstall(root, version = '0.0.9') {
   const manifest = readManifest(root).manifest;
   for (const name of SCRIPT_NAMES) {
     const path = join(root, SCRIPTS_DIR, name);
-    const older = readFileSync(path, 'utf8').replace(`kh-orchestration ${KIT_VERSION}.`, 'kh-orchestration 0.0.9.');
-    writeFileSync(path, `${older}// 0.0.9\n`);
+    const older = readFileSync(path, 'utf8').replace(`kh-orchestration ${KIT_VERSION}.`, `kh-orchestration ${version}.`);
+    writeFileSync(path, `${older}// ${version}\n`);
     manifest.files.find((file) => file.path === `${SCRIPTS_DIR}/${name}`).sha256 = sha256(readFileSync(path));
   }
-  const oldEntry = { ...entryOf(), version: '0.0.9', sha256: lfSha256(readFileSync(join(root, SCRIPTS_DIR, 'extension.mjs'))) };
+  const oldEntry = { ...entryOf(), version, sha256: lfSha256(readFileSync(join(root, SCRIPTS_DIR, 'extension.mjs'))) };
   const extensions = join(root, EXTENSIONS_PATH);
-  writeFileSync(extensions, readFileSync(extensions, 'utf8').replace(entryOf().sha256, oldEntry.sha256).replace(new RegExp(`("version":\\s*)"${KIT_VERSION.replaceAll('.', '\\.')}"`), '$1"0.0.9"'));
+  writeFileSync(extensions, readFileSync(extensions, 'utf8').replace(entryOf().sha256, oldEntry.sha256).replace(new RegExp(`("version":\\s*)"${KIT_VERSION.replaceAll('.', '\\.')}"`), `$1"${version}"`));
   manifest.extensionEntry.sha256 = oldEntry.sha256;
-  manifest.kitVersion = '0.0.9';
+  manifest.kitVersion = version;
   writeFileSync(join(root, MANIFEST_PATH), `${JSON.stringify(manifest, null, 2)}\n`);
   return oldEntry;
 }

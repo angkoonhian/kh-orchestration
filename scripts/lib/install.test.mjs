@@ -5,20 +5,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { KIT_VERSION, makeRepo, testEnv } from './test-repo.mjs';
-import { ageInstall, entryOf, everything, fresh, hooksDir, listing, read, repos, scratch, sha256 } from './install-fixture.mjs';
+import { ageInstall, entryOf, everything, fresh, hooksDir, read, repos, scratch, sha256 } from './install-fixture.mjs';
 import {
   ATTRIBUTES_LINE, EXTENSIONS_PATH, OFFICERS_PATH, SCRIPTS_DIR, SCRIPT_NAMES, TEXT, applyCommand, applyPlan, applyUninstall, coverageOf, envPath, khHarnessApply,
-  plan, shippedScripts, uninstallPlan,
+  plan, shippedScripts, stampScript, uninstallPlan,
 } from './install.mjs';
 import { MANIFEST_PATH, readManifest } from './manifest.mjs';
 import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
 import { TEXT as KO_TEXT } from '../../assets/scripts/ko-cli.mjs';
-import { checkContract1, lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
+import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { refreshBin, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { shellWord } from '../../assets/scripts/extension.mjs';
@@ -122,12 +121,12 @@ test('plan refuses a .claude that is a link, an extensions file it cannot read, 
   assert.equal(TEXT.extensionsFull, '.claude/kh-harness/extensions.json lists 8 extensions already, the most kh-harness runs, and kh-orchestration never drops another plugin\'s entry to make room. Remove a plugin that registered one first.');
 });
 
-test('plan refuses an effective core.hooksPath at the local, global and worktree level, naming the level and the unset command, and changes no configuration', () => {
+const unsetIn = (file) => `git config --file ${shellWord(file)} --unset core.hooksPath`;
+test('plan refuses an effective core.hooksPath at the local, global and worktree level and through an include, naming the file it is set in and an unset command for that file, and changes no configuration', () => {
   const repo = fresh();
+  const local = join(repo.root, '.git', 'config');
   assert.equal(repo.git('config', '--local', 'core.hooksPath', '/tmp/hooks-elsewhere').status, 0);
-  assert.deepEqual(refusalsOf(repo.root), [{
-    text: TEXT.hooksPath('/tmp/hooks-elsewhere', 'local'), next: `git -C ${shellWord(repo.root)} config --local --unset core.hooksPath`,
-  }]);
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.hooksPath('/tmp/hooks-elsewhere', 'local', local), next: unsetIn(local) }]);
   assert.equal(repo.git('config', '--local', 'core.hooksPath').stdout, '/tmp/hooks-elsewhere\n');
   assert.equal(repo.git('config', '--local', '--unset', 'core.hooksPath').status, 0);
 
@@ -138,7 +137,7 @@ test('plan refuses an effective core.hooksPath at the local, global and worktree
   process.env.HOME = home;
   delete process.env.GIT_CONFIG_GLOBAL;
   try {
-    assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.hooksPath('/dev/null', 'global'), next: `git -C ${shellWord(repo.root)} config --global --unset core.hooksPath` }]);
+    assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.hooksPath('/dev/null', 'global', join(home, '.gitconfig')), next: unsetIn(join(home, '.gitconfig')) }]);
   } finally {
     process.env.HOME = saved.HOME;
     if (saved.GIT_CONFIG_GLOBAL !== undefined) process.env.GIT_CONFIG_GLOBAL = saved.GIT_CONFIG_GLOBAL;
@@ -147,9 +146,18 @@ test('plan refuses an effective core.hooksPath at the local, global and worktree
   const worktree = repo.addWorktree('side');
   assert.equal(repo.git('config', 'extensions.worktreeConfig', 'true').status, 0);
   assert.equal(spawnSync('git', ['config', '--worktree', 'core.hooksPath', '.hooks'], { cwd: worktree, env: testEnv() }).status, 0);
-  assert.deepEqual(refusalsOf(worktree), [{ text: TEXT.hooksPath('.hooks', 'worktree'), next: `git -C ${shellWord(worktree)} config --worktree --unset core.hooksPath` }]);
+  const worktreeConfig = join(repo.root, '.git', 'worktrees', 'worktree-side', 'config.worktree');
+  assert.deepEqual(refusalsOf(worktree), [{ text: TEXT.hooksPath('.hooks', 'worktree', worktreeConfig), next: unsetIn(worktreeConfig) }]);
   assert.deepEqual(refusalsOf(repo.root), [], 'the main worktree has no core.hooksPath of its own');
-  assert.ok(TEXT.hooksPath('/x', 'local').startsWith(KO_TEXT.hooksPath('/x', 'local')));
+
+  // Set in a file the local configuration includes: that file is named, and unset there.
+  const included = join(scratch.at(-1), 'included.cfg');
+  writeFileSync(included, '[core]\n\thooksPath = /x\n');
+  assert.equal(repo.git('config', '--local', 'include.path', included).status, 0);
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.hooksPath('/x', 'local', included), next: unsetIn(included) }]);
+  assert.equal(spawnSync('/bin/sh', ['-c', unsetIn(included)], { env: testEnv() }).status, 0, 'the command works');
+  assert.deepEqual(refusalsOf(repo.root), []);
+  assert.equal(TEXT.hooksPath('/x', 'local', '/f'), `${KO_TEXT.hooksPath('/x', 'local')} It is set in /f. kh-orchestration changes no configuration of yours: unset it, then run apply again.`);
 });
 
 test('plan refuses a git older than 2.30, a .gitattributes that is not a file, and a /bin/sh that does not accept -p', () => {
@@ -577,4 +585,31 @@ test('bin/ is not replaced when the approved tree is gone, and apply says how to
   rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
   assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.approvedTreeGone(gone), next: TEXT.askOwner(TEXT.startAgain(repo.root)) }]);
   assert.equal(existsSync(join(stateDir(repo.root), 'bin')), false);
+});
+
+test('an install of a newer kit is a downgrade: refused unless asked for with --downgrade, and then labelled one (after Task 9\'s review)', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  ageInstall(repo.root, '9.9.9');
+  assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.downgrade('9.9.9'), next: TEXT.askOwner(`${applyCommand(repo.root)} --downgrade`) }]);
+  const planned = plan(repo.root, { downgrade: true });
+  assert.deepEqual(planned.refusals, []);
+  assert.deepEqual(planned.actions.filter((action) => action.kind === 'file').map((action) => action.detail), SCRIPT_NAMES.map((name) => TEXT.downgradeScript(`${SCRIPTS_DIR}/${name}`, '9.9.9')));
+  assert.equal(TEXT.downgrade('9.9.9'), `The install here is kh-orchestration 9.9.9, newer than this plugin's ${KIT_VERSION}: applying would replace it with an older kit. Run apply from kh-orchestration 9.9.9 or later, or give --downgrade to mean it.`);
+});
+
+test('a version bump stamps every script once: a file already stamped for another version has its stamp line replaced, not doubled (after Task 9\'s review)', () => {
+  const verifier = readFileSync(new URL('../../assets/scripts/verify-contract-1.mjs', import.meta.url));
+  const body = verifier.toString('utf8').split('\n').slice(1).join('\n');
+  assert.equal(stampScript(verifier, '9.9.9').toString('utf8'), `// Generated by kh-orchestration 9.9.9. Do not edit.\n${body}`);
+  const plain = Buffer.from('export const x = 1;\n');
+  assert.equal(stampScript(plain, '9.9.9').toString('utf8'), '// Generated by kh-orchestration 9.9.9. Do not edit.\nexport const x = 1;\n');
+});
+
+test('uninstall says a kept hook still starts the gate, which refuses every commit, and how to remove it; a dry-run rewrite says edits are discarded', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const hook = join(hooksDir(repo.root), 'pre-commit');
+  assert.equal(TEXT.keptHook(hook), `kept: the git hook ${hook} was changed since kh-orchestration wrote it, and it still starts the commit gate, which now refuses every commit: remove it (rm -- ${shellWord(hook)}) or take kh-orchestration's lines out of it`);
+  assert.ok(TEXT.rewriteHook(hook).endsWith('; any edit made in it is discarded)'));
 });

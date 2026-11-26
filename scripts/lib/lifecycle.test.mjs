@@ -96,7 +96,7 @@ function followSteps(root, stdout) {
 }
 
 test('the commands print their usage and refuse what they do not take, with exit 2', () => {
-  for (const [name, flags] of [['apply', '<repository> [--yes]'], ['detect', '<repository> [--json]'], ['uninstall', '<repository> [--yes] [--state]']]) {
+  for (const [name, flags] of [['apply', '<repository> [--yes] [--downgrade]'], ['detect', '<repository> [--json]'], ['uninstall', '<repository> [--yes] [--state]']]) {
     const usage = `usage: node ${command(name)} ${flags}\n`;
     assert.deepEqual([run(name, ['--help']).status, run(name, ['--help']).stdout], [0, usage]);
     assert.deepEqual([run(name, []).status, run(name, []).stderr], [2, `kh-orchestration: ${TEXT.missingRepository}\n${usage}`]);
@@ -328,6 +328,8 @@ test('detect reports no install, a fresh install, and each broken state, and --j
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ko-nowhere-')));
   scratch.push(dir);
   assert.deepEqual([run('detect', [dir]).status, run('detect', [dir]).stderr], [1, `kh-orchestration: ${TEXT.notARepository(dir)}\nNext: git -C ${dir} init\n`]);
+  const nowhere = run('detect', [dir, '--json']);
+  assert.deepEqual([nowhere.status, JSON.parse(nowhere.stdout), nowhere.stderr], [1, { schema: 1, root: null, refusal: { text: TEXT.notARepository(dir), next: `git -C ${dir} init` } }, '']);
 });
 
 test('uninstall restores the repository exactly, keeps the shared state without --state and says where, and removes it with --state', () => {

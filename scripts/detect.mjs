@@ -14,7 +14,11 @@ function main(argv) {
   }
   if (args.usage !== undefined) return usageError('detect', args.usage);
   const report = detect(args.repo);
-  if (report.refusal !== undefined) return refuse([report.refusal]);
+  if (report.refusal !== undefined) {
+    if (!args.flags.has('--json')) return refuse([report.refusal]);
+    process.stdout.write(`${JSON.stringify({ schema: 1, root: null, refusal: report.refusal }, null, 2)}\n`);
+    return 1;
+  }
   if (args.flags.has('--json')) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else print(detectLines(report));
   return 0;
