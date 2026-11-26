@@ -56,7 +56,10 @@
 //   edit tools are guarded there, and the digest refuses the commit.
 // - environment variables that git or a shell runs as commands (GIT_EDITOR,
 //   GIT_SSH_COMMAND, BASH_ENV, PROMPT_COMMAND...) when exported earlier rather
-//   than set in the command's own assignments, which are scanned.
+//   than set in the command's own assignments, which are scanned; and a
+//   variable that steers git or its hooks (PATH, HOME, GIT_EXEC_PATH, ...)
+//   exported in an earlier command line, or inside a script fed to a shell on
+//   its standard input. One exported in the same line as git is blocked.
 // - a glob or a search whose output becomes another command's words (`chmod a-x
 //   $(find . -name pre-commit)`, `find . -name pre-commit | xargs chmod a-x`,
 //   `.g*/hooks`), and a ko.mjs name found by a search or a substitution.
@@ -230,7 +233,8 @@ export const MESSAGES = Object.freeze({
   hiddenOption: 'A flag of git commit, merge or pull is given through a variable or a substitution, which could turn the hooks off, so it is blocked. Write the flags out literally.',
   commitTree: `git commit-tree makes a commit without the commit gate and is not run from a session. Run ${RUN}, then git commit.`,
   gitConfig: 'Git configuration that redirects hooks or names a command git runs (core.hooksPath, include, alias, mergeOptions, filters, fsmonitor, diff and merge drivers, pagers, editors, gpg and ssh programs) is not changed from a session. The owner changes it; git config --get reads it.',
-  gitEnv: 'GIT_CONFIG_*, HOME, XDG_CONFIG_HOME, PATH, GIT_EXEC_PATH (or --exec-path), NODE_*, LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT and DYLD_* are not set for git from a session: they change what git and its hooks run. Run the git command without them.',
+  exportedEnv: 'This line runs git and also sets a variable that steers git or its hooks (NODE_*, LD_*, DYLD_*, GIT_CONFIG_*, GIT_EXEC_PATH, HOME, XDG_CONFIG_HOME, PATH, TMOUT, PS4, SHELLOPTS, BASH_ENV, ENV, BASH_FUNC_*), exports a function, or defines git as one. Run git in a line of its own.',
+  gitEnv: 'GIT_CONFIG_*, GIT_EXEC_PATH (or --exec-path), HOME, XDG_CONFIG_HOME, PATH, NODE_*, LD_*, DYLD_*, TMOUT, SHELLOPTS, PS4, BASH_ENV, ENV and BASH_FUNC_* are not set for git from a session: they change what git and its hooks run. Run the git command without them.',
   xargs: 'A git command or ko.mjs run through xargs takes words the hook cannot see, so it is blocked. Run the command directly, with its subcommand and options written out.',
   guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
@@ -304,6 +308,7 @@ function addExpansion(word, raw, quoted = false) {
 }
 
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
+const ENV_ASSIGNMENT = /^[^=-][^=]*=/;
 function isAssignment(word) {
   const match = ASSIGNMENT.exec(word.text);
   return match !== null && match[0].length <= word.plain;
@@ -350,6 +355,8 @@ function parseList(p, nested) {
       command.assignments.push(word);
     } else {
       command.words.push(word);
+      const before = command.words[command.words.length - 2];
+      if (before !== undefined && isKeyword(before, 'function') && command.words.slice(0, -2).every((earlier) => !earlier.quoted && RESERVED.has(earlier.text))) p.functions.push(word.text);
       if (command.words.length === 3 && isKeyword(command.words[0], 'case') && isKeyword(word, 'in')) {
         command = newCommand(null, false);
         cases.push('pattern');
@@ -425,7 +432,8 @@ function parseList(p, nested) {
       nestedList(p);
       addExpansion(word, src.slice(start, p.pos));
     } else if (char === '(' && word !== null && word.plain === word.text.length && FUNCTION_NAME.test(word.text) && /^\(\s*\)/.test(src.slice(p.pos, p.pos + 64))) {
-      // `name()`: the function's name goes; its body follows as commands.
+      // `name()`: the function's name goes to p.functions; its body follows as commands.
+      p.functions.push(word.text);
       word = null;
       p.pos = src.indexOf(')', p.pos) + 1;
     } else if (char === '(') {
@@ -729,8 +737,10 @@ function readHeredocs(p, heredocs) {
 
 // The commands of a script, each with word objects, or null when a shell would not accept it
 // or it nests deeper than MAX_DEPTH.
-function parseScript(src, depth) {
-  const p = { src, pos: 0, depth, out: [] };
+// The simple commands of `src`, or null when it cannot be split. The name of every function it
+// defines (`name()`, `function name`) is added to `functions`.
+function parseScript(src, depth, functions = []) {
+  const p = { src, pos: 0, depth, out: [], functions };
   try {
     parseList(p, false);
   } catch (error) {
@@ -1003,7 +1013,9 @@ function readEnv(words, from) {
       i++;
       continue;
     }
-    if (ASSIGNMENT.test(text)) {
+    // env(1) takes any NAME=VALUE whose name is not empty and holds no =, not only a shell
+    // identifier: `env 'BASH_FUNC_git%%=() { …; }' git` sets an exported function.
+    if (ENV_ASSIGNMENT.test(text)) {
       result.assignments.push(word);
       i++;
       continue;
@@ -1440,9 +1452,15 @@ const XARGS_HIDDEN = new Set(['commit', 'merge', 'pull', 'config', 'commit-tree'
 // Environment that changes git's configuration or programs: on any command for GIT_CONFIG*,
 // on a git command for the rest.
 const GIT_CONFIG_ENV = /^GIT_CONFIG[A-Za-z0-9_]*\+?=/i;
-// PATH: a git command's PATH decides which programs its hooks start. NODE_*, LD_PRELOAD,
-// LD_LIBRARY_PATH, LD_AUDIT and DYLD_*: they load code into the hooks' processes, Node among them.
-const GIT_ENV = /^(HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH|PATH|NODE_[A-Za-z0-9_]*|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_[A-Za-z0-9_]*)\+?=/i;
+// PATH: a git command's PATH decides which programs its hooks start. NODE_*, LD_* and DYLD_*:
+// they load code into the hooks' processes, Node among them.
+// TMOUT, SHELLOPTS, PS4, BASH_ENV, ENV and BASH_FUNC_*: they steer the shell a hook runs in.
+const GUARDED_ENV = '(?:HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH|PATH|NODE_[A-Za-z0-9_]*|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|TMOUT|SHELLOPTS|PS4|BASH_ENV|ENV|BASH_FUNC_[^=]*)';
+const GIT_ENV = new RegExp(`^${GUARDED_ENV}\\+?=`, 'i');
+// A variable set or exported elsewhere in a line that runs git reaches git's hooks just as well
+// (decision 15, addition after Task 6's fourth re-review): these and GIT_CONFIG_*.
+const EXPORTED_GUARD = new RegExp(`^(?:${GUARDED_ENV}|GIT_CONFIG[A-Za-z0-9_]*)$`, 'i');
+const SETS_EXPORTS = new Set(['export', 'declare', 'typeset', 'readonly', 'local']);
 
 // The git invocation a resolved command is, or null: git by its basename, or git-<sub> read as
 // git <sub>. { sub, rest, configs, execPath }: the subcommand, the words after it, the k=v of
@@ -1468,7 +1486,7 @@ function gitInvocation(resolved) {
 // A configuration key that redirects or turns off hooks.
 // Keys that name a command git runs (decision 15, addition after Task 6's third re-review): a clean
 // filter or a monitor runs inside the gate's own git calls and can blind what it reads.
-const COMMAND_KEY = /^(?:core\.(?:fsmonitor|sshcommand|editor|pager)|filter\..+|diff\.external|diff\..+\.(?:command|textconv)|merge\..+\.driver|sequence\.editor|pager\..+|gpg\.program|gpg\..+\.program)$/;
+const COMMAND_KEY = /^(?:core\.(?:fsmonitor|sshcommand|editor|pager)|filter\..+\.(?:clean|smudge|process)|diff\.external|diff\..+\.(?:command|textconv)|merge\..+\.driver|sequence\.editor|pager\..+|gpg\.program|gpg\..+\.program)$/;
 function hookKey(key) {
   const lower = key.toLowerCase();
   return lower === 'core.hookspath' || lower.startsWith('include.') || lower.startsWith('includeif.') || lower.startsWith('alias.') || /^branch\..*\.mergeoptions$/.test(lower)
@@ -1484,12 +1502,18 @@ const CONFIG_SECTIONS = new Set(['--rename-section', '--remove-section', 'rename
 const CONFIG_ACTIONS = new Set(['get', 'set', 'unset', 'list', 'edit', 'rename-section', 'remove-section', 'get-color', 'get-colorbool']);
 
 // git config: a write (old or new syntax) of a hook key, a section change of a hook section, or --edit.
+// The classic form stops reading options at its first operand (a value may begin with -). In the
+// subcommand form (`git config set --local <key> <value>`) options stand anywhere after the
+// subcommand, so they are skipped wherever they are to find the key.
 function configChangesHooks(rest) {
   const options = [];
   const operands = [];
+  let ended = false;
   for (let i = 0; i < rest.length; i++) {
     const text = rest[i].text;
-    if (text.startsWith('-') && operands.length === 0) {
+    const subcommandForm = operands.length > 0 && CONFIG_ACTIONS.has(operands[0]);
+    if (!ended && text === '--') ended = true;
+    else if (!ended && text.startsWith('-') && (operands.length === 0 || subcommandForm)) {
       options.push(text.split('=', 1)[0]);
       if (CONFIG_VALUED.has(text)) i++;
     } else operands.push(text);
@@ -1904,7 +1928,7 @@ function judgeUnseen(command, resolved, values, context, depth) {
 // A script given on a command line: parsed and judged as the command's own; one that cannot
 // be split is scanned.
 function judgeScript(text, context, depth) {
-  const commands = depth + 1 > MAX_DEPTH ? null : parseScript(text, depth + 1);
+  const commands = depth + 1 > MAX_DEPTH ? null : parseScript(text, depth + 1, context.line.functions);
   if (commands === null) scanned(MESSAGES.unsplittable, text);
   else judgeCommands(commands, context, depth + 1);
 }
@@ -1912,6 +1936,7 @@ function judgeScript(text, context, depth) {
 function judgeCommand(command, context, depth) {
   const resolved = resolveCommand(command);
   const git = gitInvocation(resolved);
+  noteLineEnvironment(command, resolved, git, context.line);
   const outputReadOnly = command.pipedTo === null || pipelineReadsOnly(command.pipedTo);
   const values = textValues(resolved, git, outputReadOnly, command.substituted);
   judgeGuardedArea(command, resolved, git, values, context);
@@ -1926,27 +1951,49 @@ function judgeCommand(command, context, depth) {
 
 // A git word after the command word, behind a wrapper the tables above do not know (ssh,
 // strace, npx, a coproc's name, sh -c '"$@"' _ git ...), is judged as a command word too.
-function judgeInnerCommand(resolved, values) {
+function innerGit(resolved, values) {
   const at = resolved.words.findIndex((word, index) => index > resolved.index && !values.has(word) && !word.expands
     && (commandName(word) === 'git' || commandName(word).startsWith('git-')));
-  if (at === -1) return;
+  if (at === -1) return null;
   const inner = { ...resolved, index: at, word: resolved.words[at], name: commandName(resolved.words[at]) };
   const git = gitInvocation(inner);
-  if (git !== null) judgeGit(inner, git, textValues(inner, git, true));
+  return git === null ? null : { inner, git };
+}
+
+function judgeInnerCommand(resolved, values) {
+  const found = innerGit(resolved, values);
+  if (found !== null) judgeGit(found.inner, found.git, textValues(found.inner, found.git, true));
 }
 
 function judgeCommands(commands, context, depth) {
   for (const command of commands) judgeCommand(command, context, depth);
 }
 
+// The line as a whole (decision 15, addition after Task 6's fourth re-review), across every
+// script in it (a substitution, a function body, a shell's -c script): whether it runs git, and
+// whether it sets a guarded variable (as an assignment of its own, before any command, through
+// env, or through export/declare/typeset/readonly/local) or exports a function. Each reaches a git
+// command later in the line and its hooks; judgeBash refuses the two together, as it does a line
+// that runs git and defines a function named git.
+const nameOf = (word) => word.text.split(/\+?=/, 1)[0];
+function noteLineEnvironment(command, resolved, git, line) {
+  if (git !== null || innerGit(resolved, NO_VALUES) !== null) line.runsGit = true;
+  if ([...command.assignments, ...resolved.envAssignments].some((word) => EXPORTED_GUARD.test(nameOf(word)))) line.steers = true;
+  if (!SETS_EXPORTS.has(resolved.name)) return;
+  const operands = resolved.words.slice(resolved.index + 1);
+  if (operands.some((word) => /^-[a-zA-Z]*f/.test(word.text) || (!word.text.startsWith('-') && EXPORTED_GUARD.test(nameOf(word))))) line.steers = true;
+}
+
 function judgeBash(payload) {
   const command = payload.tool_input?.command;
   if (typeof command !== 'string') refuse(MESSAGES.noCommand);
   if (command.length > MAX_COMMAND_LENGTH) refuse(MESSAGES.tooLong);
-  const context = { command, ...sessionDirs(payload), gitDirTexts: undefined, inGitDir: undefined };
-  const commands = parseScript(command, 0);
+  const line = { runsGit: false, steers: false, functions: [] };
+  const context = { command, ...sessionDirs(payload), gitDirTexts: undefined, inGitDir: undefined, line };
+  const commands = parseScript(command, 0, line.functions);
   if (commands === null) scanned(MESSAGES.unsplittable, command);
   else judgeCommands(commands, context, 0);
+  if (line.runsGit && (line.steers || line.functions.includes('git'))) refuse(MESSAGES.exportedEnv);
 }
 
 // ---------------------------------------------------------------------------
