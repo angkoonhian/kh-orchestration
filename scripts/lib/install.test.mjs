@@ -12,7 +12,7 @@ import { KIT_VERSION, makeRepo, testEnv } from './test-repo.mjs';
 import { ageInstall, entryOf, everything, fresh, hooksDir, read, repos, scratch, sha256 } from './install-fixture.mjs';
 import {
   ATTRIBUTES_LINE, EXTENSIONS_PATH, OFFICERS_PATH, SCRIPTS_DIR, SCRIPT_NAMES, TEXT, applyCommand, applyPlan, applyUninstall, coverageOf, envPath, khHarnessApply,
-  plan, shippedScripts, stampScript, uninstallPlan,
+  detect, plan, shippedScripts, stampScript, uninstallPlan,
 } from './install.mjs';
 import { MANIFEST_PATH, readManifest } from './manifest.mjs';
 import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
@@ -21,6 +21,8 @@ import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { refreshBin, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { shellWord } from '../../assets/scripts/extension.mjs';
+import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
+import { pinTree } from '../../assets/scripts/ko-git.mjs';
 
 const OTHER = { id: 'other-plugin', version: '2.0.0', module: '.claude/other/ext.mjs', sha256: 'a'.repeat(64), onFailure: 'block' };
 const refusalsOf = (dir) => plan(dir).refusals;
@@ -577,14 +579,97 @@ test('a missing or damaged bin/ is restored from the last approved tree, never f
   }
 });
 
-test('bin/ is not replaced when the approved tree is gone, and apply says how to start again (after Task 9\'s review)', () => {
+const fromPlugin = (root) => TEXT.askOwner(`${applyCommand(root)} --bin-from-plugin`);
+const approval = (digest, tree) => ({ digests: [{ digest, ...(tree === undefined ? {} : { tree }), approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }] });
+
+// An install approved from its staged tree, which is then never committed: an unprotected file is
+// added, so HEAD's tree has the same digest but another id, and a prune removes the approved one.
+function approvedThenPruned() {
   const repo = fresh();
   applyPlan(repo.root, plan(repo.root));
-  const gone = 'f'.repeat(40);
-  writeState(repo.root, 'approvals.json', { digests: [{ digest: 'a'.repeat(64), tree: gone, approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }] });
-  rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
-  assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.approvedTreeGone(gone), next: TEXT.askOwner(TEXT.startAgain(repo.root)) }]);
-  assert.equal(existsSync(join(stateDir(repo.root), 'bin')), false);
+  assert.equal(repo.git('add', '-A').status, 0);
+  const tree = repo.git('write-tree').stdout.trim();
+  const { digest } = digestOfTree(repo.root, tree);
+  writeState(repo.root, 'approvals.json', approval(digest, tree));
+  refreshBin(repo.root, tree);
+  repo.write('notes.txt', 'n\n');
+  assert.equal(repo.git('add', 'notes.txt').status, 0);
+  assert.equal(repo.git('commit', '-q', '--no-verify', '-m', 'install').status, 0);
+  assert.equal(repo.git('reflog', 'expire', '--expire=now', '--all').status, 0);
+  assert.equal(repo.git('prune', '--expire=now').status, 0);
+  assert.notEqual(repo.git('cat-file', '-t', tree).status, 0, 'fixture: the approved tree is pruned');
+  return { repo, digest, bin: join(stateDir(repo.root), 'bin') };
+}
+
+test('a bin/ whose approved tree was pruned is restored from HEAD\'s tree, then from the base branch\'s, when its protected files have the approved digest (after Task 9\'s re-review)', () => {
+  const { repo, bin } = approvedThenPruned();
+  rmSync(bin, { recursive: true });
+  const head = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.refusals, []);
+  assert.equal(planned.actions[0].kind, 'state-copy', 'bin/ is restored before anything else is written');
+  assert.equal(planned.actions[0].detail, TEXT.restoreBinFromHead(bin, head));
+  assert.equal(applyPlan(repo.root, planned).refusal, null);
+  assert.ok(binMatchesTree(repo, bin, head));
+
+  // On a branch whose own protected files changed, the base branch's tree is the one that matches.
+  const main = head;
+  assert.equal(repo.git('checkout', '-q', '-b', 'side').status, 0);
+  repo.write(OFFICERS_PATH, read(repo.root, OFFICERS_PATH).replace('"protected": []', '"protected": ["notes.txt"]'));
+  assert.equal(repo.git('commit', '-q', '--no-verify', '-am', 'side').status, 0);
+  rmSync(bin, { recursive: true });
+  assert.deepEqual(plan(repo.root).actions.filter((action) => action.kind === 'state-copy').map((action) => action.detail), [TEXT.restoreBinFromBase(bin, 'main', main)]);
+});
+
+test('with no reachable tree of the approved digest, or an approved copy that does not load, apply refuses before writing and names --bin-from-plugin, which keeps all state (after Task 9\'s re-review)', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const bin = join(stateDir(repo.root), 'bin');
+  writeState(repo.root, 'approvals.json', approval('a'.repeat(64), 'f'.repeat(40)));
+  rmSync(bin, { recursive: true });
+  assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.noApprovedSource('a'.repeat(64)), next: fromPlugin(repo.root) }]);
+  const planned = plan(repo.root, { binFromPlugin: true });
+  assert.deepEqual(planned.actions.map((action) => action.detail), [TEXT.binFromPluginAction(bin)]);
+  assert.ok(planned.notes.includes(TEXT.binFromPlugin));
+  const approvals = read(repo.root, '.git/kh-orchestration/approvals.json');
+  assert.equal(applyPlan(repo.root, planned).refusal, null);
+  for (const { name, bytes } of shippedScripts()) assert.deepEqual(readFileSync(join(bin, name)), bytes, name);
+  assert.equal(read(repo.root, '.git/kh-orchestration/approvals.json'), approvals, 'every approval is kept');
+
+  // An approved tree whose gate does not load: refused in the dry run, with a working-copy script
+  // still to be written left unwritten.
+  const gate = join(repo.root, SCRIPTS_DIR, 'ko-gate.mjs');
+  const good = readFileSync(gate);
+  writeFileSync(gate, `${good}\nthis is not javascript(\n`);
+  assert.equal(repo.git('add', '-A').status, 0);
+  const broken = repo.git('write-tree').stdout.trim();
+  writeFileSync(gate, good);
+  assert.equal(repo.git('add', '-A').status, 0);
+  writeState(repo.root, 'approvals.json', approval(digestOfTree(repo.root, broken).digest, broken));
+  rmSync(bin, { recursive: true });
+  rmSync(join(repo.root, SCRIPTS_DIR, 'ko-git.mjs'));
+  const failing = plan(repo.root);
+  assert.equal(failing.refusals.length, 1);
+  assert.equal(failing.refusals[0].next, fromPlugin(repo.root));
+  assert.ok(failing.refusals[0].text.startsWith(TEXT.approvedBinFails(broken, '').split(':')[0]), failing.refusals[0].text);
+  assert.equal(existsSync(join(repo.root, SCRIPTS_DIR, 'ko-git.mjs')), false);
+  const report = detect(repo.root);
+  assert.equal(report.next, fromPlugin(repo.root), 'detect\'s next step is the same');
+  assert.equal(applyPlan(repo.root, plan(repo.root, { binFromPlugin: true })).refusal, null);
+  assert.ok(existsSync(join(bin, 'gate.mjs')));
+});
+
+test('uninstall --state removes the refs that pin approved trees', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  assert.equal(repo.git('add', '-A').status, 0);
+  const tree = repo.git('write-tree').stdout.trim();
+  pinTree(repo.root, 'b'.repeat(64), tree);
+  applyUninstall(repo.root, uninstallPlan(repo.root, { state: false }));
+  assert.notEqual(repo.git('for-each-ref', 'refs/kh-orchestration/').stdout, '', 'kept without --state');
+  applyPlan(repo.root, plan(repo.root));
+  applyUninstall(repo.root, uninstallPlan(repo.root, { state: true }));
+  assert.equal(repo.git('for-each-ref', 'refs/kh-orchestration/').stdout, '');
 });
 
 test('an install of a newer kit is a downgrade: refused unless asked for with --downgrade, and then labelled one (after Task 9\'s review)', () => {

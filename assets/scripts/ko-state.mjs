@@ -1,7 +1,8 @@
 // The shared state directory: <git-common-dir>/kh-orchestration/, the same
 // directory from every linked worktree.
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
 import { shellWord } from './extension.mjs';
@@ -362,7 +363,15 @@ function preflight(dir, names, failedMessage) {
  * a regular file, a blob that does not hash to its id, or a copy that does not load leaves bin/ as
  * it was and throws a StateError; a failed read throws what ko-git throws. Called by `approve`.
  */
-export function refreshBin(root, tree) {
+export const refreshBin = (root, tree) => replaceBin(root, treeScripts(root, tree), binPreflightMessage);
+
+/**
+ * The scripts bin/ is made of from `tree`, `[{ name, bytes }]`, each read from the object store and
+ * verified against its object id. Throws a StateError for a tree without gate.mjs or ko.mjs, an
+ * entry that is not a regular file, or a blob that does not hash to its id; a failed read throws
+ * what ko-git throws. refreshBin, and apply (Task 9) to check an approved copy before writing.
+ */
+export function treeScripts(root, tree) {
   const scripts = binEntriesOf(root, tree);
   if (!ENTRIES.every((name) => scripts.some((entry) => entry.path === `${SCRIPTS_DIR}${name}`))) throw new StateError(binIncompleteMessage);
   const notFile = scripts.find((entry) => entry.type !== 'blob' || !FILE_MODES.includes(entry.mode));
@@ -370,7 +379,23 @@ export function refreshBin(root, tree) {
   const blobs = readBlobs(root, scripts.map((entry) => entry.oid));
   const mismatch = scripts.find((entry) => !hashesTo(entry.oid, blobs.get(entry.oid)));
   if (mismatch !== undefined) throw new StateError(objectMismatchMessage(mismatch.path));
-  replaceBin(root, scripts.map((entry) => ({ name: entry.path.slice(SCRIPTS_DIR.length), bytes: blobs.get(entry.oid) })), binPreflightMessage);
+  return scripts.map((entry) => ({ name: entry.path.slice(SCRIPTS_DIR.length), bytes: blobs.get(entry.oid) }));
+}
+
+/**
+ * Whether `files` (`[{ name, bytes }]`) load as a bin/ would: the same pre-flight, run on a copy in
+ * a temporary directory outside the repository, which is removed. Throws a StateError of
+ * failedMessage(<the script>) when they do not. apply (Task 9) checks an approved copy with it in
+ * its dry run, so a copy that would fail is refused before anything is written.
+ */
+export function checkLoads(files, failedMessage) {
+  const dir = mkdtempSync(join(tmpdir(), 'ko-bin-check-'));
+  try {
+    for (const file of files) writeFileSync(join(dir, file.name), file.bytes);
+    preflight(dir, files.map((file) => file.name).sort(), failedMessage);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**

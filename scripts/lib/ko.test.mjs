@@ -1136,3 +1136,30 @@ test('on a detached HEAD verify-branch and approve say "a detached HEAD", never 
   assert.equal(verified.stdout.includes('this branch'), false, verified.stdout);
   assert.ok(lines(verified.stdout)[0].includes('a detached HEAD'));
 });
+
+// The approved tree stays reachable (after Task 9's re-review): approve pins it under
+// refs/kh-orchestration/approved/<digest>, through the installed hooks (the reference-transaction
+// hook lets an update of a process with no in-flight record through), so git prune keeps it.
+test('approve pins the approved tree with a ref that git prune keeps, and refuses before recording anything when the ref cannot be written', () => {
+  const repo = installed();
+  const tree = indexTree(repo.root);
+  const digest = digestOfTree(repo.root, tree).digest;
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const ref = `refs/kh-orchestration/approved/${digest}`;
+  assert.equal(gitIn(repo.root, ['rev-parse', '--verify', ref]).stdout.trim(), tree);
+  assert.equal(gitIn(repo.root, ['cat-file', '-t', ref]).stdout.trim(), 'tree');
+  assert.equal(gitIn(repo.root, ['reflog', 'expire', '--expire=now', '--all']).status, 0);
+  assert.equal(gitIn(repo.root, ['prune', '--expire=now']).status, 0);
+  assert.equal(gitIn(repo.root, ['cat-file', '-t', tree]).stdout.trim(), 'tree', 'the approved tree survives a prune');
+
+  // A ref that cannot be written: a file where refs/kh-orchestration/approved must be a directory.
+  const other = installed();
+  rmSync(join(other.root, '.git', 'refs', 'kh-orchestration'), { recursive: true, force: true });
+  writeFileSync(join(other.root, '.git', 'refs', 'kh-orchestration'), 'not a directory\n');
+  const before = stateSnapshot(other.root);
+  const refused = approveAnswer(other.root);
+  assert.equal(refused.status, 1);
+  assert.ok(refused.stderr.startsWith(`kh-orchestration: ${TEXT.pinFailed}\n`), refused.stderr);
+  assert.deepEqual(stateSnapshot(other.root), before, 'nothing is recorded and bin/ is as it was');
+  assert.equal(TEXT.pinFailed, 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved. Check that the git directory can be written, then approve again.');
+});

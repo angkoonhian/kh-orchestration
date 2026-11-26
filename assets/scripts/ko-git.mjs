@@ -67,7 +67,22 @@ export function commonDir(root) {
   return realpathSync(resolve(root, oneLine(out)));
 }
 
-// Writes tree objects for the index, so it is the one call that is not read-only.
+// The refs that keep each approved tree reachable (after Task 9's re-review): approve's staged
+// tree is often never committed, and git prune would remove it, and bin/'s repair with it.
+export const APPROVED_REFS = 'refs/kh-orchestration/';
+
+/**
+ * Points refs/kh-orchestration/approved/<digest> at the tree object `tree` (a ref may name a tree),
+ * so git prune and gc keep it. `digest` is 64 hexadecimal digits. Throws a GitError when the ref
+ * cannot be written. The reference-transaction hook sees it as an update of a process with no
+ * in-flight record and lets it through without starting node.
+ */
+export function pinTree(root, digest, tree) {
+  if (!/^[0-9a-f]{64}$/.test(digest)) throw new GitError(gitFailedMessage('pin the approved tree'));
+  mustSucceed(exec(root, ['update-ref', '--no-deref', '--end-of-options', `${APPROVED_REFS}approved/${digest}`, tree]), 'pin the approved tree');
+}
+
+// Writes tree objects for the index; with pinTree, the only calls that are not read-only.
 export function indexTree(root) {
   return oneLine(mustSucceed(exec(root, ['write-tree']), 'write the index tree'));
 }

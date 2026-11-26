@@ -8,13 +8,13 @@
 import { TEXT, applyCommand, applyPlan, closingLines, nextAfterApply, ownerRefusal, parseArguments, plan, planLines, print, refuse, runCommand, usageError } from './lib/install.mjs';
 
 function main(argv) {
-  const args = parseArguments(argv, ['--yes', '--downgrade']);
+  const args = parseArguments(argv, ['--yes', '--downgrade', '--bin-from-plugin']);
   if (args.help) {
     print([`usage: ${TEXT.usage('apply')}`]);
     return 0;
   }
   if (args.usage !== undefined) return usageError('apply', args.usage);
-  const planned = plan(args.repo, { downgrade: args.flags.has('--downgrade') });
+  const planned = plan(args.repo, { downgrade: args.flags.has('--downgrade'), binFromPlugin: args.flags.has('--bin-from-plugin') });
   if (planned.refusals.length > 0) return refuse(planned.refusals);
   if (planned.actions.length === 0 && planned.conflicts.length === 0) {
     print([TEXT.nothingToDo(planned.root), `Next: ${nextAfterApply(planned.root, planned)}`]);

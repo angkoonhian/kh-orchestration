@@ -30,7 +30,7 @@ import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
 import { REASONS, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
-  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, listEntries, repoRoot, tidy, treeOfCommit,
+  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, listEntries, pinTree, repoRoot, tidy, treeOfCommit,
 } from './ko-git.mjs';
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
@@ -174,6 +174,7 @@ export const TEXT = Object.freeze({
   alreadyApproved: 'This digest is approved already; approving again refreshes bin/ from this tree and closes this worktree for proposals.',
   prompt: 'Type approve and press Enter to approve; anything else cancels: ',
   notApproved: 'Nothing was approved: the answer was not the word approve.',
+  pinFailed: 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved. Check that the git directory can be written, then approve again.',
   noAnswer: 'Nothing was approved: no answer could be read (standard input is closed or empty).',
   approved: (digest, tree) => `Approved: digest ${short(digest)} of tree ${short(tree)}. bin/ now holds this tree's scripts, and this worktree is closed for proposals.`,
   approvedNext: (runCommand) => `${runCommand}, then git commit`,
@@ -845,7 +846,14 @@ function approve(root) {
   if (answer === null) return refusal(TEXT.noAnswer, ownerCommand(root, 'approve'));
   if (answer !== 'approve') return refusal(TEXT.notApproved, ownerCommand(root, 'approve'));
   try {
-    // First: a tree whose scripts cannot make a working bin/ records nothing.
+    // First, before anything is recorded: the tree is pinned, so it cannot be pruned.
+    pinTree(root, digest.digest, tree);
+  } catch (error) {
+    if (error instanceof GitError) return refusal(TEXT.pinFailed, ownerCommand(root, 'approve'));
+    throw error;
+  }
+  try {
+    // Then: a tree whose scripts cannot make a working bin/ records nothing.
     refreshBin(root, tree);
   } catch (error) {
     if (error instanceof StateError) return refusal(error.message, ownerCommand(root, 'approve'));

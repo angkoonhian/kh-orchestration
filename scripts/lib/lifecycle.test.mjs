@@ -99,7 +99,7 @@ function followSteps(root, stdout) {
 }
 
 test('the commands print their usage and refuse what they do not take, with exit 2', () => {
-  for (const [name, flags] of [['apply', '<repository> [--yes] [--downgrade]'], ['detect', '<repository> [--json]'], ['uninstall', '<repository> [--yes] [--state]']]) {
+  for (const [name, flags] of [['apply', '<repository> [--yes] [--downgrade] [--bin-from-plugin]'], ['detect', '<repository> [--json]'], ['uninstall', '<repository> [--yes] [--state]']]) {
     const usage = `usage: node ${command(name)} ${flags}\n`;
     assert.deepEqual([run(name, ['--help']).status, run(name, ['--help']).stdout], [0, usage]);
     assert.deepEqual([run(name, []).status, run(name, []).stderr], [2, `kh-orchestration: ${TEXT.missingRepository}\n${usage}`]);
