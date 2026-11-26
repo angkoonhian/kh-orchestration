@@ -1,0 +1,17 @@
+{
+  "description": "Tells each session in a repository where kh-orchestration is installed that its commits are checked, how to run the officers, and what only the owner does. Silent everywhere else.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-brief.mjs"],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
