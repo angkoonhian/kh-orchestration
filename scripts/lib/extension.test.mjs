@@ -1056,3 +1056,27 @@ test('setpriv --reset-env, systemd-run, su - and sudo -i count as a cleared envi
   ];
   assert.deepEqual(mismatches(rows), []);
 });
+
+// After the whole-branch review: the flags that hide a file from git's comparison with the working
+// tree are not set from a session (run refuses while one is set), and du only reads.
+test('git update-index --assume-unchanged and --skip-worktree, and their abbreviations, are blocked; other update-index forms and du are not', () => {
+  const rows = [
+    ['git update-index --assume-unchanged src/a.js', blocked(MESSAGES.indexFlags)],
+    ['git update-index --skip-worktree -- src/a.js', blocked(MESSAGES.indexFlags)],
+    ['git update-index --assume src/a.js', blocked(MESSAGES.indexFlags)],
+    ['git update-index --as src/a.js', blocked(MESSAGES.indexFlags)],
+    ['git update-index --skip-w src/a.js', blocked(MESSAGES.indexFlags)],
+    ['git -C sub update-index -q --skip-worktree x', blocked(MESSAGES.indexFlags)],
+    ['git update-index --{assume,x}-unchanged a', blocked(MESSAGES.indexFlags)],
+    ['git update-index --refresh', ALLOW],
+    ['git update-index --really-refresh', ALLOW],
+    ['git update-index --add new.txt', ALLOW],
+    ['git update-index --chmod=+x file', ALLOW],
+    ['git update-index --no-assume-unchanged -- src/a.js', ALLOW],
+    ['git update-index --no-skip-worktree -- src/a.js', ALLOW],
+    ['du -sh .git', ALLOW],
+    ['du -sh .git/objects', ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+  assert.ok(MESSAGES.indexFlags.length <= 300 && !/[<>]/.test(MESSAGES.indexFlags));
+});

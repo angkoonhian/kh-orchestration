@@ -242,6 +242,7 @@ const unseen = (reason) => `This command's structure cannot be seen (${reason}) 
 export const MESSAGES = Object.freeze({
   noVerify: `git may not skip the commit gate from a session. Run the officers with ${RUN}, then commit without --no-verify or -n.`,
   hiddenOption: 'A flag of git commit, merge or pull is given through a variable or a substitution, which could turn the hooks off, so it is blocked. Write the flags out literally.',
+  indexFlags: 'git update-index --assume-unchanged and --skip-worktree hide a file from git\'s comparison with the working tree, so the officers could pass on other files than a commit holds; they are not set from a session. ko.mjs run refuses while any is set.',
   commitTree: `git commit-tree makes a commit without the commit gate and is not run from a session. Run ${RUN}, then git commit.`,
   gitConfig: 'Git configuration that redirects hooks or names a command git runs (core.hooksPath, include, alias, mergeOptions, filters, fsmonitor, diff and merge drivers, pagers, editors, gpg and ssh programs) is not changed from a session. The owner changes it; git config --get reads it.',
   exportedEnv: 'This line runs git and sets a variable that steers git or a hook (NODE_OPTIONS etc., LD_*, DYLD_*, GIT_CONFIG_*, GIT_EXEC_PATH, GIT_COMMON_DIR, HOME, XDG_CONFIG_HOME, PATH, TMOUT, PS4, SHELLOPTS, BASH_ENV, ENV, BASH_FUNC_*), exports a function, or defines git as one. Run git in a line of its own.',
@@ -1230,7 +1231,7 @@ function ownTextValues(resolved, git, outputReadOnly, substituted) {
 // ---------------------------------------------------------------------------
 // Bash, the guarded area: the whole git directory
 
-const READ_ONLY = new Set(['ls', 'cat', 'head', 'tail', 'stat', 'file', 'wc', 'grep', 'rg', 'test', '[', 'diff', 'cmp', 'sha256sum', 'less', 'jq', 'echo', 'printf', 'find']);
+const READ_ONLY = new Set(['ls', 'cat', 'head', 'tail', 'stat', 'file', 'wc', 'grep', 'rg', 'test', '[', 'diff', 'cmp', 'sha256sum', 'less', 'jq', 'echo', 'printf', 'find', 'du']);
 const READ_ONLY_GIT = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'rev-parse', 'cat-file', 'grep', 'blame']);
 // Options with which a read-only command writes or runs something after all.
 const WRITING_OPTIONS = {
@@ -1553,6 +1554,10 @@ function configChangesHooks(rest) {
 }
 
 const isNoVerify = (text) => text.length >= 6 && '--no-verify'.startsWith(text);
+// git update-index's flags that stop git comparing a file with the working tree (after the
+// whole-branch review), in any abbreviation git accepts: --as and --sk are the shortest that no
+// other update-index option shares.
+const hidesFromComparison = (text) => text.length >= 4 && ['--assume-unchanged', '--skip-worktree'].some((flag) => flag.startsWith(text));
 // The shortest abbreviation git accepts, looked for anywhere in the raw text of a word that holds an expansion.
 const NO_VERIFY_PREFIX = '--no-v';
 
@@ -1683,6 +1688,7 @@ function judgeGit(resolved, git, values) {
   }
   if (git.sub === 'commit-tree') refuse(MESSAGES.commitTree);
   if (git.sub === 'config' && configChangesHooks(git.rest)) refuse(MESSAGES.gitConfig);
+  if (git.sub === 'update-index' && git.rest.some((word) => (variantsOf(word) ?? []).some(hidesFromComparison))) refuse(MESSAGES.indexFlags);
   if (git.sub === 'restore' || git.sub === 'checkout' || git.sub === 'reset' || git.sub === 'rm') {
     const split = splitsExtensionPair(git.sub, git.rest);
     if (split !== null) refuse(split === 'index' ? MESSAGES.unstageExtension : MESSAGES.restoreExtension);

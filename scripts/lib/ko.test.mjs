@@ -1283,3 +1283,54 @@ test('C1: verify-branch whose officer rewrites a file of HEAD\'s tree records no
     'The working tree changed while the officers ran, so no verdict is recorded: they did not pass on HEAD\'s tree as it is (an officer that fixes files, a lint --fix say, does this, and so does one that writes a file git does not ignore). Commit what they changed if it is wanted, add a file they write to .gitignore, discard the rest, then verify again. Changed: src/a.js.',
   );
 });
+
+// An officer that fails while src/a.js reads BAD.
+const CONTENT = "import { readFileSync } from 'node:fs';\nprocess.exit(readFileSync('src/a.js', 'utf8') === 'BAD\\n' ? 1 : 0);\n";
+
+test('I1: run and verify-branch refuse while an index entry is flagged assume-unchanged or skip-worktree, naming the paths and the commands that clear the flags', () => {
+  const repo = installed({ officers: officersOf([['content', ['node', 'tools/content.mjs']]]) });
+  repo.write('tools/content.mjs', CONTENT);
+  repo.write('src/a.js', 'BAD\n');
+  repo.write('src/b.js', 'b\n');
+  stage(repo);
+  assert.equal(gitIn(repo.root, ['update-index', '--assume-unchanged', '--', 'src/a.js']).status, 0);
+  assert.equal(gitIn(repo.root, ['update-index', '--skip-worktree', '--', 'src/b.js']).status, 0);
+  repo.write('src/a.js', 'GOOD\n');
+  const rootWord = shellWord(repo.root);
+  const clear = `git -C ${rootWord} update-index --no-assume-unchanged -- src/a.js && git -C ${rootWord} update-index --no-skip-worktree -- src/b.js`;
+  const result = ko(repo.root, ['run']);
+  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.hiddenEntries(['src/a.js', 'src/b.js']), `${clear}, then ${agent(repo.root, 'run')}`)]);
+  assert.equal(existsSync(join(stateDir(repo.root), 'verdicts')), false, 'no officer ran');
+  assert.equal(
+    TEXT.hiddenEntries(['src/a.js']),
+    'The index flags these files assume-unchanged or skip-worktree (a sparse checkout flags its files so), so git does not compare them with the working tree and the officers could pass on other files than a commit would hold: src/a.js. Clear the flags, then run the officers.',
+  );
+
+  // Committed with git's hooks off, verify-branch refuses the same way.
+  assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'unchecked']).status, 0);
+  const verified = ko(repo.root, ['verify-branch']);
+  assert.deepEqual([verified.status, verified.stderr], [1, refusalText(TEXT.hiddenEntries(['src/a.js', 'src/b.js']), `${clear}, then ${agent(repo.root, 'verify-branch')}`)]);
+
+  // Cleared, the committed copy is seen: the working tree differs from it, and once it matches,
+  // verify-branch runs the officer on it and fails.
+  for (const flag of ['--no-assume-unchanged', '--no-skip-worktree']) assert.equal(gitIn(repo.root, ['update-index', flag, '--', flag.includes('assume') ? 'src/a.js' : 'src/b.js']).status, 0);
+  assert.equal(ko(repo.root, ['verify-branch']).stderr.startsWith(`kh-orchestration: ${TEXT.untidyHead(['src/a.js'])}`), true);
+  repo.write('src/a.js', 'BAD\n');
+  const failing = ko(repo.root, ['verify-branch']);
+  assert.equal(failing.status, 1);
+  assert.match(lines(failing.stdout)[1], /^ {2}content {2}fail {2}/, 'the staged copy that was hidden fails');
+});
+
+test('I1: past ten flagged entries the refusal names ten and counts the rest, and its command clears those ten', () => {
+  const repo = installed();
+  const paths = Array.from({ length: 11 }, (_, index) => `s/${String(index).padStart(2, '0')}.txt`);
+  for (const path of paths) repo.write(path, 'x\n');
+  stage(repo);
+  assert.equal(gitIn(repo.root, ['update-index', '--skip-worktree', '--', ...paths]).status, 0);
+  const result = ko(repo.root, ['run']);
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(
+    TEXT.hiddenEntries(paths),
+    `git -C ${shellWord(repo.root)} update-index --no-skip-worktree -- ${paths.slice(0, 10).join(' ')}, then ${agent(repo.root, 'run')}`,
+  )]);
+  assert.ok(TEXT.hiddenEntries(paths).includes('s/09.txt and 1 more.'));
+});

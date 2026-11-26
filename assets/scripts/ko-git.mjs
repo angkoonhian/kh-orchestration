@@ -178,6 +178,21 @@ export function tidy(root) {
   return { tidy: unstaged.length === 0 && untracked.length === 0, unstaged, untracked };
 }
 
+// The index entries git does not compare with the working tree (after the whole-branch review), so
+// that `tidy` cannot see a difference in them: `{ assumed, skipped }`, the paths flagged
+// assume-unchanged (a lower-case tag in git ls-files -v) and skip-worktree (the tag S, or s when
+// both are set), in index order. Reads the index only.
+export function hiddenEntries(root) {
+  const assumed = [];
+  const skipped = [];
+  for (const entry of nulSeparated(mustSucceed(git(root, ['ls-files', '-v', '-z']), 'read the index'))) {
+    const [tag, path] = [entry[0], entry.slice(2)];
+    if (tag !== tag.toUpperCase()) assumed.push(path);
+    if (tag.toUpperCase() === 'S') skipped.push(path);
+  }
+  return { assumed, skipped };
+}
+
 // The tree of the commit `id` names, or null when `id` names no object or an object that is not a
 // commit (a tag is not peeled). `id` must be a full object id; the caller checks that.
 export function treeOfCommitId(root, id) {

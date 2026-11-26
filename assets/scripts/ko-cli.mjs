@@ -30,7 +30,7 @@ import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
 import { REASONS, baseDigestOf, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
-  GitError, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
+  GitError, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, hiddenEntries, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
 } from './ko-git.mjs';
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
@@ -133,6 +133,7 @@ export const TEXT = Object.freeze({
   unexpected: 'an unexpected error stopped it',
   filterDriver: (name, key) => `The git filter driver ${shownName(name)} is configured (${shownName(key)}). A clean filter can make a working tree that differs from the index look tidy, and the officers run on the working tree, so they are not run here. Remove the driver from the configuration file shown below; only lfs is allowed.`,
   untidy: (paths) => `The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage the files meant to be committed, and add the others (a .claude/settings.local.json, say) to .gitignore: ${named(paths)}.`,
+  hiddenEntries: (paths) => `The index flags these files assume-unchanged or skip-worktree (a sparse checkout flags its files so), so git does not compare them with the working tree and the officers could pass on other files than a commit would hold: ${named(paths)}. Clear the flags, then run the officers.`,
   cannotRun: (problem) => `The officers cannot be run on this tree: ${sentence(problem)}`,
   treeChanged: (paths) => `The working tree changed while the officers ran, so no verdict is recorded: they did not pass on the tree a commit would hold (${OFFICER_CHANGES}). Stage what they changed if it is wanted, add a file they write to .gitignore, restore the rest, then run the officers again. Changed: ${named(paths)}.`,
   treeChangedHead: (paths) => `The working tree changed while the officers ran, so no verdict is recorded: they did not pass on HEAD's tree as it is (${OFFICER_CHANGES}). Commit what they changed if it is wanted, add a file they write to .gitignore, discard the rest, then verify again. Changed: ${named(paths)}.`,
@@ -397,6 +398,22 @@ function untidyPaths(root) {
   return state.tidy ? [] : [...state.unstaged, ...state.untracked];
 }
 
+// When the index hides entries from git's comparison with the working tree (hiddenEntries: an
+// assume-unchanged or skip-worktree flag), the refusal naming them, with the commands that clear
+// the flags of the first ten, then `then`; exit 1. Null when it hides none.
+function hiddenRefusal(root, then) {
+  const { assumed, skipped } = hiddenEntries(root);
+  const paths = [...new Set([...assumed, ...skipped])];
+  if (paths.length === 0) return null;
+  const shown = new Set(paths.slice(0, NAMED_AT_MOST));
+  const rootWord = shellWord(root);
+  const clear = [['--no-assume-unchanged', assumed], ['--no-skip-worktree', skipped]]
+    .map(([flag, list]) => [flag, list.filter((path) => shown.has(path))])
+    .filter(([, list]) => list.length > 0)
+    .map(([flag, list]) => commandLine(`git -C ${rootWord} update-index ${flag} --`, list));
+  return refusal(TEXT.hiddenEntries(paths), `${clear.join(' && ')}, then ${then}`);
+}
+
 const treeExists = (root, tree) => {
   const type = git(root, ['cat-file', '-t', '--end-of-options', tree]);
   return type.status === 0 && type.stdout.trim() === 'tree';
@@ -407,6 +424,8 @@ const treeExists = (root, tree) => {
 async function run(root) {
   const filter = foreignFilter(root);
   if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
+  const hidden = hiddenRefusal(root, agentCommand(root, 'run'));
+  if (hidden !== null) return hidden;
   const untidy = untidyPaths(root);
   // Never a command that stages everything (after Task 9's re-review): an unignored
   // settings.local.json would go into the tree the owner approves.
@@ -795,6 +814,8 @@ async function verifyBranch(root, { noRun }) {
   if (!noRun) {
     const filter = foreignFilter(root);
     if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
+    const hidden = hiddenRefusal(root, agentCommand(root, 'verify-branch'));
+    if (hidden !== null) return hidden;
     const untidy = untidyPaths(root);
     if (untidy.length > 0) return refusal(TEXT.untidyHead(untidy), `git stash -u && ${agentCommand(root, 'verify-branch')}`);
     if (indexTree(root) !== head) return refusal(TEXT.stagedChanges, `git stash && ${agentCommand(root, 'verify-branch')}`);

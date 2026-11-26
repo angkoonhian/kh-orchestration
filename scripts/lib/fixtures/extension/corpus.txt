@@ -1771,7 +1771,7 @@ sed -i 's/x/y/' .claude/kh-orchestration/officers.json
 allow
 git checkout main -- .claude/settings.json
 =====
-allow
+block
 git update-index --assume-unchanged .claude/settings.json
 =====
 allow
