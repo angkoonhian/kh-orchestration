@@ -166,6 +166,21 @@ test('apply --yes in a path with spaces installs a gate that refuses a real comm
   assert.deepEqual({ tree: listing(root) }, before, 'a second apply writes nothing');
 });
 
+test('the printed staging step stages exactly what apply wrote, never an unignored settings.local.json or another file under .claude (after Task 9\'s review)', () => {
+  const repo = fresh();
+  writeFileSync(join(repo.root, '.claude/settings.local.json'), '{}\n');
+  writeFileSync(join(repo.root, '.claude/notes.md'), 'mine\n');
+  const applied = run('apply', [repo.root, '--yes']);
+  assert.equal(applied.status, 0, applied.stderr);
+  const { stage } = ownerSteps(applied.stdout);
+  assert.equal(stage, `git -C ${repo.root} add -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes`);
+  assert.equal(shell(stage).status, 0);
+  const staged = git(repo.root, 'diff', '--cached', '--name-only').stdout.split('\n').filter((path) => path !== '').sort();
+  assert.deepEqual(staged, [
+    '.claude/kh-harness/extensions.json', OFFICERS_PATH, ...readdirSync(join(repo.root, SCRIPTS_DIR)).map((name) => `${SCRIPTS_DIR}/${name}`), MANIFEST_PATH, '.gitattributes',
+  ].sort());
+});
+
 test('apply from a linked worktree installs for the repository: the hooks and the state are the common directory\'s, and a commit lands there through the printed steps', () => {
   const repo = fresh();
   const worktree = repo.addWorktree('side');

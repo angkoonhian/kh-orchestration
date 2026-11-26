@@ -119,6 +119,10 @@ const detectCommand = (root) => commandOf('detect', root, '');
 export const khHarnessApply = (root) => `node <kh-harness>/scripts/apply.mjs ${shellWord(root)} --yes`;
 
 const sentence = (text) => `${text.replace(/\.$/, '')}.`;
+// Exactly what apply writes in the working tree, never .claude as a whole (after Task 9's review):
+// .claude holds the owner's settings.local.json and whatever else they keep there.
+const WRITTEN_PATHS = ['.claude/kh-orchestration', MANIFEST_PATH, EXTENSIONS_PATH, ATTRIBUTES_FILE];
+const stageCommand = (root) => `git -C ${shellWord(root)} add -- ${WRITTEN_PATHS.join(' ')}`;
 const USAGES = {
   apply: '<repository> [--yes]',
   detect: '<repository> [--json]',
@@ -203,7 +207,7 @@ export const TEXT = Object.freeze({
   approveAgain: 'The files this run changed are protected: the commit gate refuses every commit until the owner approves them again.',
   steps: (root, approve, run) => [
     `1. Read what was installed: ${OFFICERS_PATH} (the officers, and what else to lock under "protected") and the scripts in ${SCRIPTS_DIR}/.`,
-    `2. Stage the install, so the tree holds what the gate checks: git -C ${shellWord(root)} add .claude ${ATTRIBUTES_FILE}`,
+    `2. Stage the install, so the tree holds what the gate checks: ${stageCommand(root)}`,
     `3. Approve, in your own terminal outside Claude Code: cd ${shellWord(root)} && ${approve}`,
     `4. Run the officers on the staged tree: cd ${shellWord(root)} && ${run}`,
     `5. Commit: git -C ${shellWord(root)} commit`,
