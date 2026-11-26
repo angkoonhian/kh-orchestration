@@ -20,7 +20,7 @@ import { COMMANDS, shellWord } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { indexTree } from '../../assets/scripts/ko-git.mjs';
 import { STAGE_INSTALL_NOTE, ownerCommand, stageInstall, stateDir } from '../../assets/scripts/ko-state.mjs';
-import { TEXT as KO_TEXT, agentCommand } from '../../assets/scripts/ko-cli.mjs';
+import { TEXT as KO_TEXT, agentCommand, repairCommand } from '../../assets/scripts/ko-cli.mjs';
 
 isolateProcessEnv();
 // The in-process calls run git with this process's environment: no user or system configuration.
@@ -484,4 +484,39 @@ test('apply --yes and detect take well under a second', () => {
   assert.equal(detected.result.status, 0);
   assert.ok(applied.ms < 3000, `apply --yes took ${applied.ms} ms`);
   assert.ok(detected.ms < 3000, `detect took ${detected.ms} ms`);
+});
+
+// After the whole-branch review: a changed extension.mjs is kept, so its entry must not stay.
+test('I5: apply --yes with a changed extension.mjs takes the entry out (tool calls work), and the two steps it and status print complete the install', () => {
+  const repo = fresh();
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  assert.equal(git(repo.root, 'add', '-A').status, 0);
+  assert.equal(git(repo.root, '-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'install').status, 0);
+  const module = join(repo.root, SCRIPTS_DIR, 'extension.mjs');
+  writeFileSync(module, `${readFileSync(module, 'utf8')}// an edit\n`);
+  assert.equal(harnessAllowsRead(repo.root), false, 'fixture: the registered entry no longer matches its module, so kh-harness blocks every tool call');
+
+  const repair = `git -C ${shellWord(repo.root)} restore --source=HEAD --staged --worktree -- .claude/kh-orchestration/scripts/extension.mjs .claude/kh-harness/extensions.json`;
+  const next = `${repair}, then ${TEXT.askOwner(applyCommand(repo.root))}`;
+  const dry = run('apply', [repo.root]);
+  assert.ok(lines(dry.stdout).includes(`  - ${TEXT.takeEntryOut}`), dry.stdout);
+  const applied = run('apply', [repo.root, '--yes']);
+  assert.equal(applied.status, 1, applied.stdout + applied.stderr);
+  const out = lines(applied.stdout);
+  assert.ok(out.includes(`  - ${TEXT.moduleKept(`${SCRIPTS_DIR}/extension.mjs`)}`), applied.stdout);
+  assert.ok(out.includes(`    Next: ${next}`), applied.stdout);
+  assert.equal(harnessAllowsRead(repo.root), true, 'without our entry, tool calls work');
+  const status = statusJson(repo.root);
+  assert.equal(status.contract.ok, false, 'commits are refused');
+  assert.ok(status.problems.some((problem) => problem.text === KO_TEXT.extensionPairDiffers && problem.next === `${repair}, then ${repairCommand(shellWord(repo.root))}`), JSON.stringify(status.problems));
+
+  assert.equal(shell(repair, { cwd: join(repo.root, '.claude') }).status, 0);
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  assert.deepEqual(plan(repo.root).conflicts, []);
+  assert.equal(harnessAllowsRead(repo.root), true);
+  assert.deepEqual(checkContract1(repo.root, ownEntry(repo.root)), { problems: [], warnings: [] });
+  assert.equal(
+    TEXT.moduleKept('m'),
+    'm is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration\'s entry is kept out of .claude/kh-harness/extensions.json, since an entry naming other bytes than its module makes kh-harness block every tool call: tool calls work, but the commit gate refuses every commit until the module and the entry are restored together from HEAD and apply is run again.',
+  );
 });

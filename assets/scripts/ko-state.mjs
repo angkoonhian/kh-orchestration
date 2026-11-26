@@ -338,6 +338,11 @@ export const INSTALL_PATHS = Object.freeze(['.claude/kh-orchestration', '.claude
 export const STAGE_INSTALL_NOTE = 'this also stages any other change in .gitattributes';
 export const stageInstall = (rootWord) => `git${rootWord === null ? '' : ` -C ${rootWord}`} add -- ${INSTALL_PATHS.join(' ')}`;
 
+// The repair when extension.mjs and its entry in extensions.json no longer match (after the
+// whole-branch review): both restored together from HEAD, never one alone, then apply run again by
+// the owner. apply's conflict and status print it alike; `rootWord` is the root quoted for a shell.
+export const restoreExtensionPair = (rootWord) => `git -C ${rootWord} restore --source=HEAD --staged --worktree -- .claude/kh-orchestration/scripts/extension.mjs .claude/kh-harness/extensions.json`;
+
 const SCRIPTS_DIR = '.claude/kh-orchestration/scripts/';
 const BIN = 'bin';
 // What a refresh that ended early (a kill) can leave beside bin/; removed at the next refresh.

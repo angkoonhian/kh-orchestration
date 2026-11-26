@@ -390,7 +390,7 @@ test('an owner-edited or unstamped installed script is kept and reported, the ho
   for (const name of HOOK_NAMES) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
   assert.equal(TEXT.scriptEdited('p'), 'p is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. To take this version, restore it (git checkout -- p), then run apply again.');
 
-  // An edited extension.mjs: kept, and its entry is not written over the kept bytes; nothing is refused.
+  // An edited extension.mjs: kept, and no entry is written for the kept bytes; nothing is refused.
   const module = join(repo.root, SCRIPTS_DIR, 'extension.mjs');
   const shippedModule = readFileSync(module);
   writeFileSync(module, `${shippedModule}// the owner's note\n`);
@@ -399,9 +399,9 @@ test('an owner-edited or unstamped installed script is kept and reported, the ho
   const keptModule = plan(repo.root);
   assert.deepEqual(keptModule.refusals, []);
   assert.deepEqual(keptModule.conflicts.map((conflict) => conflict.text), [
-    TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), TEXT.scriptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`), TEXT.scriptEdited(`${SCRIPTS_DIR}/extension.mjs`), TEXT.extensionSkipped, TEXT.hooksStopped,
+    TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), TEXT.scriptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`), TEXT.moduleKept(`${SCRIPTS_DIR}/extension.mjs`), TEXT.hooksStopped,
   ]);
-  assert.equal(keptModule.actions.some((action) => action.kind === 'extension-entry'), false);
+  assert.equal(keptModule.actions.some((action) => action.kind === 'extension-entry' || action.kind === 'entry-out'), false, 'no entry to write or take out');
   writeFileSync(module, shippedModule);
   writeFileSync(join(repo.root, EXTENSIONS_PATH), extensions);
 

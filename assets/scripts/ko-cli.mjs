@@ -26,7 +26,7 @@ import { accessSync, constants, readFileSync, readSync, readdirSync, realpathSyn
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { COMMANDS, shellWord } from './extension.mjs';
-import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
+import { EXTENSION_ID, MODULE, STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
 import { REASONS, baseDigestOf, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
@@ -36,10 +36,10 @@ import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
 import {
   RULE_ID, StateError, appendJournal, approvalStanding, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
-  refreshBin, removeStaleInflight, stateDir, switchOff, switchOn, verdictName, writeState,
+  refreshBin, removeStaleInflight, restoreExtensionPair, stateDir, switchOff, switchOn, verdictName, writeState,
 } from './ko-state.mjs';
 import { passing, produceVerdict, readVerdict, writeVerdict } from './ko-verdict.mjs';
-import { checkContract1 } from './verify-contract-1.mjs';
+import { checkContract1, lfSha256 } from './verify-contract-1.mjs';
 
 // The variables a Claude Code session sets (decision 13): an owner's command refuses while either is
 // set. The installer's writing runs (apply --yes, uninstall --yes) read the same list.
@@ -50,6 +50,7 @@ const MAX_REASON = 500;
 const MIN_GIT = [2, 30];
 const REFERENCE_HOOK = 'reference-transaction';
 const CONTRACT_FILE = '.claude/kh-harness/contract.json';
+const EXTENSIONS_FILE = '.claude/kh-harness/extensions.json';
 const HARNESS_LOG = '.claude/scripts/harness-log.mjs';
 const SCRIPTS = '.claude/kh-orchestration/scripts';
 // What recordExternalEvent needs listed in the contract file (CONTRACT.md, step 2): the log, and
@@ -209,6 +210,7 @@ export const TEXT = Object.freeze({
   exemptHere: (branch, reason) => `This branch, ${shownName(branch)}, is exempt (${shownText(reason)}): the commit gate lets its commits through unchecked.`,
   noInstall: (problem) => `The staged tree holds no usable install: ${sentence(problem)}`,
   installProblem: (problem) => `The officers file of the staged tree cannot be used: ${sentence(problem)}`,
+  extensionPairDiffers: 'kh-orchestration\'s extension module and its entry in .claude/kh-harness/extensions.json do not match (the module was changed, or the entry is missing): while such an entry is registered kh-harness blocks every tool call, and without the entry the commit gate refuses every commit. Restore the two together from HEAD, then have the owner run apply again.',
   contractProblem: (problem) => `kh-harness contract 1 does not hold in this working directory: ${sentence(problem)}`,
   undigestable: (problem) => `The protected files of the staged tree cannot be checked: ${sentence(problem)}`,
   unapproved: (digest) => `The protected files of the staged tree (digest ${short(digest)}) are not approved.`,
@@ -313,6 +315,23 @@ function foreignFilter(root) {
     if (name !== 'lfs') return { name, key };
   }
   return null;
+}
+
+// Whether the working copy's extension module is present but its entry in kh-harness's extensions
+// file is missing or names another hash (after the whole-branch review): the state apply leaves when
+// it keeps a changed module, which only the two-file restore and apply repair. Executes nothing.
+function extensionPairDiffers(root) {
+  const module = readNoFollow(join(root, MODULE));
+  if (module.bytes === undefined) return false;
+  const listed = readNoFollow(join(root, EXTENSIONS_FILE));
+  let entries;
+  try {
+    entries = listed.bytes === undefined ? [] : JSON.parse(listed.bytes.toString('utf8'));
+  } catch {
+    return false;
+  }
+  const entry = Array.isArray(entries) ? entries.find((candidate) => candidate?.id === EXTENSION_ID) : undefined;
+  return entry === undefined || entry.sha256 !== lfSha256(module.bytes);
 }
 
 // The waivers in force on `branch`: none on a detached HEAD.
@@ -721,6 +740,7 @@ export function statusOf(root) {
   }
 
   const contract = contractHolds(root, { probe: false });
+  if (!contract.ok && extensionPairDiffers(root)) problems.push({ text: TEXT.extensionPairDiffers, next: `${restoreExtensionPair(shellWord(root))}, then ${APPLY(root)}` });
   for (const problem of contract.ok ? [] : contract.problems) problems.push({ text: TEXT.contractProblem(problem), next: agentCommand(root, 'status') });
 
   const here = realpathSync(root);

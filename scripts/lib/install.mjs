@@ -16,7 +16,9 @@
 // must be, first of all; (a) the fourteen scripts into .claude/kh-orchestration/scripts/ — when
 // extension.mjs is replaced while its entry is registered, one action takes the entry out, writes
 // the module and puts the entry back, adjacent; (b) officers.json when there is none; (c) the line
-// `.claude/** -text` in .gitattributes; (d) the entry in kh-harness's extensions file; (e) the
+// `.claude/** -text` in .gitattributes; (d) the entry in kh-harness's extensions file, or, when an
+// extension.mjs that is not kh-orchestration's is kept, its entry taken out (an entry beside other
+// bytes than it names would make kh-harness block every tool call); (e) the
 // shared state directory and bin/ before any approval, from the plugin's shipped scripts through
 // ko-state's pre-flight; (f) the git hooks that are not someone else's into <git-common-dir>/hooks/,
 // then the self-test; (g) stale in-flight records removed. The manifest is written after each
@@ -57,7 +59,7 @@ import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { APPROVED_REFS, GitError, commonDir, currentBranch, git, repoRoot } from '../../assets/scripts/ko-git.mjs';
 import { HOOK_NAMES, REFUSED_TEXT, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
 import {
-  INSTALL_PATHS, SCRATCH_MESSAGES, STAGE_INSTALL_NOTE, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stageInstall, stateDir, treeScripts,
+  INSTALL_PATHS, SCRATCH_MESSAGES, STAGE_INSTALL_NOTE, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, restoreExtensionPair, stageInstall, stateDir, treeScripts,
 } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
@@ -191,11 +193,12 @@ export const TEXT = Object.freeze({
   rewriteHook: (path) => `rewrite the git hook ${path} (it names kh-orchestration but is not the exact text this version writes for this env and Node; any edit made in it is discarded)`,
   removeInflight: (pids) => `remove the in-flight records of git processes that have ended: ${pids.join(', ')}`,
   record: (what) => `record ${what} in ${MANIFEST_PATH} (already in place)`,
+  takeEntryOut: `take kh-orchestration's entry out of ${EXTENSIONS_PATH}: ${MODULE} is kept with other bytes than the entry names, and kh-harness blocks every tool call while the two disagree`,
 
   scriptNotOurs: (path) => `${path} is kept as it is: it does not begin with kh-orchestration's stamp line, so kh-orchestration did not write it and never overwrites it. The path is kh-orchestration's own script's: move the file elsewhere to keep it, then run apply again.`,
   scriptEdited: (path) => `${path} is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. To take this version, restore it (git checkout -- ${path}), then run apply again.`,
   hooksStopped: 'The git hooks are not written while an installed script is kept: the install is incomplete until the scripts above are kh-orchestration\'s.',
-  extensionSkipped: `kh-orchestration's entry in ${EXTENSIONS_PATH} is not written while ${MODULE} is kept: the entry would register bytes kh-orchestration did not ship.`,
+  moduleKept: (path) => `${path} is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration's entry is kept out of ${EXTENSIONS_PATH}, since an entry naming other bytes than its module makes kh-harness block every tool call: tool calls work, but the commit gate refuses every commit until the module and the entry are restored together from HEAD and apply is run again.`,
   hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so it is not written over. To run the commit gate from it, make its first line #!/bin/sh and put this line directly after it, with only blank or comment lines between:\n    ${line}`,
   hostedMisplaced: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between:\n    ${line}`,
   hostedStale: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line for another env or Node, so the commit gate may not start from it. Replace that line with this one:\n    ${line}`,
@@ -834,7 +837,10 @@ export function plan(dir, { downgrade = false, binFromPlugin = false, execute = 
     else if (found.state === 'current' && recordedFile(path) !== sha256(bytes)) actions.push({ kind: 'record', path, detail: TEXT.record(path), file: { path, sha256: sha256(bytes) } });
     if (found.state === 'edited' || found.state === 'not-ours') {
       kept.push(name);
-      conflicts.push({ text: found.state === 'edited' ? TEXT.scriptEdited(path) : TEXT.scriptNotOurs(path), next });
+      // The module is repaired with its entry, from HEAD together (after the whole-branch review):
+      // either restored alone, from HEAD or otherwise, can leave the pair disagreeing.
+      if (name === 'extension.mjs') conflicts.push({ text: TEXT.moduleKept(path), next: `${restoreExtensionPair(shellWord(root))}, then ${next}` });
+      else conflicts.push({ text: found.state === 'edited' ? TEXT.scriptEdited(path) : TEXT.scriptNotOurs(path), next });
     }
   }
 
@@ -857,7 +863,9 @@ export function plan(dir, { downgrade = false, binFromPlugin = false, execute = 
     const action = { kind: 'extension-swap', path: EXTENSIONS_PATH, detail: TEXT.swapExtension(moduleState.version), without: extensionsTextWith(extensions, null), bytes: shippedBytes('extension.mjs'), text: plannedText, entry };
     actions.splice(firstScript === -1 ? actions.length : firstScript, 0, action);
   } else if (kept.includes('extension.mjs')) {
-    conflicts.push({ text: TEXT.extensionSkipped, next });
+    // A kept module never stands beside our entry (after the whole-branch review): kh-harness would
+    // block every tool call. Without it tool calls work and the gate's contract check refuses commits.
+    if (listedFirst !== undefined) actions.push({ kind: 'entry-out', path: EXTENSIONS_PATH, detail: TEXT.takeEntryOut, without: extensionsTextWith(extensions, null) });
   } else {
     const listed = listedFirst;
     if (listed === undefined) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.addEntry(extensions.state === 'absent'), text: plannedText, entry, create: true });
@@ -1041,6 +1049,11 @@ export function applyPlan(root, planned, { onWrite } = {}) {
           writeWhole(action.path, hookText(action.name, { env: planned.env, node: planned.node, version: KIT_VERSION }), 0o755);
         });
         hooksWritten.push(action);
+      } else if (action.kind === 'entry-out') {
+        const extensions = join(root, EXTENSIONS_PATH);
+        write(EXTENSIONS_PATH, () => (action.without === null ? rmSync(extensions, { force: true }) : writeWhole(extensions, action.without, 0o644)));
+        manifest.extensionEntry = null;
+        save();
       } else if (action.kind === 'extension-swap') {
         const extensions = join(root, EXTENSIONS_PATH);
         write(EXTENSIONS_PATH, () => (action.without === null ? rmSync(extensions, { force: true }) : writeWhole(extensions, action.without, 0o644)));
