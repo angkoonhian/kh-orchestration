@@ -15,3 +15,93 @@ Run its tests with `npm test` (Node 22 or later, no dependencies), and the slow 
 - Refs under `refs/kh-orchestration/approved/`, one per approval, each naming the approved tree so that `git gc` and `git prune` keep it. They are not branches or tags, so an ordinary push or clone leaves them out, but `git push --mirror` and a mirror clone send them.
 
 `node <kh-orchestration>/scripts/uninstall.mjs <repository> --yes` removes what apply wrote and kept unchanged; with `--state` it also removes the shared state and the refs under `refs/kh-orchestration/`.
+
+## How it works
+
+**The verdict.** `ko.mjs run` works only on a tidy tree (nothing unstaged in tracked files, no untracked file that is not ignored), and refuses while any git filter driver other than `lfs` is configured. It takes the tree of the index (`git write-tree`) and its base: the merge base of `HEAD` with the base branch that `officers.json` names, or `HEAD` itself on the base branch. It runs every officer, in the listed order, on the working tree, which then equals that tree, and records a verdict keyed by the tree and the base, in the shared state: each officer's result, the first 4,000 characters of each failure's output, the waivers in force, the rules marked `approval: agent` that changed since the base, and the digest of the protected files. It also appends a line to the run journal (`journal.jsonl`) and, when an agent runs it in a session where kh-harness's session log is enabled, one event to that log.
+
+An officer is a command, run without a shell from the repository's top directory, that exits 0 to pass. It sees `KO_OPTIONS` (its `options` as JSON), `KO_BASE`, `KO_TREE`, `KO_CHANGED_FILE` (a file listing the changed paths, NUL-separated) and `KO_WAIVERS`. Its time limit is `timeoutSeconds`, 600 by default and at most 3,600. An officer whose `appliesTo` globs match no changed path is recorded as skipped, which counts as a pass.
+
+**The commit gate.** git runs `pre-commit` before a commit and `pre-merge-commit` before a merge commit; each starts `bin/gate.mjs` from the shared state, never from the tree being committed. The gate stops at the first check that decides:
+
+1. the owner's off switch: allowed, unchecked;
+2. the branch is exempt: allowed, unchecked;
+3. the tree holds the install (`officers.json` and `extension.mjs` as files);
+4. the working copies of `.claude/settings.json`, `.claude/kh-harness/`, `.claude/scripts/` and `.claude/kh-orchestration/scripts/` equal the tree, byte for byte and mode for mode, compared in Node, not by git;
+5. `RULES.md` parses and the digest can be computed;
+6. the digest is one the owner approved;
+7. kh-harness contract 1 holds: neither settings file sets a `NODE_*`, `LD_*` or `DYLD_*` variable under `env`, `checkContract1` finds nothing in the working directory, and the probe (kh-harness's hook run on a call the extension must block) blocks it, run on a private copy of the approved tree outside the repository;
+8. a passing verdict exists for this tree and base, recording the same digest;
+9. the index still holds the same tree;
+10. the tree is recorded for the git process that is committing, and the gate allows.
+
+Nothing from the repository is executed before step 6 has established that the owner approved those exact bytes. A refusal prints the reason and the exact command to run next, then the line `kh-orchestration: the commit gate did not allow this commit.`
+
+**The three hooks.** `pre-commit` and `pre-merge-commit` run the gate. `reference-transaction` closes the gap between the gate's exit and git's reading of the index: in the `prepared` state of the committing process it refuses the branch update unless the new commit holds exactly the tree the gate allowed, and on an allow it records the commit as accepted (`accepted/<commit>.json`). For every other ref update (a rebase, a fetch, a reset) it exits in plain `sh` without starting Node. Each hook is a `#!/bin/sh -p` script that calls no program by name: it finds the shared state from its own path and starts Node by the absolute path recorded at install, through `env -i` with an allowlist of variables, so no `NODE_*`, `LD_*`, `DYLD_*` or shell function reaches the gate. A hook allows only when the gate exits 0 and prints the exact token `kh-orchestration: allowed`. `apply` never writes over a hook it did not write; it prints the one line to add to that hook instead.
+
+**The approval lock.** The protected files are `docs/harness/RULES.md`, `.claude/kh-orchestration/officers.json`, `.claude/settings.json`, everything under `.claude/kh-orchestration/scripts/`, `.claude/kh-harness/` and `.claude/scripts/`, every officer script that an officer's `argv` names as a file in the tree, and every file matching a glob in `officers.json`'s `protected` list. The digest is one SHA-256 over a line `path`, `mode`, `git object id` for each of them, read from the tree object (never the working directory), with `RULES.md` contributing the hash of its canonical form. A link (symbolic or submodule) at or above anything protected makes the tree unapprovable. Approvals are a set of digests, so branches with different approved content coexist, and a verdict taken before an approval stays valid once its digest is approved. `approve`, run by the owner in their own terminal, shows the covered files and the diff since the last approval on the branch (or, failing that, since an approved tree whose digest is the merge base's, or the most recent approved tree), asks for the word `approve`, refreshes `bin/` from the approved tree, pins that tree with a ref and records the digest. Right after `apply`, nothing is approved.
+
+**Minor rules.** A rule in `RULES.md` with exactly one line `approval: agent` is minor: its heading's title and the values of its `why`, `verify` and `priority` lines are left out of the digest, so an agent may reword them and commit. Everything else about it is covered: its id, every other line (`status`, `enforced-by`, `pointer`, `approval`, any other key or prose), and its presence. Every change to a minor rule since the base is listed in `run`'s output, in the verdict and in `verify-branch`'s report. A rule without that line needs the owner for any change, and so does adding a rule, removing one, or marking one `approval: agent`.
+
+**The hook extension.** kh-harness runs `.claude/kh-orchestration/scripts/extension.mjs` before every tool call of a Claude Code session, through its extension point, with `onFailure: "block"`. It is one self-contained file, starts no process and writes nothing. It blocks the one-line ways round the gate: `--no-verify` (or `-n` on `commit`) for `commit`, `merge` and `pull`; `git commit-tree`; git configuration that redirects hooks or names a command git runs; any write to the git directory (its hooks, its config, the shared state), which reading commands may still read; the owner's `ko.mjs` commands and the installer's `--yes`; unsetting the session variables those rely on; edits to the protected files other than `RULES.md` unless the owner opened the worktree for proposals with `propose`; any edit to `.claude/settings.local.json`; and restoring or unstaging the extension's entry or its module without the other. `RULES.md` may always be edited: the digest decides at commit whether the edit was within what an agent may change.
+
+**The session brief.** The plugin's `SessionStart` hook tells each session in a repository where kh-orchestration is installed on this machine, in under 600 characters, that commits are checked, the `run` command to use, what only the owner does, whether the worktree is open for proposals, and what is wrong when something is. It reads the state through the approved copy in the git directory, which a clone does not carry, so a clone stays silent until the owner runs `apply` there. A skill, `orchestrate`, answers the questions people ask by name ("run the checks", "is this branch ready to merge", "why was my commit refused"); nothing depends on it being used.
+
+## Commands
+
+The agent's commands, run from anywhere in the repository with the working copy's `node .claude/kh-orchestration/scripts/ko.mjs <command>`:
+
+| Command | What it does |
+|---|---|
+| `run` | runs the officers on the staged tree and records the verdict |
+| `status [--json]` | what the commit gate sees in this worktree, with every problem and its next command; executes nothing from the repository |
+| `verify-branch [--no-run]` | whether `HEAD`'s tree passes the gate's checks (an exemption or the off switch does not make it pass); runs the officers on it first unless `--no-run` |
+| `unexempt <branch>` | ends a branch's exemption (it only tightens, so it is not the owner's) |
+
+The owner's commands act only from the approved copy, `node <git-common-dir>/kh-orchestration/bin/ko.mjs <command>`, and refuse inside a Claude Code session (`CLAUDECODE` or `CLAUDE_CODE_SESSION_ID` set):
+
+| Command | What it does |
+|---|---|
+| `approve` | approves the protected files of the staged tree, after showing them and asking for the word `approve`; closes this worktree for proposals |
+| `propose` | opens this worktree for agents' edits to the protected files until the next `approve` |
+| `waive <rule> --reason <text>` | waives a rule's officer on the current branch; the officer sees it in `KO_WAIVERS` |
+| `exempt <branch> --reason <text>` | lets a branch's commits through the gate unchecked |
+| `off`, `on` | switches the gate off or on for the whole repository |
+
+The plugin's commands, run from the plugin: `node <kh-orchestration>/scripts/apply.mjs <repository> [--yes] [--downgrade] [--bin-from-plugin]` (a dry run without `--yes`), `node <kh-orchestration>/scripts/detect.mjs <repository> [--json]` (a read-only report) and `node <kh-orchestration>/scripts/uninstall.mjs <repository> [--yes] [--state]`. `apply --yes` and `uninstall --yes` are the owner's and refuse inside a session. `apply` refuses where kh-harness's contract file is missing or names a contract other than 1, where kh-harness's `PreToolUse` entry script is not registered, where git is older than 2.30, where `/bin/sh` does not take `-p`, where `core.hooksPath` is set at any level, and where `.claude` is a link.
+
+## What it costs
+
+Measured on the build machine (Linux, Node 26, git 2.56, 2026-11-26):
+
+- An allowed commit takes about 140 ms, most of it the contract probe and the second Node start, in `reference-transaction`.
+- Every other ref update starts no Node, but git still starts the `reference-transaction` hook once for each state of each transaction: a rebase of 20 commits takes about 290 ms with it against about 10 ms without it.
+- The hook extension: about 7 to 11 ms on each tool call (kh-harness's extension loader and this module), well inside kh-harness's latency budget.
+- `approve`: about 160 ms, of which the check that the new `bin/` loads is three Node starts. `run`: one Node start plus the officers' own time.
+- With kh-harness's session log enabled, each `run` an agent starts in a session adds one event. The gate's probe runs kh-harness's hook in a private copy outside the repository, for which the log is not enabled, so commits add nothing to it.
+
+## What it does not do
+
+**The shared state is not tamper-proof.** Verdicts and approvals are files in the git directory. The extension blocks a session's one-line writes to them, and the run journal keeps a record, but code an agent manages to run outside the gate (a script it wrote to disk, a command git runs from configuration before the hook) can write a false verdict or approval. This guards against skipped steps, not against an agent set on cheating. When it matters, `verify-branch` (without `--no-run`) runs the officers again on the branch's head. The gate's private copy of the approved tree sits in a temporary directory the same user can write; a process rewriting it during the probe can change what the probe runs, but not that commit's outcome, which was read first.
+
+**What the hook extension does not catch.** It reads a command's words; it is not a shell. It does not see: `eval`, and variables holding paths or flags (`git merge $F`; `N=-n; git commit --trailer -m "$N"`); a script written to disk and then run; strings built up inside inline code; an encoded payload piped to an interpreter (`… | base64 -d | sh`), `sed -f` and `awk -f` script files; editor scripting (`vim -es`, `ed`, `ex`) and `tar --checkpoint-action`; git options that run a command (`rebase -x`, `bisect run`, `submodule foreach`), a pager or editor git starts, and an alias already configured; a copy of `ko.mjs` under another name, or its name or subcommand produced by a search or a substitution; a glob or a search whose output becomes another command's words; copying or unpacking over the git directory through its parent, or through a link made earlier; variables that git or a shell runs, or that steer git, when exported in an earlier command line; a shell write to a tracked protected file such as `officers.json` (only the edit tools are guarded; the digest refuses the commit); `.claude/settings.local.json` changed through the shell (the gate's contract check refuses the commit); and, while `officers.json` cannot be read, edits to the officer scripts and `protected` files. Keeping the extension's entry and its module together is best effort: pathspec magic, globs, absolute paths, `git -C` or `git stash push -- <one of them>` can still split them, after which kh-harness blocks every tool call until the owner runs `apply --yes`. A commit made outside Claude Code is not seen by the extension at all, so `--no-verify` typed by a person still skips `pre-commit` and `pre-merge-commit`. The full list is the header of `assets/scripts/extension.mjs`.
+
+**Commits git never hooks.** git runs no commit hook for a rebase, a cherry-pick, a revert, `git am`, a fast-forward merge, `git stash`, `update-ref` and other plumbing, or a commit pulled from a clone. These are not blocked, since agents need them. Their result has no verdict for its tree, and `verify-branch` says so and fails until the officers pass on the head; `status` names such a head too. Run `verify-branch` before every merge into the base branch. A clone of an installed repository has no hooks and no shared state (they live in the git directory) until the owner runs `apply --yes` in it, so commits there are not checked.
+
+**What a verdict does not lock.** The digest covers the protected files only. It does not cover the code an officer checks (by design), the tools an officer starts (`node_modules`, `npm`, `python3` and anything found through `PATH`), a directory named in `argv` (`eslint src`), `package.json` for an `npm run` officer unless `package.json` is added to `protected`, or anything else not in `protected`. `apply` and `detect` say per officer what the digest covers. An officer inherits the environment of whoever runs `run` (`NODE_OPTIONS`, `PYTHONPATH` and the like). An officer whose `appliesTo` matched nothing counts as a pass.
+
+**Known over-blocks an agent will meet.** Each has a plain way round:
+
+- inline code that mentions a guarded word (`node -e "…git commit -n…"`) and a test-name pattern behind a runner (`npx jest -t 'commit -n'`, `vitest -t`, `rspec -e`): put the code in a file, or the pattern in the test's configuration;
+- `git commit --author "$A"`: write the value out, or glue it (`--author="$A"`);
+- a `PATH=` or `HOME=` assignment on any command in a line that also runs git: run git in a line of its own;
+- `ssh host git commit -n …`: run the remote command from the person's terminal;
+- `git config --remove-section filter.lfs` and other writes of hook-related configuration: the owner changes configuration;
+- `rm .git/index.lock` without `-f` and any other write into the git directory: `rm -f .git/index.lock` is the one write allowed;
+- unstaging `extensions.json` or `extension.mjs` alone: unstage the whole install, as the message says;
+- a commit while the install's live files differ from the tree: stage them for approval, or have the owner run `apply --yes`;
+- `run` refuses while a git filter driver other than `lfs` is configured.
+
+**Platform notes.** It needs git 2.30 or later and a `/bin/sh` that accepts `-p` (`apply` checks both). The hooks have been tested with `/bin/sh` as bash and as zsh in `sh` emulation, not dash, BusyBox or ksh. A repository whose `.claude` is a link cannot install it. The hooks name Node by its absolute path, so after Node moves (an nvm switch, an upgrade to another path) every commit is refused until the owner runs `apply --yes` again. A `core.hooksPath` set at any level, the global one included, makes git skip the repository's hooks, which turns the gate off: `apply` refuses while one is set, and `status` and the session brief report one set later (one set in another worktree's own configuration is seen only by `status` there). A later line in `.gitattributes` that overrides `.claude/** -text` is not detected. Refs under `refs/kh-orchestration/approved/` accumulate, one per distinct approved digest, and the `accepted/` records one per gated commit. Two owner commands run at the same moment can lose one update. `uninstall` leaves the commits that already contain the install as they are, and does not remove a hooks folder that `apply` created.
+
+**What an agent may change in a minor rule.** The heading's title and the values of `why`, `verify` and `priority` (so an agent may change a minor rule's check command and move it between `normal` and `high`), and nothing else. Those parts may not contain `<!--`, `-->`, a control character other than TAB, a line or paragraph separator, or a zero-width or bidi character; such a rule makes the tree unapprovable. A free part inside a closed HTML comment is covered byte for byte.
