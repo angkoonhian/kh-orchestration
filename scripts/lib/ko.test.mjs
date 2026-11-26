@@ -97,10 +97,10 @@ test('run refuses an untidy tree, naming what to stage, at most ten paths, and r
   for (let index = 0; index < 11; index += 1) repo.write(`new-${String(index).padStart(2, '0')}.txt`, 'x\n');
   const result = ko(repo.root, ['run']);
   const paths = ['a.txt', ...Array.from({ length: 11 }, (_, index) => `new-${String(index).padStart(2, '0')}.txt`)];
-  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.untidy(paths), `git add -A && ${agent(repo.root, 'run')}`)]);
+  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.untidy(paths), `git -C ${shellWord(repo.root)} add -- <each path meant to be committed>, then ${agent(repo.root, 'run')}`)]);
   assert.equal(
     TEXT.untidy(['a', 'b']),
-    'The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage or remove: a, b.',
+    'The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage the files meant to be committed, and add the others (a .claude/settings.local.json, say) to .gitignore: a, b.',
   );
   assert.ok(TEXT.untidy(paths).endsWith('new-08.txt and 2 more.'));
   assert.equal(existsSync(join(stateDir(repo.root), 'verdicts')), false);
@@ -276,7 +276,7 @@ test('with the log disabled, or the contract not listing the log, run records no
   assert.equal(logCommand(repo.root, 'enable').status, 0);
   writeFileSync(join(repo.root, '.claude/scripts/harness-log.mjs'), 'process.stdout.write("must not be imported");\n');
   const unchecked = ko(repo.root, ['run'], { env: { ...testEnv(), CLAUDE_CODE_SESSION_ID: 'ko-test-unhashed' } });
-  assert.deepEqual([unchecked.status, unchecked.stderr], [1, refusalText(TEXT.untidy(['.claude/scripts/harness-log.mjs']), `git add -A && ${agent(repo.root, 'run')}`)]);
+  assert.deepEqual([unchecked.status, unchecked.stderr], [1, refusalText(TEXT.untidy(['.claude/scripts/harness-log.mjs']), `git -C ${shellWord(repo.root)} add -- <each path meant to be committed>, then ${agent(repo.root, 'run')}`)]);
   stage(repo);
   const staged = ko(repo.root, ['run'], { env: { ...testEnv(), CLAUDE_CODE_SESSION_ID: 'ko-test-unhashed' } });
   assert.equal(staged.status, 0);
@@ -1077,8 +1077,9 @@ test('every ko.mjs command a refusal or report prints works where the person is:
   const fromDeep = (args) => ko(side, args, { cwd: deep });
   const untidy = fromDeep(['run']);
   const next = untidy.stderr.split('\n')[1].slice('Next: '.length);
-  assert.equal(next, `git add -A && ${agent(side, 'run')}`);
-  const followed = spawnSync('sh', ['-c', next], { cwd: deep, env: testEnv(), encoding: 'utf8' });
+  assert.equal(next, `git -C ${shellWord(side)} add -- <each path meant to be committed>, then ${agent(side, 'run')}`);
+  // The person stages the listed file meant to be committed, then runs the officers.
+  const followed = spawnSync('sh', ['-c', next.replace('<each path meant to be committed>', 'docs/deep/n.txt').replace(', then ', ' && ')], { cwd: deep, env: testEnv(), encoding: 'utf8' });
   assert.equal(followed.status, 0, followed.stderr);
   const approved = owner(repo.root, ['approve'], { cwd: deep, input: 'approve\n' });
   assert.equal(approved.status, 0, approved.stderr);

@@ -130,7 +130,7 @@ export const TEXT = Object.freeze({
   failed: (reason) => `ko.mjs could not finish: ${sentence(reason)}`,
   unexpected: 'an unexpected error stopped it',
   filterDriver: (name, key) => `The git filter driver ${shownName(name)} is configured (${shownName(key)}). A clean filter can make a working tree that differs from the index look tidy, and the officers run on the working tree, so they are not run here. Remove the driver from the configuration file shown below; only lfs is allowed.`,
-  untidy: (paths) => `The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage or remove: ${named(paths)}.`,
+  untidy: (paths) => `The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage the files meant to be committed, and add the others (a .claude/settings.local.json, say) to .gitignore: ${named(paths)}.`,
   cannotRun: (problem) => `The officers cannot be run on this tree: ${sentence(problem)}`,
 
   runHeader: (tree, base) => `Officers on the staged tree ${short(tree)} against the base ${short(base)}:`,
@@ -384,7 +384,9 @@ async function run(root) {
   const filter = foreignFilter(root);
   if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
   const untidy = untidyPaths(root);
-  if (untidy.length > 0) return refusal(TEXT.untidy(untidy), `git add -A && ${agentCommand(root, 'run')}`);
+  // Never a command that stages everything (after Task 9's re-review): an unignored
+  // settings.local.json would go into the tree the owner approves.
+  if (untidy.length > 0) return refusal(TEXT.untidy(untidy), `git -C ${shellWord(root)} add -- <each path meant to be committed>, then ${agentCommand(root, 'run')}`);
   const tree = indexTree(root);
   const branch = currentBranch(root);
   const read = officersOfTree(root, tree);

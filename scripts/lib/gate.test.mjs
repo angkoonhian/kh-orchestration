@@ -261,7 +261,7 @@ test('live files: a working extension that blocks only the probe, re-hashed and 
   assert.deepEqual(contractHolds(repo.root), { ok: true });
   // git names the differing paths in its order: the re-hashed extensions file comes first.
   const first = '.claude/kh-harness/extensions.json';
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers(first), `git restore -- ${first}`));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffersKept(first), keptNext(first)));
 
   assert.equal(
     REASONS.liveDiffers('x'),
@@ -404,6 +404,8 @@ test('Critical 2: an index changed after the tree was judged is refused before t
 // What the gate prints on a refusal, and what the hook adds after it (decision 18, amended).
 const gateText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
 const HOOK_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
+// The gate's next step for an installer's file that differs (after Task 9's re-review).
+const keptNext = (path) => `git add -- ${path}, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes`;
 const refusalText = (reason, next) => `${gateText(reason, next)}${HOOK_LINE}`;
 // The entry's own text when ko-gate.mjs or a sibling cannot be loaded: literals only.
 // Its next command is apply, from the plugin: the owner's commands run from this same bin/.
@@ -482,7 +484,7 @@ test('Important 1 through git: a neutered live extension, unstaged, with an ordi
   assert.equal(gitIn(repo.root, ['add', 'z.txt']).status, 0);
   await runAndApprove(repo.root);
   const first = '.claude/kh-harness/extensions.json';
-  assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.liveDiffers(first), `git restore -- ${first}`));
+  assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.liveDiffersKept(first), keptNext(first)));
 });
 
 test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commit; a missing sibling with fixed text, a missing gate, a gate that is a directory, or no bin/ with only the hook\'s line', async () => {
@@ -1395,7 +1397,17 @@ test('rule 3: bytes are compared, so a CRLF working copy of a live file differs;
   const settings = join(repo.root, '.claude/settings.json');
   const original = readFileSync(settings);
   writeFileSync(settings, original.toString('utf8').replaceAll('\n', '\r\n'));
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveLineEndings('.claude/settings.json'), 'rm -- .claude/settings.json && git restore -- .claude/settings.json'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveLineEndings('.claude/settings.json'), 'git checkout -- .claude/settings.json'));
+  // An installer's file is never restored or removed (after Task 9's re-review): stage it, or the owner's apply.
+  const officersGit = join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs');
+  const gitScript = readFileSync(officersGit);
+  writeFileSync(officersGit, gitScript.toString('utf8').replaceAll('\n', '\r\n'));
+  writeFileSync(settings, original);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveLineEndingsKept('.claude/kh-orchestration/scripts/ko-git.mjs'), keptNext('.claude/kh-orchestration/scripts/ko-git.mjs')));
+  writeFileSync(officersGit, `${gitScript}// x\n`);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffersKept('.claude/kh-orchestration/scripts/ko-git.mjs'), keptNext('.claude/kh-orchestration/scripts/ko-git.mjs')));
+  writeFileSync(officersGit, gitScript);
+  writeFileSync(settings, original.toString('utf8').replaceAll('\n', '\r\n'));
   writeFileSync(settings, `${original.toString('utf8').replaceAll('\n', '\r\n')}x`);
   assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/settings.json'), 'git restore -- .claude/settings.json'));
   writeFileSync(settings, original);
@@ -1412,7 +1424,7 @@ test('rule 3: bytes are compared, so a CRLF working copy of a live file differs;
   const scripts = join(repo.root, '.claude/kh-orchestration/scripts');
   renameSync(scripts, `${scripts}-real`);
   symlinkSync(`${scripts}-real`, scripts);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/kh-orchestration/scripts'), 'git restore -- .claude/kh-orchestration/scripts'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffersKept('.claude/kh-orchestration/scripts'), keptNext('.claude/kh-orchestration/scripts')));
   rmSync(scripts);
   renameSync(`${scripts}-real`, scripts);
   writeFileSync(join(repo.root, '.claude/scripts/big.mjs'), Buffer.alloc(4 * 1024 * 1024 + 1));

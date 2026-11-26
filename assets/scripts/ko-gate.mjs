@@ -107,6 +107,8 @@ export const REASONS = Object.freeze({
   probeDirRelative: 'TMPDIR names a relative path, so the place of the private copy of the approved tree depends on the directory git runs in; set TMPDIR to an absolute directory outside the repository',
   probeDirUnusable: 'the temporary directory for the private copy of the approved tree (TMPDIR, or /tmp when it is not set) does not exist or cannot be written; set TMPDIR to a directory outside the repository that can',
   liveDiffers: (path) => `The working copy of ${path} differs from the tree being committed, and the working copy is what this session's hooks run. Stage it for the owner to approve, or restore it as below, then commit again.`,
+  liveDiffersKept: (path) => `The working copy of ${path} differs from the tree being committed, and it is kh-orchestration's or shared with other plugins, so an older copy must not be put back beside the others. Stage it as below so the owner can approve it, or have the owner run kh-orchestration's apply again, then commit again.`,
+  liveLineEndingsKept: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings (core.autocrlf or a text attribute), and it is kh-orchestration's or shared with other plugins. Add the line .claude/** -text to .gitattributes, then stage it as below for the owner to approve, or have the owner run apply again.`,
   liveLineEndings: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings: this checkout converts them (core.autocrlf or a text attribute), and the working copy is what this session's hooks run. Add the line .claude/** -text to .gitattributes, check the file out again as below, then commit again.`,
   liveMode: (path) => `The working copy of ${path} differs from the tree being committed only in its executable bit: this checkout does not keep file modes (core.fileMode false, or a filesystem without them), and the working copy is what this session's hooks run. Set the bit as the tree has it, as below, then commit again.`,
   liveStagedElsewhere: (path) => `${path} is staged with a change this partial commit leaves out, so its working copy, which this session's hooks run, differs from the tree being committed. Commit without a path list, or restore it, then commit again.`,
@@ -214,13 +216,16 @@ function listedUnder(root, dir) {
   return found;
 }
 
-// Whether no message may suggest removing `path` (after Task 9's review): kh-harness's extensions
-// file, shared by every plugin that registers an extension, and any file kh-orchestration's
-// manifest records as written by its installer. A manifest that cannot be read records nothing.
+// Whether no message may suggest removing or restoring `path` (after Task 9's review and
+// re-review): kh-harness's extensions file, shared by every plugin that registers an extension, and
+// every file kh-orchestration's installer writes: all of its install folder, and whatever else the
+// working copy's manifest records when it parses. Restoring an older copy of one puts it
+// beside newer siblings: an old entry beside a new extension.mjs blocks every tool call.
 const SHARED_FILES = ['.claude/kh-harness/extensions.json'];
 const MANIFEST = '.claude/kh-orchestration.manifest.json';
+const INSTALL_FOLDER = '.claude/kh-orchestration/';
 function keptByAnInstaller(root, path) {
-  if (SHARED_FILES.includes(path)) return true;
+  if (SHARED_FILES.includes(path) || path.startsWith(INSTALL_FOLDER)) return true;
   const read = readNoFollow(join(root, MANIFEST));
   try {
     const files = JSON.parse(read.bytes?.toString('utf8'))?.files;
@@ -229,6 +234,9 @@ function keptByAnInstaller(root, path) {
     return false;
   }
 }
+// The next step for an installer's file that differs: stage it for the owner's approval, or have
+// the owner's apply write it again (the repair line ko.mjs and status print, a test holds them).
+const KEPT_NEXT = (word) => `git add -- ${word}, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes`;
 
 // A differing path's refusal: staged in the repository's own index with other content than the
 // tree's means a partial commit leaves it out, and restoring or removing it would lose the change.
@@ -239,8 +247,9 @@ function differsRefusal(root, path, entry, how) {
   if (staged !== null && (entry === undefined || staged.oid !== entry.oid || staged.mode !== entry.mode)) return refuse(REASONS.liveStagedElsewhere(path), 'git commit');
   const word = shellWord(path);
   if (entry === undefined) return refuse(keptByAnInstaller(root, path) ? REASONS.liveUntrackedKept(path) : REASONS.liveUntracked(path), `git add -- ${word}`);
-  if (how === 'lineEndings') return refuse(REASONS.liveLineEndings(path), `rm -- ${word} && git restore -- ${word}`);
   if (how === 'mode') return refuse(REASONS.liveMode(path), `chmod ${entry.mode === '100755' ? '+x' : '-x'} -- ${word}`);
+  if (keptByAnInstaller(root, path)) return refuse(how === 'lineEndings' ? REASONS.liveLineEndingsKept(path) : REASONS.liveDiffersKept(path), KEPT_NEXT(word));
+  if (how === 'lineEndings') return refuse(REASONS.liveLineEndings(path), `git checkout -- ${word}`);
   return refuse(REASONS.liveDiffers(path), `git restore -- ${word}`);
 }
 
@@ -263,7 +272,7 @@ function convertedFrom(oid, bytes) {
 function liveRefusal(root, live) {
   for (const dir of LIVE_ANCESTORS) {
     const stat = lstatOrNull(join(root, dir));
-    if (stat !== null && !stat.isDirectory()) return refuse(REASONS.liveDiffers(dir), `git restore -- ${shellWord(dir)}`);
+    if (stat !== null && !stat.isDirectory()) return keptByAnInstaller(root, dir) ? refuse(REASONS.liveDiffersKept(dir), KEPT_NEXT(shellWord(dir))) : refuse(REASONS.liveDiffers(dir), `git restore -- ${shellWord(dir)}`);
   }
   const inTree = new Map(live.map((entry) => [entry.path, entry]));
   for (const entry of live) {

@@ -11,10 +11,12 @@ import { join } from 'node:path';
 import { KIT_VERSION, installKhHarness, isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import { EXTENSIONS_PATH, OFFICERS_PATH, PLUGIN_DIR, SCRIPTS_DIR, TEXT, applyCommand, envPath, plan, planLines, uninstallPlan } from './install.mjs';
 import { MANIFEST_PATH } from './manifest.mjs';
+import { ageInstall, harnessAllowsRead } from './install-fixture.mjs';
 import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
 import { checkContract1, probeContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 import { PROBE_PAYLOAD, ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
+import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { indexTree } from '../../assets/scripts/ko-git.mjs';
 import { ownerCommand, stateDir } from '../../assets/scripts/ko-state.mjs';
@@ -35,6 +37,7 @@ after(() => {
 });
 
 const REFUSED_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
+const TEXT_UNTIDY_START = 'The working tree differs from the index';
 const command = (name) => join(PLUGIN_DIR, 'scripts', `${name}.mjs`);
 const env = () => ({ ...testEnv(), KH_DATA_DIR: process.env.KH_DATA_DIR, HK_MARKER_DIR: process.env.HK_MARKER_DIR });
 const run = (name, args, options = {}) => spawnSync(process.execPath, [command(name), ...args], { env: env(), encoding: 'utf8', ...options });
@@ -270,6 +273,46 @@ test('a foreign hook of each name: the other two hooks are written, the printed 
     assert.equal(readFileSync(foreign, 'utf8'), pasted, `${name}: the foreign hook is left as it is`);
     assert.ok(lines(removed.stdout).includes(TEXT.hostedRemains(name, foreign)), name);
   }
+});
+
+test('after an upgrade, following only the printed next steps lands a commit, and kh-harness never blocks a tool call on the way (after Task 9\'s re-review)', () => {
+  const repo = fresh();
+  // An older kit's install, approved and committed.
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  ageInstall(repo.root);
+  followSteps(repo.root, TEXT.steps(repo.root, ownerCommand(repo.root, 'approve'), agentCommand(repo.root, 'run')).join('\n'));
+  assert.ok(harnessAllowsRead(repo.root));
+  const upgraded = run('apply', [repo.root, '--yes']);
+  assert.equal(upgraded.status, 0, upgraded.stderr);
+  assert.ok(harnessAllowsRead(repo.root), 'after the upgrade');
+  const approve = ownerCommand(repo.root, 'approve');
+  const runCommand = agentCommand(repo.root, 'run');
+  let landed = false;
+  for (let step = 0; step < 40 && !landed; step += 1) {
+    const attempt = git(repo.root, 'commit', '-q', '-m', 'upgrade');
+    if (attempt.status === 0) {
+      landed = true;
+      break;
+    }
+    const next = attempt.stderr.split('\n').find((line) => line.startsWith('Next: '))?.slice('Next: '.length) ?? '';
+    assert.ok(!/git restore|\brm -- /.test(next), `step ${step}: ${next}`);
+    if (next.startsWith('git add -- ')) assert.equal(shell(next.split(', or ')[0], { cwd: repo.root }).status, 0, next);
+    else if (next === approve) assert.equal(shell(next, { cwd: repo.root, input: 'approve\n' }).status, 0, next);
+    else if (next === runCommand || next === COMMANDS.run) {
+      let ran = shell(next, { cwd: repo.root });
+      // run names what to stage when the tree is untidy: here the manifest apply rewrote.
+      if (ran.status !== 0 && ran.stderr.includes(TEXT_UNTIDY_START)) {
+        const listed = ran.stderr.split('\n')[0].split('.gitignore: ')[1].replace(/\.$/, '').split(', ');
+        assert.deepEqual(listed, [MANIFEST_PATH], ran.stderr);
+        assert.equal(git(repo.root, 'add', '--', ...listed).status, 0);
+        ran = shell(next, { cwd: repo.root });
+      }
+      assert.equal(ran.status, 0, ran.stdout + ran.stderr);
+    }
+    else assert.fail(`step ${step}: a next step this test does not follow: ${next}`);
+    assert.ok(harnessAllowsRead(repo.root), `after step ${step}: ${next}`);
+  }
+  assert.ok(landed, 'the upgrade was committed');
 });
 
 test('detect reports no install, a fresh install, and each broken state, and --json carries the same in a stable shape; it writes nothing', () => {
