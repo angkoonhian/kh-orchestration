@@ -1,15 +1,16 @@
 // The installer's logic (Task 9) called in-process, as the three commands call it: what `plan`
 // refuses and proposes, what `applyPlan` writes and records, how it shares the extensions file
-// (Review Focus 4), what it keeps, a kill after each of its writes, and its self-test. The
-// commands themselves, end to end through real git, are lifecycle.test.mjs's.
-import { test, after } from 'node:test';
+// (Review Focus 4), what it keeps, and its self-test. A kill after each write is
+// install-kill.test.mjs's; the commands, end to end through real git, are lifecycle.test.mjs's.
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { KIT_VERSION, installKhHarness, isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
+import { KIT_VERSION, makeRepo, testEnv } from './test-repo.mjs';
+import { ageInstall, entryOf, everything, fresh, hooksDir, listing, read, repos, scratch, sha256 } from './install-fixture.mjs';
 import {
   ATTRIBUTES_LINE, EXTENSIONS_PATH, OFFICERS_PATH, SCRIPTS_DIR, SCRIPT_NAMES, TEXT, applyCommand, applyPlan, applyUninstall, coverageOf, envPath, khHarnessApply,
   plan, shippedScripts, uninstallPlan,
@@ -22,68 +23,8 @@ import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { stateDir, writeInflight } from '../../assets/scripts/ko-state.mjs';
 import { shellWord } from '../../assets/scripts/extension.mjs';
 
-isolateProcessEnv();
-// The in-process calls run git with this process's environment: no user or system configuration.
-process.env.GIT_CONFIG_GLOBAL = '/dev/null';
-process.env.GIT_CONFIG_NOSYSTEM = '1';
-const repos = [];
-const scratch = [];
-after(() => {
-  for (const repo of repos) repo.cleanup();
-  for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
-});
-
-// A repository with kh-harness installed and committed, as an owner has it before installing kh-orchestration.
-function fresh({ baseBranch = 'main', files = {} } = {}) {
-  const repo = makeRepo({ baseBranch, files });
-  repos.push(repo);
-  installKhHarness(repo.root);
-  repo.commitAll('kh-harness');
-  return repo;
-}
-const hooksDir = (root) => join(root, '.git', 'hooks');
-const read = (root, path) => readFileSync(join(root, path), 'utf8');
-const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
-const entryOf = () => {
-  const bytes = shippedScripts().find((script) => script.name === 'extension.mjs').bytes;
-  return { id: 'kh-orchestration', version: KIT_VERSION, module: `${SCRIPTS_DIR}/extension.mjs`, sha256: lfSha256(bytes), onFailure: 'block' };
-};
 const OTHER = { id: 'other-plugin', version: '2.0.0', module: '.claude/other/ext.mjs', sha256: 'a'.repeat(64), onFailure: 'block' };
-
-// Everything under `dir` and its bytes, so a run can be shown to have written nothing.
-function listing(dir) {
-  if (!existsSync(dir)) return {};
-  const walk = (relative) => readdirSync(join(dir, relative), { withFileTypes: true }).flatMap((entry) => {
-    const path = relative === '' ? entry.name : `${relative}/${entry.name}`;
-    if (entry.isDirectory()) return [[`${path}/`, ''], ...walk(path)];
-    const stat = lstatSync(join(dir, path));
-    return [[path, `${(stat.mode & 0o777).toString(8)} ${entry.isSymbolicLink() ? 'link' : sha256(readFileSync(join(dir, path)))}`]];
-  });
-  return Object.fromEntries(walk(''));
-}
-const everything = (root) => ({ tree: listing(root), common: listing(join(root, '.git')) });
-
 const refusalsOf = (dir) => plan(dir).refusals;
-
-// Leaves an install as an older kit (0.0.9) would have: every script stamped 0.0.9 with other
-// bytes and recorded as written so, and the extension entry naming that module, changed in the
-// extensions file where it stands.
-function ageInstall(root) {
-  const manifest = readManifest(root).manifest;
-  for (const name of SCRIPT_NAMES) {
-    const path = join(root, SCRIPTS_DIR, name);
-    const older = readFileSync(path, 'utf8').replace(`kh-orchestration ${KIT_VERSION}.`, 'kh-orchestration 0.0.9.');
-    writeFileSync(path, `${older}// 0.0.9\n`);
-    manifest.files.find((file) => file.path === `${SCRIPTS_DIR}/${name}`).sha256 = sha256(readFileSync(path));
-  }
-  const oldEntry = { ...entryOf(), version: '0.0.9', sha256: lfSha256(readFileSync(join(root, SCRIPTS_DIR, 'extension.mjs'))) };
-  const extensions = join(root, EXTENSIONS_PATH);
-  writeFileSync(extensions, readFileSync(extensions, 'utf8').replace(entryOf().sha256, oldEntry.sha256).replace(new RegExp(`("version":\\s*)"${KIT_VERSION.replaceAll('.', '\\.')}"`), '$1"0.0.9"'));
-  manifest.extensionEntry.sha256 = oldEntry.sha256;
-  manifest.kitVersion = '0.0.9';
-  writeFileSync(join(root, MANIFEST_PATH), `${JSON.stringify(manifest, null, 2)}\n`);
-  return oldEntry;
-}
 
 test('the installed scripts are the fourteen files of assets/scripts, each stamped once with this kit\'s version', () => {
   const assets = readdirSync(new URL('../../assets/scripts/', import.meta.url)).filter((name) => name.endsWith('.mjs')).sort();
@@ -550,62 +491,6 @@ test('the manifest is refused when it cannot be read or records a path kh-orches
   }
 });
 
-// The kill tests: a run stopped right after its nth write (`onWrite` throws, and nothing after it
-// runs, as when the process is killed), then a fresh run of apply or of uninstall.
-const KILLED = 'killed here';
-function killedAfter(root, count) {
-  let writes = 0;
-  assert.throws(() => applyPlan(root, plan(root), {
-    onWrite: () => {
-      writes += 1;
-      if (writes === count) throw new Error(KILLED);
-    },
-  }), { message: KILLED });
-}
-
-// What an install leaves, the manifest's installation time aside, to compare two runs.
-function installState(root) {
-  const { installedAt, ...manifest } = readManifest(root).manifest;
-  const tree = listing(join(root, '.claude/kh-orchestration'));
-  return { tree, extensions: read(root, EXTENSIONS_PATH), manifest, hooks: listing(hooksDir(root)), bin: listing(join(stateDir(root), 'bin')), attributes: read(root, '.gitattributes') };
-}
-const porcelain = (root) => spawnSync('git', ['status', '--porcelain', '-uall'], { cwd: root, env: testEnv(), encoding: 'utf8' }).stdout;
-
-test('a kill after each write of apply --yes leaves a state that apply completes and that uninstall --state cleans', () => {
-  // The number of writes a full run makes, and what it leaves.
-  const counting = fresh();
-  let total = 0;
-  applyPlan(counting.root, plan(counting.root), { onWrite: () => { total += 1; } });
-  assert.ok(total > 20, `a full run makes ${total} writes`);
-  const finished = installState(counting.root);
-  for (let count = 1; count <= total; count += 1) {
-    const repo = fresh();
-    assert.equal(porcelain(repo.root), '');
-    const hooksBefore = listing(hooksDir(repo.root));
-    killedAfter(repo.root, count);
-    // The same killed state twice: apply is run on one, uninstall on the other.
-    const copy = realpathSync(mkdtempSync(join(tmpdir(), 'ko-killed-')));
-    scratch.push(copy);
-    cpSync(repo.root, join(copy, 'repo'), { recursive: true, verbatimSymlinks: true });
-    const other = join(copy, 'repo');
-
-    const completed = plan(repo.root);
-    assert.deepEqual([completed.refusals, completed.conflicts], [[], []], `after write ${count}`);
-    assert.equal(applyPlan(repo.root, completed).refusal, null, `after write ${count}`);
-    assert.deepEqual(plan(repo.root).actions, [], `after write ${count}: apply completed it`);
-    assert.deepEqual(installState(repo.root), finished, `after write ${count}`);
-
-    const uninstalled = uninstallPlan(other, { state: true });
-    assert.deepEqual([uninstalled.refusals, uninstalled.kept], [[], []], `after write ${count}`);
-    applyUninstall(other, uninstalled);
-    assert.equal(porcelain(other), '', `after write ${count}: uninstall leaves the tree as it was`);
-    assert.deepEqual(listing(hooksDir(other)), hooksBefore, `after write ${count}`);
-    assert.equal(existsSync(join(other, '.git', 'kh-orchestration')), false, `after write ${count}`);
-    repo.cleanup();
-    rmSync(copy, { recursive: true, force: true });
-  }
-});
-
 test('applyPlan and applyUninstall refuse inside a Claude Code session and write nothing; plan and uninstallPlan stay open (after Task 9\'s review)', () => {
   const repo = fresh();
   const planned = plan(repo.root);
@@ -633,4 +518,17 @@ test('applyPlan and applyUninstall refuse inside a Claude Code session and write
   }
   assert.equal(TEXT.ownerOnly('apply', 'CLAUDECODE'), 'apply --yes is the owner\'s to run in their own terminal, outside Claude Code: CLAUDECODE is set here, so this is a Claude Code session. Nothing was changed.');
   assert.equal(TEXT.askOwner('x'), 'ask the owner to run, in their own terminal outside Claude Code: x');
+});
+
+test('uninstall removes kh-orchestration\'s entry by its id whatever it names, before the module, and keeps the others (after Task 9\'s review)', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const extensions = join(repo.root, EXTENSIONS_PATH);
+  writeFileSync(extensions, `${JSON.stringify([OTHER, { ...entryOf(), sha256: 'b'.repeat(64) }], null, 2)}\n`);
+  const uninstalled = uninstallPlan(repo.root, { state: true });
+  assert.deepEqual(uninstalled.kept, []);
+  const kinds = uninstalled.actions.map((action) => action.kind);
+  assert.ok(kinds.indexOf('extension-entry') < kinds.indexOf('file'), 'the entry goes before the scripts');
+  applyUninstall(repo.root, uninstalled);
+  assert.equal(readFileSync(extensions, 'utf8'), `${JSON.stringify([OTHER], null, 2)}\n`);
 });

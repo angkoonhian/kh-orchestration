@@ -164,6 +164,7 @@ export const TEXT = Object.freeze({
   appendAttributes: `add the line ${ATTRIBUTES_LINE} to ${ATTRIBUTES_FILE}`,
   addEntry: (created) => `add kh-orchestration's entry to ${EXTENSIONS_PATH}${created ? ' (new)' : ''}`,
   updateEntry: `update kh-orchestration's entry in ${EXTENSIONS_PATH}`,
+  unregisterEntry: `remove kh-orchestration's entry from ${EXTENSIONS_PATH} while its extension.mjs is replaced, so kh-harness never runs a module whose hash the entry does not name (until it is written again, tool calls run unchecked by kh-orchestration and the gate refuses commits)`,
   createBin: (path) => `create ${path}/ from kh-orchestration ${KIT_VERSION}'s scripts`,
   replaceBin: (path, names) => `replace ${path}/ with kh-orchestration ${KIT_VERSION}'s scripts (it differs: ${names.join(', ')})`,
   writeHook: (path) => `write the git hook ${path} (new)`,
@@ -224,7 +225,6 @@ export const TEXT = Object.freeze({
   removeManifest: `remove ${MANIFEST_PATH}`,
   keepManifest: `keep ${MANIFEST_PATH}, recording only what is kept`,
   keptHook: (path) => `kept: the git hook ${path} was changed since kh-orchestration wrote it`,
-  keptEntry: `kept: kh-orchestration's entry in ${EXTENSIONS_PATH} is not the one kh-orchestration wrote`,
   keptEdited: (path) => `kept: ${path} was changed since kh-orchestration wrote it`,
   keptNotOurs: (path) => `kept: ${path} does not begin with kh-orchestration's stamp line`,
   keptOfficers: `kept: ${OFFICERS_PATH} was changed since kh-orchestration wrote it, so it is the owner's work`,
@@ -747,6 +747,14 @@ export function plan(dir) {
   const next = askOwner(applyCommand(root));
   const recordedFile = (path) => manifest?.files.find((file) => file.path === path)?.sha256;
 
+  // An extension.mjs about to be replaced while its entry is registered: the entry goes first and
+  // comes back after the scripts (after Task 9's review), so a kill in between leaves the extension
+  // off (the gate's contract check refuses commits) and never a registered module that does not
+  // hash to its entry, which would block every tool call.
+  const listedFirst = extensions.state === 'ok' ? extensions.entries.find((candidate) => candidate.id === EXTENSION_ID) : undefined;
+  const unregister = listedFirst !== undefined && scriptState(root, 'extension.mjs', recordedFile(`${SCRIPTS_DIR}/extension.mjs`)).state === 'older';
+  if (unregister) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.unregisterEntry, text: extensionsTextWith(extensions, null), entry: null, create: false });
+
   // (a) the scripts
   const kept = [];
   for (const { name, bytes } of shippedScripts()) {
@@ -778,7 +786,7 @@ export function plan(dir) {
   if (kept.includes('extension.mjs')) {
     conflicts.push({ text: TEXT.extensionSkipped, next });
   } else {
-    const listed = extensions.state === 'ok' ? extensions.entries.find((candidate) => candidate.id === EXTENSION_ID) : undefined;
+    const listed = unregister ? undefined : listedFirst;
     if (listed === undefined) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.addEntry(extensions.state === 'absent'), text: plannedText, entry, create: true });
     else if (!sameEntry(listed, entry)) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.updateEntry, text: plannedText, entry, create: false });
     else if (manifest?.extensionEntry?.sha256 !== entry.sha256) actions.push({ kind: 'record', path: EXTENSIONS_PATH, detail: TEXT.record('kh-orchestration\'s extension entry'), extensionEntry: { id: EXTENSION_ID, sha256: entry.sha256 } });
@@ -892,7 +900,7 @@ export function applyPlan(root, planned, { onWrite } = {}) {
       const record = () => {
         if (action.kind === 'file') recordFile(manifest, { path: action.path, sha256: sha256(action.bytes) });
         else if (action.kind === 'patch') manifest.patches = [{ file: ATTRIBUTES_FILE, kind: action.patch, detail: ATTRIBUTES_LINE }];
-        else if (action.kind === 'extension-entry') manifest.extensionEntry = { id: EXTENSION_ID, sha256: action.entry.sha256 };
+        else if (action.kind === 'extension-entry') manifest.extensionEntry = action.entry === null ? null : { id: EXTENSION_ID, sha256: action.entry.sha256 };
         else if (action.kind === 'state-copy') manifest.stateDir = true;
         else if (action.kind === 'git-hook') recordHook(manifest, { name: action.name, sha256: sha256(Buffer.from(hookText(action.name, { env: planned.env, node: planned.node, version: KIT_VERSION }))) });
         else if (action.kind === 'record') {
@@ -914,7 +922,7 @@ export function applyPlan(root, planned, { onWrite } = {}) {
       } else if (action.kind === 'patch') {
         write(ATTRIBUTES_FILE, () => writeWhole(join(root, ATTRIBUTES_FILE), action.bytes, readRegular(join(root, ATTRIBUTES_FILE), MAX_SMALL_FILE_BYTES).mode ?? 0o644));
       } else if (action.kind === 'extension-entry') {
-        write(EXTENSIONS_PATH, () => writeWhole(join(root, EXTENSIONS_PATH), action.text, 0o644));
+        write(EXTENSIONS_PATH, () => (action.text === null ? rmSync(join(root, EXTENSIONS_PATH), { force: true }) : writeWhole(join(root, EXTENSIONS_PATH), action.text, 0o644)));
       } else if (action.kind === 'state-copy') {
         write(action.path, () => replaceBin(root, shippedScripts(), TEXT.binShippedPreflight));
       } else if (action.kind === 'git-hook') {
@@ -1041,14 +1049,11 @@ export function uninstallPlan(dir, { state }) {
   if (extensions.state === 'malformed' && manifest.extensionEntry !== null) {
     return { root, state, refusals: [{ text: TEXT.extensionsMalformed(extensions.problem), next: `cat ${shellWord(join(root, EXTENSIONS_PATH))}` }], actions: [], kept: [], notes: [] };
   }
-  const listed = extensions.state === 'ok' ? extensions.entries.find((entry) => entry.id === EXTENSION_ID) : undefined;
-  if (listed !== undefined) {
-    if (listed.sha256 === manifest.extensionEntry?.sha256 || sameEntry(listed, ownEntryShipped())) {
-      const text = extensionsTextWith(extensions, null);
-      actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.removeEntry(text === null), text });
-    } else {
-      kept.push(TEXT.keptEntry);
-    }
+  // The entry is kh-orchestration's by its id, whatever it names: it goes before the module it
+  // names, so kh-harness never runs an entry whose module is gone (after Task 9's review).
+  if (extensions.state === 'ok' && extensions.entries.some((entry) => entry.id === EXTENSION_ID)) {
+    const text = extensionsTextWith(extensions, null);
+    actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.removeEntry(text === null), text });
   }
 
   const patch = manifest.patches[0];
