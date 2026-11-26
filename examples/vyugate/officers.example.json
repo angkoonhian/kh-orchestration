@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "baseBranch": "main",
+  "protected": ["scripts/officers/**"],
+  "officers": [
+    {
+      "id": "docs-with-logic",
+      "rule": "V8",
+      "argv": ["node", "scripts/officers/docs-with-logic.mjs"],
+      "appliesTo": ["**"],
+      "timeoutSeconds": 60,
+      "options": {
+        "logic": ["PLACEHOLDER-logic-directory/**"],
+        "docs": ["PLACEHOLDER-docs-directory/**"]
+      }
+    },
+    {
+      "id": "migrations-append-only",
+      "rule": "V11",
+      "argv": ["python3", "scripts/officers/migrations-append-only.py"],
+      "appliesTo": ["products/vision/backend/src/vyugate_api/db.py"],
+      "timeoutSeconds": 60,
+      "options": {
+        "file": "products/vision/backend/src/vyugate_api/db.py",
+        "name": "MIGRATIONS"
+      }
+    }
+  ]
+}
