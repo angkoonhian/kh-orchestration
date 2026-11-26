@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, symlinkSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
+import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
   StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readInflight, readState, removeInflight, removeStaleInflight, shapeMessage, stateDir,
   invalidPidMessage, stateUnreadableMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
+  binIncompleteMessage, binEntryMessage, listInflight, readProposals, readWaivers, refreshBin, switchOff, switchOn,
 } from '../../assets/scripts/ko-state.mjs';
+import { objectMismatchMessage } from '../../assets/scripts/ko-digest.mjs';
 
 // The modules take the caller's git environment; a test must not inherit a hook's.
 isolateProcessEnv();
@@ -194,7 +196,10 @@ const DIGEST = 'a'.repeat(64);
 test('readApprovals: absent is nothing approved; the records are given back as written', () => {
   withRepo((repo) => {
     assert.deepEqual(readApprovals(repo.root), []);
-    const digests = [{ digest: DIGEST, approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }, { digest: 'b'.repeat(64), approvedAt: 'x', branch: null }];
+    const digests = [
+      { digest: DIGEST, approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }, { digest: 'b'.repeat(64), approvedAt: 'x', branch: null },
+      { digest: 'c'.repeat(64), tree: 'd'.repeat(40), approvedAt: 'x', branch: 'main' }, { digest: 'e'.repeat(64), tree: 'f'.repeat(64), approvedAt: 'x', branch: null },
+    ];
     writeState(repo.root, 'approvals.json', { digests });
     assert.deepEqual(readApprovals(repo.root), digests);
   });
@@ -207,6 +212,8 @@ test('readApprovals throws a StateError with fixed text for any other shape, nev
       [], null, 7, {}, { digests: {} }, { digests: [entry], extra: 1 }, { digests: [null] }, { digests: [{ ...entry, digest: 'A'.repeat(64) }] },
       { digests: [{ ...entry, digest: 'a'.repeat(63) }] }, { digests: [{ ...entry, approvedAt: 1 }] }, { digests: [{ ...entry, branch: 3 }] },
       { digests: [{ digest: DIGEST, approvedAt: 'x' }] }, { digests: [{ ...entry, more: true }] },
+      { digests: [{ ...entry, tree: null }] }, { digests: [{ ...entry, tree: 'a'.repeat(39) }] }, { digests: [{ ...entry, tree: 'A'.repeat(40) }] },
+      { digests: [{ ...entry, tree: 'a'.repeat(40), more: 1 }] },
     ]) {
       writeState(repo.root, 'approvals.json', value);
       assert.throws(() => readApprovals(repo.root), (error) => error instanceof StateError && error.message === shapeMessage('approvals.json'), JSON.stringify(value));
@@ -297,4 +304,156 @@ test('removeStaleInflight on a state directory that cannot be read says so, not 
     }
     assert.equal(stateUnreadableMessage, 'The shared state directory could not be read; nothing proceeds on state that cannot be read.');
   });
+});
+
+test('readWaivers: absent is no waiver; the records are given back as written', () => {
+  withRepo((repo) => {
+    assert.deepEqual(readWaivers(repo.root), []);
+    const waivers = [{ rule: 'V8', branch: 'feature/x', reason: 'docs follow in the next branch', at: '2026-11-26T00:00:00.000Z' }];
+    writeState(repo.root, 'waivers.json', { waivers });
+    assert.deepEqual(readWaivers(repo.root), waivers);
+  });
+});
+
+test('readWaivers throws a StateError with fixed text for any other shape, never "no waiver"', () => {
+  withRepo((repo) => {
+    const entry = { rule: 'V8', branch: 'b', reason: 'r', at: 'x' };
+    for (const value of [
+      [], null, {}, { waivers: {} }, { waivers: [entry], extra: 1 }, { waivers: [7] }, { waivers: [{ ...entry, rule: '' }] }, { waivers: [{ ...entry, rule: '8V' }] },
+      { waivers: [{ ...entry, rule: 'a b' }] }, { waivers: [{ ...entry, branch: null }] }, { waivers: [{ ...entry, reason: '' }] }, { waivers: [{ ...entry, at: 1 }] },
+      { waivers: [{ rule: 'V8', branch: 'b', reason: 'r' }] }, { waivers: [{ ...entry, more: 1 }] },
+    ]) {
+      writeState(repo.root, 'waivers.json', value);
+      assert.throws(() => readWaivers(repo.root), (error) => error instanceof StateError && error.message === shapeMessage('waivers.json'), JSON.stringify(value));
+    }
+  });
+});
+
+test('readProposals: absent is no worktree open; absolute paths are given back; any other shape is a StateError', () => {
+  withRepo((repo) => {
+    assert.deepEqual(readProposals(repo.root), []);
+    writeState(repo.root, 'proposals.json', { worktrees: ['/a/b', '/c'] });
+    assert.deepEqual(readProposals(repo.root), ['/a/b', '/c']);
+    for (const value of [[], { worktrees: 'x' }, { worktrees: ['relative/path'] }, { worktrees: [''] }, { worktrees: [1] }, { worktrees: [], more: 1 }]) {
+      writeState(repo.root, 'proposals.json', value);
+      assert.throws(() => readProposals(repo.root), { name: 'StateError', message: shapeMessage('proposals.json') }, JSON.stringify(value));
+    }
+  });
+});
+
+test('switchOff creates the off file by temporary file and rename, switchOn removes it; each is idempotent', () => {
+  withRepo((repo) => {
+    switchOn(repo.root);
+    assert.equal(isOff(repo.root), false);
+    switchOff(repo.root);
+    switchOff(repo.root);
+    assert.equal(isOff(repo.root), true);
+    assert.deepEqual(readdirSync(stateDir(repo.root)), ['off']);
+    switchOn(repo.root);
+    switchOn(repo.root);
+    assert.equal(isOff(repo.root), false);
+    assert.deepEqual(readdirSync(stateDir(repo.root)), []);
+  });
+});
+
+test('listInflight names every in-flight record with whether its process is alive, touching nothing', () => {
+  withRepo((repo) => {
+    assert.deepEqual(listInflight(repo.root), []);
+    const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
+    writeInflight(repo.root, dead, INFLIGHT_TREE);
+    writeInflight(repo.root, String(process.pid), INFLIGHT_TREE);
+    writeFileSync(join(stateDir(repo.root), 'inflight-x.json'), '{}');
+    const expected = [{ pid: dead, live: false }, { pid: String(process.pid), live: true }].sort((a, b) => (`inflight-${a.pid}.json` < `inflight-${b.pid}.json` ? -1 : 1));
+    assert.deepEqual(listInflight(repo.root), expected);
+    assert.equal(readInflight(repo.root, dead), INFLIGHT_TREE);
+  });
+});
+
+const SCRIPTS = '.claude/kh-orchestration/scripts';
+const binOf = (root) => join(stateDir(root), 'bin');
+const binFiles = (root) => Object.fromEntries(readdirSync(binOf(root)).sort().map((name) => [name, readFileSync(join(binOf(root), name), 'utf8')]));
+const treeOfIndex = (repo) => {
+  assert.equal(repo.git('add', '-A').status, 0);
+  return repo.git('write-tree').stdout.trim();
+};
+
+test('refreshBin replaces bin/ with the tree\'s scripts, the .mjs files directly under the scripts folder only', () => {
+  withRepo((repo) => {
+    repo.write(`${SCRIPTS}/gate.mjs`, 'gate one\n');
+    repo.write(`${SCRIPTS}/ko-git.mjs`, 'git one\n');
+    repo.write(`${SCRIPTS}/notes.txt`, 'not a script\n');
+    repo.write(`${SCRIPTS}/deeper/x.mjs`, 'not directly under\n');
+    repo.write('elsewhere.mjs', 'not installed\n');
+    const first = treeOfIndex(repo);
+    mkdirSync(binOf(repo.root), { recursive: true });
+    writeFileSync(join(binOf(repo.root), 'stale.mjs'), 'from an older kit\n');
+    refreshBin(repo.root, first);
+    assert.deepEqual(binFiles(repo.root), { 'gate.mjs': 'gate one\n', 'ko-git.mjs': 'git one\n' });
+    repo.write(`${SCRIPTS}/gate.mjs`, 'gate two\n');
+    refreshBin(repo.root, treeOfIndex(repo));
+    assert.deepEqual(binFiles(repo.root), { 'gate.mjs': 'gate two\n', 'ko-git.mjs': 'git one\n' });
+    assert.deepEqual(readdirSync(stateDir(repo.root)), ['bin'], 'no temporary or old directory is left');
+  });
+});
+
+test('refreshBin refuses a tree without gate.mjs, an entry that is not a regular file, and a blob that does not hash to its id, and leaves bin/ as it was', () => {
+  withRepo((repo) => {
+    repo.write(`${SCRIPTS}/gate.mjs`, 'gate\n');
+    refreshBin(repo.root, treeOfIndex(repo));
+    const before = binFiles(repo.root);
+
+    repo.git('rm', '-q', '--cached', `${SCRIPTS}/gate.mjs`);
+    const noGate = repo.git('write-tree').stdout.trim();
+    assert.throws(() => refreshBin(repo.root, noGate), { name: 'StateError', message: binIncompleteMessage });
+    assert.equal(binIncompleteMessage, 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs, so bin/ is not refreshed from it: the hooks would find no gate. Stage the install\'s scripts first.');
+
+    symlinkSync('gate.mjs', join(repo.root, SCRIPTS, 'ko-link.mjs'));
+    const withLink = treeOfIndex(repo);
+    assert.throws(() => refreshBin(repo.root, withLink), { name: 'StateError', message: binEntryMessage(`${SCRIPTS}/ko-link.mjs`) });
+    assert.equal(binEntryMessage('p'), 'p is not a regular file in the tree, so bin/ is not refreshed from it.');
+    assert.equal(repo.git('rm', '-q', '-f', `${SCRIPTS}/ko-link.mjs`).status, 0);
+
+    // A loose object whose content no longer hashes to its name: git does not check on read.
+    repo.write(`${SCRIPTS}/gate.mjs`, 'gate forged later\n');
+    const forgedTree = treeOfIndex(repo);
+    const objectPath = (oid) => join(repo.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
+    const oid = repo.git('rev-parse', `${forgedTree}:${SCRIPTS}/gate.mjs`).stdout.trim();
+    const other = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: repo.root, input: 'other bytes\n', encoding: 'utf8' }).stdout.trim();
+    chmodSync(objectPath(oid), 0o644);
+    writeFileSync(objectPath(oid), readFileSync(objectPath(other)));
+    assert.throws(() => refreshBin(repo.root, forgedTree), { name: 'StateError', message: objectMismatchMessage(`${SCRIPTS}/gate.mjs`) });
+    assert.deepEqual(binFiles(repo.root), before);
+  });
+});
+
+test('refreshBin killed at any moment leaves bin/ whole: one tree\'s scripts or the other\'s, or no bin/ at all, never a mix', async () => {
+  const repo = makeRepo();
+  try {
+    const trees = ['one', 'two'].map((version) => {
+      for (let index = 0; index < 12; index += 1) repo.write(`${SCRIPTS}/${index === 0 ? 'gate' : `s${index}`}.mjs`, `${version} ${index}\n${'x'.repeat(200_000)}\n`);
+      return treeOfIndex(repo);
+    });
+    const module = new URL('../../assets/scripts/ko-state.mjs', import.meta.url).href;
+    const loop = `const { refreshBin } = await import(${JSON.stringify(module)}); const trees = ${JSON.stringify(trees)};
+      process.stdout.write('ready\\n'); for (let i = 0; ; i += 1) refreshBin(${JSON.stringify(repo.root)}, trees[i % 2]);`;
+    const versions = new Set();
+    for (let round = 0; round < 15; round += 1) {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', loop], { env: testEnv(), stdio: ['ignore', 'pipe', 'inherit'] });
+      await new Promise((resolve) => child.stdout.once('data', resolve));
+      await new Promise((resolve) => setTimeout(resolve, 20 + Math.floor(Math.random() * 60)));
+      child.kill('SIGKILL');
+      await new Promise((resolve) => child.once('exit', resolve));
+      if (!existsSync(binOf(repo.root))) continue;
+      const files = binFiles(repo.root);
+      const version = files['gate.mjs'].split(' ')[0];
+      versions.add(version);
+      assert.equal(Object.keys(files).length, 12);
+      assert.ok(Object.values(files).every((text) => text.startsWith(`${version} `)), 'every file is of the same tree');
+    }
+    assert.ok(versions.size > 0);
+    refreshBin(repo.root, trees[0]);
+    assert.deepEqual(readdirSync(stateDir(repo.root)), ['bin'], 'what a kill left beside bin/ is removed at the next refresh');
+  } finally {
+    repo.cleanup();
+  }
 });

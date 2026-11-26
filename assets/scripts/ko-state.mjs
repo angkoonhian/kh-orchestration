@@ -2,8 +2,9 @@
 // directory from every linked worktree.
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { dirname, join } from 'node:path';
-import { commonDir } from './ko-git.mjs';
+import { dirname, isAbsolute, join } from 'node:path';
+import { hashesTo, objectMismatchMessage } from './ko-digest.mjs';
+import { commonDir, listEntries, readBlobs } from './ko-git.mjs';
 
 export class StateError extends Error {
   constructor(message) {
@@ -20,12 +21,20 @@ export const invalidVerdictKeyMessage = 'A verdict is named by a full hexadecima
 export const writeFailedMessage = (name) => `The shared state file ${name} could not be written.`;
 export const stateUnreadableMessage = 'The shared state directory could not be read; nothing proceeds on state that cannot be read.';
 export const invalidPidMessage = 'An in-flight record is named by the process id of a git command: digits only, without a leading zero.';
+export const binIncompleteMessage = 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs, so bin/ is not refreshed from it: the hooks would find no gate. Stage the install\'s scripts first.';
+export const binEntryMessage = (path) => `${path} is not a regular file in the tree, so bin/ is not refreshed from it.`;
 export const shapeMessage = (name) =>
   `The shared state file ${name} is not of the shape kh-orchestration writes. Restore it from a backup or ask the owner to remove it; nothing proceeds on a state file that cannot be read.`;
 
-// approvals.json is `{ digests: [{ digest, approvedAt, branch }] }`: each digest the owner approved
-// (64 lower-case hexadecimal digits), when (an ISO time), and the branch it was approved on (null
-// on a detached HEAD). Absent, nothing is approved. Read through readApprovals.
+// approvals.json is `{ digests: [{ digest, tree, approvedAt, branch }] }`: each digest the owner
+// approved (64 lower-case hexadecimal digits), the tree approve read it from (a full object id; a
+// record written before approve kept it has no `tree` key and is still valid), when (an ISO time),
+// and the branch it was approved on (null on a detached HEAD). Absent, nothing is approved. Read
+// through readApprovals. `approve` diffs against the last record of its branch that has a tree.
+// waivers.json is `{ waivers: [{ rule, branch, reason, at }] }`: an officer's rule (a rule id as
+// RULES.md writes one) the owner waived on a branch, by exact name, why (non-empty) and when.
+// Absent, nothing is waived. Read through readWaivers; `run` passes a branch's waivers to the
+// officers as KO_WAIVERS.
 // exemptions.json is `{ branches: [{ name, reason, at }] }`: the branches, by exact name, the gate
 // lets through without an install, why (non-empty) and when. Absent, no branch is exempt. Read
 // through readExemptions.
@@ -37,7 +46,11 @@ export const shapeMessage = (name) =>
 // off is a file whose presence is the owner's switch (isOff); its content means nothing.
 // proposals.json is `{ worktrees: [<absolute real path of a worktree root>...] }`, the worktrees
 // open for proposals. The hook extension reads it itself (it cannot import this file): absent,
-// unreadable or of another shape, no worktree is open.
+// unreadable or of another shape, no worktree is open. ko.mjs reads it through readProposals.
+// bin/ is the copy of the approved tree's scripts the hooks run (decision 5), replaced whole by
+// refreshBin.
+// The files are read, changed and written with no lock: two owner commands at once may lose one
+// update. Only the owner writes them, one command at a time in practice.
 const STATE_NAMES = new Set(['approvals.json', 'waivers.json', 'exemptions.json', 'proposals.json']);
 // `verdicts/<tree>-<base>.json`: the one sub-path a state name may have (decision 5).
 const OBJECT_ID = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
@@ -116,6 +129,9 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 const hasExactKeys = (value, keys) => isPlainObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 const isText = (value) => typeof value === 'string' && value !== '';
 const DIGEST = /^[0-9a-f]{64}$/;
+const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+// A rule id as the registry reads one (ko-registry.mjs), at most 64 characters.
+export const RULE_ID = /^[A-Za-z][\w.-]{0,63}$/;
 
 // The list a state file of the shape `{ <key>: [entry...] }` holds; [] when the file is absent. Any
 // other shape throws: a damaged record must never read as an empty one.
@@ -125,21 +141,31 @@ function readList(root, name, key, entryHasShape) {
   return value[key];
 }
 
-const approvalHasShape = (entry) => hasExactKeys(entry, ['digest', 'approvedAt', 'branch'])
-  && typeof entry.digest === 'string' && DIGEST.test(entry.digest) && isText(entry.approvedAt) && (entry.branch === null || isText(entry.branch));
+const approvalHasShape = (entry) => (hasExactKeys(entry, ['digest', 'approvedAt', 'branch']) || hasExactKeys(entry, ['digest', 'tree', 'approvedAt', 'branch']))
+  && typeof entry.digest === 'string' && DIGEST.test(entry.digest) && (!Object.hasOwn(entry, 'tree') || (typeof entry.tree === 'string' && TREE_ID.test(entry.tree)))
+  && isText(entry.approvedAt) && (entry.branch === null || isText(entry.branch));
 const exemptionHasShape = (entry) => hasExactKeys(entry, ['name', 'reason', 'at']) && isText(entry.name) && isText(entry.reason) && isText(entry.at);
 
-// The approvals, `[{ digest, approvedAt, branch }]`. Throws a StateError for a file that cannot be read or is of another shape.
+const waiverHasShape = (entry) => hasExactKeys(entry, ['rule', 'branch', 'reason', 'at'])
+  && typeof entry.rule === 'string' && RULE_ID.test(entry.rule) && isText(entry.branch) && isText(entry.reason) && isText(entry.at);
+const proposalHasShape = (entry) => isText(entry) && isAbsolute(entry);
+
+// The approvals, `[{ digest, tree?, approvedAt, branch }]`. Throws a StateError for a file that cannot be read or is of another shape.
 export const readApprovals = (root) => readList(root, 'approvals.json', 'digests', approvalHasShape);
 
 // The exemptions, `[{ name, reason, at }]`. Throws a StateError for a file that cannot be read or is of another shape.
 export const readExemptions = (root) => readList(root, 'exemptions.json', 'branches', exemptionHasShape);
 
+// The waivers of every branch, `[{ rule, branch, reason, at }]`. Throws a StateError for a file that cannot be read or is of another shape.
+export const readWaivers = (root) => readList(root, 'waivers.json', 'waivers', waiverHasShape);
+
+// The worktrees open for proposals, as absolute paths. Throws a StateError for a file that cannot be read or is of another shape.
+export const readProposals = (root) => readList(root, 'proposals.json', 'worktrees', proposalHasShape);
+
 function inflightName(pid) {
   if (typeof pid !== 'string' || !PID.test(pid)) throw new StateError(invalidPidMessage);
   return `inflight-${pid}.json`;
 }
-const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // Records the tree the gate allowed for git process `pid`. Throws a StateError when it cannot.
 export function writeInflight(root, pid, tree) {
@@ -178,11 +204,11 @@ function alive(pid) {
 }
 
 /**
- * Removes every in-flight record whose process no longer exists and returns their process ids.
- * Only names of the in-flight form are touched. A pid that was reused by a later process keeps
- * its record until that process ends; the gate replaces a record for its own process.
+ * Every in-flight record, `[{ pid, live }]` in name order: the git process id it is named by and
+ * whether that process still exists. Only names of the in-flight form are listed; nothing is
+ * changed. Throws a StateError when the state directory exists and cannot be read.
  */
-export function removeStaleInflight(root) {
+export function listInflight(root) {
   let names;
   try {
     names = readdirSync(stateDir(root));
@@ -190,18 +216,101 @@ export function removeStaleInflight(root) {
     if (error.code === 'ENOENT') return [];
     throw new StateError(stateUnreadableMessage);
   }
-  const removed = [];
-  for (const name of names.filter((entry) => INFLIGHT_NAME.test(entry)).sort()) {
+  return names.filter((entry) => INFLIGHT_NAME.test(entry)).sort().map((name) => {
     const pid = name.slice('inflight-'.length, -'.json'.length);
-    if (alive(pid)) continue;
-    removeInflight(root, pid);
-    removed.push(pid);
-  }
-  return removed;
+    return { pid, live: alive(pid) };
+  });
+}
+
+/**
+ * Removes every in-flight record whose process no longer exists and returns their process ids.
+ * Only names of the in-flight form are touched. A pid that was reused by a later process keeps
+ * its record until that process ends; the gate replaces a record for its own process.
+ */
+export function removeStaleInflight(root) {
+  const stale = listInflight(root).filter((record) => !record.live).map((record) => record.pid);
+  for (const pid of stale) removeInflight(root, pid);
+  return stale;
 }
 
 export function isOff(root) {
   return existsSync(join(stateDir(root), OFF_FILE));
+}
+
+// The owner's switch: off is a file, made by temporary file and rename; on removes it. Both are idempotent.
+export function switchOff(root) {
+  const target = join(stateDir(root), OFF_FILE);
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(temporary, '');
+    renameSync(temporary, target);
+  } catch {
+    rmSync(temporary, { force: true });
+    throw new StateError(writeFailedMessage(OFF_FILE));
+  }
+}
+
+export function switchOn(root) {
+  try {
+    rmSync(join(stateDir(root), OFF_FILE), { force: true });
+  } catch {
+    throw new StateError(writeFailedMessage(OFF_FILE));
+  }
+}
+
+const SCRIPTS_DIR = '.claude/kh-orchestration/scripts/';
+const BIN = 'bin';
+// What a refresh that ended early (a kill) can leave beside bin/; removed at the next refresh.
+const BIN_LEFTOVER = /^bin\.[0-9]+\.[0-9a-f-]+\.(?:tmp|old)$/;
+const FILE_MODES = ['100644', '100755'];
+
+/**
+ * Replaces <state>/bin/ with the scripts of `tree` (decision 19): every `.mjs` file directly in
+ * `.claude/kh-orchestration/scripts/`, each read from the object store and verified against its
+ * object id. The new directory is written beside bin/ in full, then renamed into place, so a hook
+ * never finds a bin/ holding some files of one tree and some of another: it finds the old bin/,
+ * the new one, or (for the instant between the two renames, or after a kill there) none, which
+ * the hooks refuse on. A tree without gate.mjs, an entry that is not a regular file, or a blob
+ * that does not hash to its id leaves bin/ as it was and throws a StateError; a failed read throws
+ * what ko-git throws. Called by `approve`, and by `apply` (Task 9).
+ */
+export function refreshBin(root, tree) {
+  const scripts = listEntries(root, tree).filter((entry) => entry.path.startsWith(SCRIPTS_DIR) && entry.path.endsWith('.mjs') && !entry.path.slice(SCRIPTS_DIR.length).includes('/'));
+  if (!scripts.some((entry) => entry.path === `${SCRIPTS_DIR}gate.mjs`)) throw new StateError(binIncompleteMessage);
+  const notFile = scripts.find((entry) => entry.type !== 'blob' || !FILE_MODES.includes(entry.mode));
+  if (notFile !== undefined) throw new StateError(binEntryMessage(notFile.path));
+  const blobs = readBlobs(root, scripts.map((entry) => entry.oid));
+  const mismatch = scripts.find((entry) => !hashesTo(entry.oid, blobs.get(entry.oid)));
+  if (mismatch !== undefined) throw new StateError(objectMismatchMessage(mismatch.path));
+
+  const dir = stateDir(root);
+  const bin = join(dir, BIN);
+  const stem = join(dir, `${BIN}.${process.pid}.${randomUUID()}`);
+  const fresh = `${stem}.tmp`;
+  const old = `${stem}.old`;
+  try {
+    mkdirSync(dir, { recursive: true });
+    for (const name of readdirSync(dir).filter((entry) => BIN_LEFTOVER.test(entry))) rmSync(join(dir, name), { recursive: true, force: true });
+    mkdirSync(fresh);
+    for (const entry of scripts) writeFileSync(join(fresh, entry.path.slice(SCRIPTS_DIR.length)), blobs.get(entry.oid));
+  } catch {
+    rmSync(fresh, { recursive: true, force: true });
+    throw new StateError(writeFailedMessage(BIN));
+  }
+  try {
+    try {
+      renameSync(bin, old);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    renameSync(fresh, bin);
+  } catch {
+    if (!existsSync(bin) && existsSync(old)) renameSync(old, bin);
+    rmSync(fresh, { recursive: true, force: true });
+    throw new StateError(writeFailedMessage(BIN));
+  }
+  rmSync(old, { recursive: true, force: true });
 }
 
 // The only state write that appends rather than replaces.
