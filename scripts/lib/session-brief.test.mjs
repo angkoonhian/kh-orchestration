@@ -48,7 +48,15 @@ const OPEN_HERE = 'This worktree is open for proposals: protected files may be e
 const NOT_OPEN_HERE = 'This worktree is not open for proposals: do not edit protected files here.';
 const FIX = 'Only the owner can fix this: ask the owner to run the plugin\'s apply.';
 const run = (root) => `node ${shellWord(join(root, '.claude/kh-orchestration/scripts/ko.mjs'))} run`;
-const normal = (root, open = NOT_OPEN_HERE) => `${CHECKED} Before committing, run the officers with \`${run(root)}\`. ${OWNER_ONLY} ${open}`;
+// The brief as it is shorter than 600 characters; past that (a repository path near 90 characters
+// or longer, as a long TMPDIR gives) the run command is the root-relative one, said to be run from
+// the repository's top directory, so a session in a subdirectory is never handed a line that fails.
+const MAX_TEXT = 600;
+const SHORT_RUN = 'Before committing, run the officers with `node .claude/kh-orchestration/scripts/ko.mjs run` from the repository\'s top directory.';
+const normal = (root, open = NOT_OPEN_HERE) => {
+  const full = `${CHECKED} Before committing, run the officers with \`${run(root)}\`. ${OWNER_ONLY} ${open}`;
+  return full.length < MAX_TEXT ? full : `${CHECKED} ${SHORT_RUN} ${OWNER_ONLY} ${open}`;
+};
 const refused = (clause) => `kh-orchestration is installed here, but ${clause}, so every commit here will be refused. ${FIX}`;
 const unchecked = (clause) => `kh-orchestration is installed here, but ${clause}, so git does not run the commit gate here and commits are NOT being checked; only the owner can fix this (ask them to run the plugin's apply).`;
 const unsure = (clause) => `kh-orchestration is installed here, but ${clause}. ${FIX}`;
@@ -126,9 +134,8 @@ test('the run command is shell-quoted when the path needs it', () => {
   const spaced = join(parent, 'a b');
   assert.equal(spawnSync('mv', [repo.root, spaced]).status, 0);
   assert.equal(spawnSync('git', ['worktree', 'repair'], { cwd: spaced, env: testEnv() }).status, 0);
-  const text = said(brief(spaced));
-  assert.ok(text.includes(`with \`node '${spaced}/.claude/kh-orchestration/scripts/ko.mjs' run\`. `), text);
-  texts.push(text);
+  const text = check(spaced, normal(spaced));
+  assert.ok(text.includes(`with \`node '${spaced}/.claude/kh-orchestration/scripts/ko.mjs' run\`. `) || text.includes(SHORT_RUN), text);
 });
 
 test('open for proposals here, and open in another worktree only', () => {
@@ -335,9 +342,8 @@ test('from a subdirectory and from a linked worktree', () => {
   // A linked worktree whose tree holds the install, committed past the gate as the owner would.
   assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'install']).status, 0);
   const side = repo.addWorktree('side');
-  const text = said(brief(side));
-  assert.ok(text.includes(`with \`node ${shellWord(join(side, '.claude/kh-orchestration/scripts/ko.mjs'))} run\`.`), text);
-  texts.push(text);
+  const text = check(side, normal(side));
+  assert.ok(text.includes(`with \`node ${shellWord(join(side, '.claude/kh-orchestration/scripts/ko.mjs'))} run\`.`) || text.includes(SHORT_RUN), 'the worktree\'s own ko.mjs');
 });
 
 test('a very long path falls back to the short run command and the text stays bounded', () => {

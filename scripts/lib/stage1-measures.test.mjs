@@ -379,10 +379,13 @@ test('A fresh session\'s brief says commits are checked and gives a run command 
   assert.equal(shell(agentCommand(root, 'run'), { cwd: root, env: agentEnv() }).status, 0);
   lands(root);
 
-  // The brief's own line, pasted, from a subdirectory of the worktree.
+  // The brief's own line, pasted, from a subdirectory of the worktree; or, when the path is long
+  // enough that the brief gives the root-relative line, from the top directory, as it then says.
   write(root, 'src/two.txt', 'two\n');
   stage(root);
-  const pasted = shell(command, { cwd: join(root, 'src'), env: agentEnv() });
+  const fromTop = brief.includes(`\`${command}\` from the repository's top directory`);
+  assert.equal(fromTop, command === 'node .claude/kh-orchestration/scripts/ko.mjs run', 'the root-relative line, and only it, is said to be run from the top directory');
+  const pasted = shell(command, { cwd: fromTop ? root : join(root, 'src'), env: agentEnv() });
   assert.equal(pasted.status, 0, pasted.stdout + pasted.stderr);
   lands(root);
 });

@@ -402,7 +402,7 @@ test('detect reports no install, a fresh install, and each broken state, and --j
   const broken = JSON.parse(run('detect', [repo.root, '--json']).stdout);
   assert.equal(broken.files.find((file) => file.path.endsWith('/ko-git.mjs')).state, 'edited');
   assert.deepEqual(broken.hooks.map((hook) => hook.state), ['current', 'not-ours', 'current']);
-  assert.ok(broken.status.problems.some((problem) => problem.text === `There is no ${join(stateDir(repo.root), 'bin')}/, so the hooks find no gate and every commit is refused.`));
+  assert.ok(broken.status.problems.some((problem) => problem.text === KO_TEXT.binMissing(join(stateDir(repo.root), 'bin'))));
   assert.deepEqual(broken.apply.conflicts.map((conflict) => conflict.text), [TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-git.mjs`), TEXT.hooksStopped]);
   const brokenText = run('detect', [repo.root]);
   assert.ok(lines(brokenText.stdout).includes(`  ${SCRIPTS_DIR}/ko-git.mjs: changed since kh-orchestration wrote it (stamped ${KIT_VERSION})`));

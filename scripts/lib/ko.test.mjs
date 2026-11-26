@@ -862,7 +862,8 @@ test('I3: status reports a bin/ file that differs from the last approved tree, o
   assert.equal(approveAnswer(repo.root).status, 0);
   const tree = indexTree(repo.root);
   const bin = join(stateDir(repo.root), 'bin');
-  const binProblems = (status) => status.problems.filter((problem) => problem.text.includes('bin/'));
+  // By the repair they name, not their text: a path past 200 characters is shown cut.
+  const binProblems = (status) => status.problems.filter((problem) => problem.next.includes('apply.mjs') && !problem.text.includes(' hook '));
   assert.deepEqual(binProblems(statusJson(repo.root)), []);
   writeFileSync(join(bin, 'ko-gate.mjs'), `${readFileSync(join(bin, 'ko-gate.mjs'), 'utf8')}// changed\n`);
   writeFileSync(join(bin, 'stray.mjs'), 'export {};\n');
