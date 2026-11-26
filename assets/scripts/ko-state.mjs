@@ -307,6 +307,8 @@ export const ownerCommand = (root, words) => `node ${shellWord(join(stateDir(roo
 export const INSTALL_PATHS = Object.freeze(['.claude/kh-orchestration', '.claude/kh-orchestration.manifest.json', '.claude/kh-harness/extensions.json', '.gitattributes']);
 // The command staging them: in the current directory (the worktree's top, as a hook's next lines
 // read), or with `rootWord` (a path already quoted for a shell) for git -C.
+// Said wherever the step is printed (after Task 9's third re-review): the whole .gitattributes is staged.
+export const STAGE_INSTALL_NOTE = 'this also stages any other change in .gitattributes';
 export const stageInstall = (rootWord) => `git${rootWord === null ? '' : ` -C ${rootWord}`} add -- ${INSTALL_PATHS.join(' ')}`;
 
 const SCRIPTS_DIR = '.claude/kh-orchestration/scripts/';

@@ -17,7 +17,10 @@ function main(argv) {
   const planned = plan(args.repo, { downgrade: args.flags.has('--downgrade'), binFromPlugin: args.flags.has('--bin-from-plugin') });
   if (planned.refusals.length > 0) return refuse(planned.refusals);
   if (planned.actions.length === 0 && planned.conflicts.length === 0) {
-    print([TEXT.nothingToDo(planned.root), `Next: ${nextAfterApply(planned.root, planned)}`]);
+    // Notes are printed whatever else there is (after Task 9's third re-review): a bin/ that cannot
+    // be checked is said here, as status says it.
+    const notes = planned.notes.length === 0 ? [] : [TEXT.notesHeader, ...planned.notes.map((note) => `  - ${note}`)];
+    print([TEXT.nothingToDo(planned.root), ...notes, `Next: ${nextAfterApply(planned.root, planned)}`]);
     return 0;
   }
   const dryRun = !args.flags.has('--yes');

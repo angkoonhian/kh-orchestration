@@ -16,11 +16,11 @@ import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mj
 import { checkContract1, probeContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 import { PROBE_PAYLOAD, ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
-import { COMMANDS } from '../../assets/scripts/extension.mjs';
+import { COMMANDS, shellWord } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { indexTree } from '../../assets/scripts/ko-git.mjs';
-import { ownerCommand, stageInstall, stateDir } from '../../assets/scripts/ko-state.mjs';
-import { agentCommand } from '../../assets/scripts/ko-cli.mjs';
+import { STAGE_INSTALL_NOTE, ownerCommand, stageInstall, stateDir } from '../../assets/scripts/ko-state.mjs';
+import { TEXT as KO_TEXT, agentCommand } from '../../assets/scripts/ko-cli.mjs';
 
 isolateProcessEnv();
 // The in-process calls run git with this process's environment: no user or system configuration.
@@ -333,6 +333,31 @@ test('after an upgrade, the gate\'s staging step stages the whole install, so an
   }
 });
 
+test('apply prints its notes even when it has nothing to write: a bin/ that cannot be checked against an approved tree is said, as status says it (after Task 9\'s third re-review)', () => {
+  const repo = fresh();
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  writeFileSync(join(stateDir(repo.root), 'approvals.json'), `${JSON.stringify({ digests: [{ digest: 'a'.repeat(64), approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }] })}\n`);
+  const gate = join(stateDir(repo.root), 'bin', 'ko-verdict.mjs');
+  writeFileSync(gate, `${readFileSync(gate, 'utf8')}// other\n`);
+  for (const args of [[repo.root], [repo.root, '--yes']]) {
+    const printed = run('apply', args);
+    assert.equal(printed.status, 0, printed.stderr);
+    assert.ok(lines(printed.stdout).includes(`  - ${KO_TEXT.binUnverifiable('a'.repeat(64))}`), printed.stdout);
+  }
+});
+
+test('every place that prints the whole-install staging step says it also stages any other change in .gitattributes (after Task 9\'s third re-review)', () => {
+  const repo = fresh();
+  const applied = run('apply', [repo.root, '--yes']);
+  const step = applied.stdout.split('\n').find((line) => line.startsWith('2. '));
+  assert.ok(step.includes(`(${STAGE_INSTALL_NOTE}):`), step);
+  assert.equal(ownerSteps(applied.stdout).stage, stageInstall(shellWord(repo.root)));
+  assert.ok(TEXT.stageAndApprove(repo.root).includes(STAGE_INSTALL_NOTE));
+  assert.ok(REASONS.liveDiffersKept('x').includes(STAGE_INSTALL_NOTE));
+  assert.ok(REASONS.liveLineEndingsKept('x').includes(STAGE_INSTALL_NOTE));
+  assert.equal(STAGE_INSTALL_NOTE, 'this also stages any other change in .gitattributes');
+});
+
 test('detect reports no install, a fresh install, and each broken state, and --json carries the same in a stable shape; it writes nothing', () => {
   const repo = fresh();
   const none = run('detect', [repo.root]);
@@ -365,7 +390,7 @@ test('detect reports no install, a fresh install, and each broken state, and --j
   const fineText = run('detect', [repo.root]).stdout;
   assert.ok(fineText.endsWith(`Next: ${TEXT.stageAndApprove(repo.root)}\n`), fineText);
   assert.ok(!fineText.includes('rm --'), fineText);
-  assert.equal(TEXT.stageAndApprove(repo.root), `stage the install (git -C ${repo.root} add -- .claude/kh-orchestration ${MANIFEST_PATH} .claude/kh-harness/extensions.json .gitattributes), then ask the owner to run, in their own terminal outside Claude Code: cd ${repo.root} && node ${join(stateDir(repo.root), 'bin', 'ko.mjs')} approve`);
+  assert.equal(TEXT.stageAndApprove(repo.root), `stage the install (git -C ${repo.root} add -- .claude/kh-orchestration ${MANIFEST_PATH} .claude/kh-harness/extensions.json .gitattributes; this also stages any other change in .gitattributes), then ask the owner to run, in their own terminal outside Claude Code: cd ${repo.root} && node ${join(stateDir(repo.root), 'bin', 'ko.mjs')} approve`);
   // Nothing is staged yet, so the staged tree holds no officers file and has no digest.
   assert.equal(fine.status.digestApproved, null);
 

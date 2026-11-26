@@ -251,7 +251,10 @@ export const MESSAGES = Object.freeze({
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
   ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code, from the approved copy. Ask the owner to run ${OWNER_KO} ${command}.`,
   sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session, nor the environment cleared in front of an owner command: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
+  // Without the clause the staging step carries elsewhere (it also stages any other change in
+  // .gitattributes): with it the text would pass kh-harness's 300 characters.
   restoreExtension: 'Restoring extensions.json or extension.mjs alone can leave an entry its module does not match, which blocks every tool call. Stage the whole install (git add -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes).',
+  unstageExtension: 'Unstaging extensions.json or extension.mjs alone lets a later git restore split the pair and block every tool call. Unstage the whole install: git restore --staged -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes',
   installerHidden: 'This names kh-orchestration\'s apply.mjs or uninstall.mjs with a word the hook cannot read whole (a variable, a substitution, a brace or glob pattern, or xargs), which could hide --yes. Write the path and arguments out; --yes is the owner\'s to run in their own terminal.',
   installerOwnerOnly: 'kh-orchestration\'s apply --yes and uninstall --yes are the owner\'s to run in their own terminal, outside Claude Code: they change the hooks and the files the commit gate checks. Ask the owner to run it; without --yes it is a dry run, open here.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
@@ -1657,13 +1660,19 @@ function judgeGitEnvironment(command, resolved, git) {
 // out one without the other, an entry can name a hash its module no longer has, and kh-harness then
 // blocks every tool call. A path operand covers a file when it names it or a folder above it.
 const EXTENSION_PAIR = ['.claude/kh-harness/extensions.json', '.claude/kh-orchestration/scripts/extension.mjs'];
-function splitsExtensionPair(words) {
-  // --staged alone changes only the index, never the working copy kh-harness hashes.
+// Whether git `sub` with `words` splits the pair: null when it does not; 'index' when it unstages one
+// half alone (restore --staged without --worktree, reset with paths, rm --cached; after Task 9's
+// third re-review a later ordinary restore would bring that half's old copy back); 'worktree' when
+// it restores, checks out or removes one half in the working copy.
+function splitsExtensionPair(sub, words) {
   const texts = words.map((word) => word.text);
-  if ((texts.includes('--staged') || texts.includes('-S')) && !texts.includes('--worktree') && !texts.includes('-W')) return false;
   const paths = words.filter((word) => !word.text.startsWith('-')).map((word) => normalizePath(word.text).replace(/^(?:\.\/)+/, '').replace(/\/+$/, ''));
   const covers = (file) => paths.some((path) => path === '.' || path === ':/' || file === path || file.startsWith(`${path}/`));
-  return covers(EXTENSION_PAIR[0]) !== covers(EXTENSION_PAIR[1]);
+  if (covers(EXTENSION_PAIR[0]) === covers(EXTENSION_PAIR[1])) return null;
+  const staged = texts.includes('--staged') || texts.includes('-S');
+  const worktree = texts.includes('--worktree') || texts.includes('-W');
+  if (sub === 'reset' || (sub === 'rm' && texts.includes('--cached')) || (sub === 'restore' && staged && !worktree)) return 'index';
+  return 'worktree';
 }
 
 function judgeGit(resolved, git, values) {
@@ -1674,7 +1683,10 @@ function judgeGit(resolved, git, values) {
   }
   if (git.sub === 'commit-tree') refuse(MESSAGES.commitTree);
   if (git.sub === 'config' && configChangesHooks(git.rest)) refuse(MESSAGES.gitConfig);
-  if ((git.sub === 'restore' || git.sub === 'checkout') && splitsExtensionPair(git.rest)) refuse(MESSAGES.restoreExtension);
+  if (git.sub === 'restore' || git.sub === 'checkout' || git.sub === 'reset' || git.sub === 'rm') {
+    const split = splitsExtensionPair(git.sub, git.rest);
+    if (split !== null) refuse(split === 'index' ? MESSAGES.unstageExtension : MESSAGES.restoreExtension);
+  }
   if (GATED.has(git.sub)) judgeGated(git.sub, git.rest);
   else if (!HARMLESS_NO_VERIFY.has(git.sub)) {
     for (const word of git.rest) {
@@ -1720,8 +1732,24 @@ const isInstaller = (word) => /kh-orchestration/i.test(word.text) && isInstaller
 // re-review): an env word, by basename, with -i, - or --ignore-environment among its options,
 // whatever stands in front of it, so a runner no table knows (prlimit, setpriv, parallel) cannot
 // hide it. The wrapper resolution sees the same for the env it resolves.
-const clearsEnvironment = (resolved) => resolved.cleared
-  || resolved.words.some((word, index) => !word.expands && commandName(word) === 'env' && readEnv(resolved.words, index + 1).cleared);
+// After Task 9's third re-review, the runners that start their command with a cleared or a login
+// environment count too: setpriv --reset-env, systemd-run (any form), su -/-l/--login and
+// sudo -i/--login, wherever they stand.
+function clearsEnvironment(resolved) {
+  if (resolved.cleared) return true;
+  const { words } = resolved;
+  return words.some((word, index) => {
+    if (word.expands) return false;
+    const name = commandName(word);
+    const after = words.slice(index + 1).map((other) => other.text);
+    if (name === 'env') return readEnv(words, index + 1).cleared;
+    if (name === 'systemd-run') return true;
+    if (name === 'setpriv') return after.includes('--reset-env');
+    if (name === 'su') return after.some((text) => text === '-' || text === '-l' || text === '--login');
+    if (name === 'sudo') return after.some((text) => text === '--login' || /^-[a-zA-Z]*i[a-zA-Z]*$/.test(text));
+    return false;
+  });
+}
 
 function judgeOwner(command, given, values, loose) {
   const resolved = { ...given, cleared: clearsEnvironment(given) };

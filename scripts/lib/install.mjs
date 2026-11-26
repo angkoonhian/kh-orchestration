@@ -57,7 +57,7 @@ import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { APPROVED_REFS, GitError, commonDir, currentBranch, git, repoRoot } from '../../assets/scripts/ko-git.mjs';
 import { HOOK_NAMES, REFUSED_TEXT, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
 import {
-  INSTALL_PATHS, SCRATCH_MESSAGES, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stageInstall, stateDir, treeScripts,
+  INSTALL_PATHS, SCRATCH_MESSAGES, STAGE_INSTALL_NOTE, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stageInstall, stateDir, treeScripts,
 } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
@@ -234,7 +234,7 @@ export const TEXT = Object.freeze({
   approveAgain: 'The files this run changed are protected: the commit gate refuses every commit until the owner approves them again.',
   steps: (root, approve, run) => [
     `1. Read what was installed: ${OFFICERS_PATH} (the officers, and what else to lock under "protected") and the scripts in ${SCRIPTS_DIR}/.`,
-    `2. Stage the install, so the tree holds what the gate checks: ${stageCommand(root)}`,
+    `2. Stage the install, so the tree holds what the gate checks (${STAGE_INSTALL_NOTE}): ${stageCommand(root)}`,
     `3. Approve, in your own terminal outside Claude Code: cd ${shellWord(root)} && ${approve}`,
     `4. Run the officers on the staged tree: cd ${shellWord(root)} && ${run}`,
     `5. Commit: git -C ${shellWord(root)} commit`,
@@ -267,7 +267,7 @@ export const TEXT = Object.freeze({
   uninstalled: (root) => `kh-orchestration is uninstalled from ${root}.`,
   nothingToRemove: 'Nothing to remove.',
   statusUnreadable: 'an unexpected error stopped it',
-  stageAndApprove: (root) => `stage the install (${stageCommand(root)}), then ${askOwner(`cd ${shellWord(root)} && ${ownerCommand(root, 'approve')}`)}`,
+  stageAndApprove: (root) => `stage the install (${stageCommand(root)}; ${STAGE_INSTALL_NOTE}), then ${askOwner(`cd ${shellWord(root)} && ${ownerCommand(root, 'approve')}`)}`,
   approveNext: (root) => askOwner(`cd ${shellWord(root)} && ${ownerCommand(root, 'approve')}`),
   allClear: 'nothing: the install is complete and the commit gate is on',
   unexpected: (command) => `${command} could not finish: an unexpected error stopped it. What was written before it is recorded in ${MANIFEST_PATH}.`,

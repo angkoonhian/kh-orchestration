@@ -36,7 +36,7 @@ import {
   isProtected, isValidGlob, matchesGlob, preToolUse, readOfficers, sharedStateDirSync, splitWords,
 } from '../../assets/scripts/extension.mjs';
 import { PROBE_PAYLOAD } from '../../assets/scripts/ko-contract.mjs';
-import { stageInstall, stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
+import { INSTALL_PATHS, stageInstall, stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1, probeContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
 isolateProcessEnv();
@@ -991,9 +991,9 @@ test('git restore or checkout of kh-orchestration\'s extension entry or module o
     ['git checkout main', ALLOW],
     ['git diff -- .claude/kh-harness/extensions.json', ALLOW],
     ['git add -- .claude/kh-harness/extensions.json', ALLOW],
-    // --staged changes only the index (after Task 9's second re-review).
-    ['git restore --staged -- .claude/kh-harness/extensions.json', ALLOW],
-    ['git restore -S .claude/kh-orchestration/scripts/extension.mjs', ALLOW],
+    // --staged of one half is blocked too (reversed after Task 9's third re-review): a later restore splits the pair.
+    ['git restore --staged -- .claude/kh-harness/extensions.json', blocked(MESSAGES.unstageExtension)],
+    ['git restore -S .claude/kh-orchestration/scripts/extension.mjs', blocked(MESSAGES.unstageExtension)],
     ['git restore --staged --worktree -- .claude/kh-harness/extensions.json', blocked(MESSAGES.restoreExtension)],
   ];
   // Its advice stages the whole install, the list the installer and the gate name (ko-state).
@@ -1019,6 +1019,40 @@ test('a cleared environment behind find -exec, an unknown runner or any wrapper 
     ['find . -maxdepth 0 -exec env -i PATH="$PATH" npm test \;', ALLOW],
     ['env -i PATH="$PATH" npm test', ALLOW],
     ['prlimit --nofile=1024 node build.mjs', ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+});
+
+// Unstaging one half of the pair (after Task 9's third re-review): a later ordinary git restore
+// would then bring the old half back beside the new one. Unstaging both, or the whole install, is fine.
+test('unstaging exactly one half of kh-orchestration\'s extension entry and module is blocked, naming the whole-install unstage; both halves, the whole install and other files stay allowed', () => {
+  const rows = [
+    ['git restore --staged -- .claude/kh-harness/extensions.json', blocked(MESSAGES.unstageExtension)],
+    ['git reset -q -- .claude/kh-orchestration/scripts/extension.mjs', blocked(MESSAGES.unstageExtension)],
+    ['git reset HEAD -- .claude/kh-harness/extensions.json', blocked(MESSAGES.unstageExtension)],
+    ['git rm --cached .claude/kh-harness/extensions.json', blocked(MESSAGES.unstageExtension)],
+    ['git restore --staged -- .claude/kh-harness/extensions.json .claude/kh-orchestration/scripts/extension.mjs', ALLOW],
+    ['git restore --staged .', ALLOW],
+    ['git reset', ALLOW],
+    ['git reset --hard', ALLOW],
+    ['git restore --staged -- src/x.js', ALLOW],
+    ['git rm --cached notes.txt', ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+  assert.ok(MESSAGES.unstageExtension.includes(`git restore --staged -- ${INSTALL_PATHS.join(' ')}`), MESSAGES.unstageExtension);
+});
+
+// More ways a runner starts its command with a cleared environment (after Task 9's third re-review).
+test('setpriv --reset-env, systemd-run, su - and sudo -i count as a cleared environment in front of an installer\'s --yes', () => {
+  const K = '/p/kh-orchestration';
+  const rows = [
+    [`U=${K}/scripts/uninstall.mjs; setpriv --reset-env node "$U" "$PWD" --yes --state`, blocked(MESSAGES.sessionEnv)],
+    [`U=${K}/scripts/uninstall.mjs; systemd-run --user --wait --pipe node "$U" "$PWD" --yes --state`, blocked(MESSAGES.sessionEnv)],
+    [`U=${K}/scripts/uninstall.mjs; sudo -i node "$U" . --yes`, blocked(MESSAGES.sessionEnv)],
+    // su -c runs its string as a script of its own, judged as one: the installer rule blocks it.
+    [`su - -c "node ${K}/scripts/uninstall.mjs . --yes"`, blocked(MESSAGES.installerOwnerOnly)],
+    ['systemd-run --user --wait npm test', ALLOW],
+    ['sudo -i true', ALLOW],
   ];
   assert.deepEqual(mismatches(rows), []);
 });
