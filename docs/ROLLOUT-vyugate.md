@@ -56,7 +56,7 @@ kh-orchestration relies on kh-harness's contract 1, which kh-harness 0.2.0 did n
    node ~/projects/kh-harness/scripts/apply.mjs ~/projects/vyugate
    ```
 
-   It prints its proposals and the diffs, then `Dry run — nothing written. Re-run with --yes to apply.` On `main` it also prints `note: --yes would be refused — refusing to apply on the default branch "main"…`; that is expected, and is why step 2 gives `--allow-default-branch`. Read what it proposes, in particular its "WHAT THE HOOKS EXECUTE" section.
+   It prints its proposals and the diffs. On `main` it then prints `note: --yes would be refused — refusing to apply on the default branch "main"…`, which is expected and is why step 2 gives `--allow-default-branch`, and it ends with `Dry run — nothing written. Re-run with --yes to apply.` Read what it proposes, in particular its "WHAT THE HOOKS EXECUTE" section.
 
 2. Apply it:
 
@@ -313,7 +313,7 @@ Then push `main` yourself.
 
 ## 9. Other branches and worktrees
 
-Once the install is committed on `main`, **every branch or worktree whose tree does not carry the install has every commit refused**, with:
+From the moment `apply --yes` writes the hooks (step 2), **every branch or worktree whose tree does not carry the install has every commit refused**, with:
 
 ```
 kh-orchestration: This tree holds no usable kh-orchestration install, so the commit gate refuses it: .claude/kh-orchestration/officers.json is not a file in this tree. …
@@ -322,10 +322,11 @@ Next: node /home/you/projects/vyugate/.git/kh-orchestration/bin/ko.mjs exempt <b
 
 The hooks and the shared state belong to the whole repository, so this includes the feature branch that is checked out now and every Orca worktree.
 
-**Bring a branch across** by merging `main` into it, in that branch's worktree:
+**Bring a branch across** by merging `main` into it, in that branch's worktree, from a clean working tree: `git merge` stops before it starts when local changes would be overwritten, so first commit what you can or stash the change the gate refused (`git stash -u`), and take it back with `git stash pop` once the merge is committed:
 
 ```sh
 cd <the worktree>
+git status --short
 git merge --no-commit main
 node .claude/kh-orchestration/scripts/ko.mjs run
 git commit --no-edit
@@ -339,7 +340,11 @@ Resolve any conflicts before `run`. When the branch has no commits of its own, t
 node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs exempt <branch> --reason "<why>"
 ```
 
-End the exemption with `node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs unexempt <branch>`. (The exemption's own "Next" line names the working copy's `ko.mjs`, which does not exist on a branch without the install; the copy in `bin/` runs the same `unexempt`.)
+End the exemption by running `unexempt` from the `bin/` copy, which works from any branch, including one that does not carry the install (where there is no working copy of `ko.mjs`):
+
+```sh
+node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs unexempt <branch>
+```
 
 A new Orca worktree made from `main` after the install carries it from its first commit.
 
@@ -375,13 +380,26 @@ The dry run lists what it would remove. `--yes --state` removes the scripts, the
 
 ## 12. When everything is blocked or refused
 
-**Every tool call in a session is blocked**, with a message starting `kh-harness extension kh-orchestration: its module file does not match the sha256 recorded for it…` (or `…is missing`). The extension's entry and its module have come apart, usually after one of the two files was restored or checked out alone. In your terminal, for the worktree of that session:
+**Every tool call in a session is blocked**, with a message starting `kh-harness extension kh-orchestration: its module file does not match the sha256 recorded for it…` (or `…is missing`). kh-harness compares the module `.claude/kh-orchestration/scripts/extension.mjs` with the hash recorded in its entry in `.claude/kh-harness/extensions.json`, so the two have come apart: the entry's hash is wrong, the module is missing, or the module was changed (often after one of the two files was restored or checked out alone). In your terminal, for the worktree of that session:
 
-```sh
-node ~/projects/kh-orchestration/scripts/apply.mjs <the worktree> --yes
-```
+1. Run kh-orchestration's apply:
 
-It writes the pair back as this plugin ships it; the next tool call is allowed. Do not `git restore` one of the two files alone. A block that starts `kh-harness: .claude/scripts/…` is kh-harness's own: run kh-harness's `apply --yes` (step 10).
+   ```sh
+   node ~/projects/kh-orchestration/scripts/apply.mjs <the worktree> --yes
+   ```
+
+   For a wrong hash or a missing module it writes the pair back as this plugin ships it, and the next tool call is allowed.
+
+2. If instead it exits 1 saying `.claude/kh-orchestration/scripts/extension.mjs is kept as it is: it was changed since kh-orchestration wrote it…`, the module was changed, and apply never overwrites a change it did not make. Restore BOTH files from `HEAD`, together, then run apply again:
+
+   ```sh
+   git -C <the worktree> restore --source=HEAD --staged --worktree -- .claude/kh-orchestration/scripts/extension.mjs .claude/kh-harness/extensions.json
+   node ~/projects/kh-orchestration/scripts/apply.mjs <the worktree> --yes
+   ```
+
+   Both together, because kh-harness checks the one against the other: restoring only one can leave a module that does not match its entry, which blocks every call again.
+
+Never restore or check out one of the two files alone. A block that starts `kh-harness: .claude/scripts/…` is kh-harness's own: run kh-harness's `apply --yes` (step 10).
 
 **Every commit is refused.** Ask for the cause:
 

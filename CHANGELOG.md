@@ -33,9 +33,10 @@ later, and has no dependencies.
 - The commit gate. `pre-commit` and `pre-merge-commit` hooks run the gate
   from the approved copy of the scripts in the git directory. It allows a
   commit only when the tree holds the install, the working copies of the
-  files the session's hooks run equal the tree, the protected files' digest is approved, contract 1 holds and
-  a passing verdict exists for that tree and base, and it executes nothing
-  of the repository's before the approval is established. A
+  files the session's hooks run equal the tree, the protected files'
+  digest is approved, contract 1 holds and a passing verdict exists for
+  that tree and base, and it executes nothing of the repository's before
+  the approval is established. A
   `reference-transaction` hook refuses a branch update whose commit is not
   the tree the gate allowed, so the index cannot change between the gate
   and the commit. Every refusal names the command to run next.
@@ -63,7 +64,10 @@ later, and has no dependencies.
   add printed, and `uninstall --yes --state` removes what `apply` wrote and
   the owner left unchanged, the hooks, the shared state and its refs, so
   the repository is as it was but for the commits made. The writing runs
-  are the owner's and refuse inside a session.
+  are the owner's and refuse inside a session. `apply --downgrade` lets an
+  older kit replace a newer install, and `apply --bin-from-plugin` fills
+  `bin/` with the plugin's own scripts, keeping every approval, when no
+  approved tree is left to restore it from.
 - The session brief, the plugin's `SessionStart` hook: each session in a
   repository where kh-orchestration is installed on this machine is told
   that commits are checked, how to run the officers, what only the owner
