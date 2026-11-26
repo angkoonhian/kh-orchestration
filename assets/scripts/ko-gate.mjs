@@ -38,9 +38,7 @@ import { contractHolds } from './ko-contract.mjs';
 import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import {
-  FILE_MODES, StateError, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, writeAccepted, writeInflight,
-} from './ko-state.mjs';
+import { FILE_MODES, StateError, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
@@ -107,8 +105,8 @@ export const REASONS = Object.freeze({
   probeDirRelative: 'TMPDIR names a relative path, so the place of the private copy of the approved tree depends on the directory git runs in; set TMPDIR to an absolute directory outside the repository',
   probeDirUnusable: 'the temporary directory for the private copy of the approved tree (TMPDIR, or /tmp when it is not set) does not exist or cannot be written; set TMPDIR to a directory outside the repository that can',
   liveDiffers: (path) => `The working copy of ${path} differs from the tree being committed, and the working copy is what this session's hooks run. Stage it for the owner to approve, or restore it as below, then commit again.`,
-  liveDiffersKept: (path) => `The working copy of ${path} differs from the tree being committed, and it is kh-orchestration's or shared with other plugins, so an older copy must not be put back beside the others. Stage it as below so the owner can approve it, or have the owner run kh-orchestration's apply again, then commit again.`,
-  liveLineEndingsKept: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings (core.autocrlf or a text attribute), and it is kh-orchestration's or shared with other plugins. Add the line .claude/** -text to .gitattributes, then stage it as below for the owner to approve, or have the owner run apply again.`,
+  liveDiffersKept: (path) => `The working copy of ${path} differs from the tree being committed, and it is kh-orchestration's or shared with other plugins, so an older copy must not be put back beside the others. Stage the whole install as below so the owner can approve it, or have the owner run kh-orchestration's apply again, then commit again.`,
+  liveLineEndingsKept: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings (core.autocrlf or a text attribute), and it is kh-orchestration's or shared with other plugins. Add the line .claude/** -text to .gitattributes, then stage the whole install as below for the owner to approve, or have the owner run apply again.`,
   liveLineEndings: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings: this checkout converts them (core.autocrlf or a text attribute), and the working copy is what this session's hooks run. Add the line .claude/** -text to .gitattributes, check the file out again as below, then commit again.`,
   liveMode: (path) => `The working copy of ${path} differs from the tree being committed only in its executable bit: this checkout does not keep file modes (core.fileMode false, or a filesystem without them), and the working copy is what this session's hooks run. Set the bit as the tree has it, as below, then commit again.`,
   liveStagedElsewhere: (path) => `${path} is staged with a change this partial commit leaves out, so its working copy, which this session's hooks run, differs from the tree being committed. Commit without a path list, or restore it, then commit again.`,
@@ -234,9 +232,11 @@ function keptByAnInstaller(root, path) {
     return false;
   }
 }
-// The next step for an installer's file that differs: stage it for the owner's approval, or have
-// the owner's apply write it again (the repair line ko.mjs and status print, a test holds them).
-const KEPT_NEXT = (word) => `git add -- ${word}, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes`;
+// The next step for an installer's file that differs: stage the WHOLE install for the owner's
+// approval (after Task 9's second re-review: one file staged alone could be split from its partner
+// by a later git restore), or have the owner's apply write it again (the repair line ko.mjs and
+// status print; a test holds them).
+const KEPT_NEXT = `${stageInstall(null)}, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes`;
 
 // A differing path's refusal: staged in the repository's own index with other content than the
 // tree's means a partial commit leaves it out, and restoring or removing it would lose the change.
@@ -248,7 +248,7 @@ function differsRefusal(root, path, entry, how) {
   const word = shellWord(path);
   if (entry === undefined) return refuse(keptByAnInstaller(root, path) ? REASONS.liveUntrackedKept(path) : REASONS.liveUntracked(path), `git add -- ${word}`);
   if (how === 'mode') return refuse(REASONS.liveMode(path), `chmod ${entry.mode === '100755' ? '+x' : '-x'} -- ${word}`);
-  if (keptByAnInstaller(root, path)) return refuse(how === 'lineEndings' ? REASONS.liveLineEndingsKept(path) : REASONS.liveDiffersKept(path), KEPT_NEXT(word));
+  if (keptByAnInstaller(root, path)) return refuse(how === 'lineEndings' ? REASONS.liveLineEndingsKept(path) : REASONS.liveDiffersKept(path), KEPT_NEXT);
   if (how === 'lineEndings') return refuse(REASONS.liveLineEndings(path), `git checkout -- ${word}`);
   return refuse(REASONS.liveDiffers(path), `git restore -- ${word}`);
 }
@@ -272,7 +272,7 @@ function convertedFrom(oid, bytes) {
 function liveRefusal(root, live) {
   for (const dir of LIVE_ANCESTORS) {
     const stat = lstatOrNull(join(root, dir));
-    if (stat !== null && !stat.isDirectory()) return keptByAnInstaller(root, dir) ? refuse(REASONS.liveDiffersKept(dir), KEPT_NEXT(shellWord(dir))) : refuse(REASONS.liveDiffers(dir), `git restore -- ${shellWord(dir)}`);
+    if (stat !== null && !stat.isDirectory()) return keptByAnInstaller(root, dir) ? refuse(REASONS.liveDiffersKept(dir), KEPT_NEXT) : refuse(REASONS.liveDiffers(dir), `git restore -- ${shellWord(dir)}`);
   }
   const inTree = new Map(live.map((entry) => [entry.path, entry]));
   for (const entry of live) {

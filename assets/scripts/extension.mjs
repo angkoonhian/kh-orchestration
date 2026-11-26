@@ -251,7 +251,7 @@ export const MESSAGES = Object.freeze({
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
   ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code, from the approved copy. Ask the owner to run ${OWNER_KO} ${command}.`,
   sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session, nor the environment cleared in front of an owner command: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
-  restoreExtension: 'Restoring .claude/kh-harness/extensions.json or kh-orchestration\'s extension.mjs without the other can leave an entry whose hash its module does not have, which blocks every tool call. Stage the file so the owner can approve it, or ask the owner to run kh-orchestration\'s apply --yes.',
+  restoreExtension: 'Restoring extensions.json or extension.mjs alone can leave an entry its module does not match, which blocks every tool call. Stage the whole install (git add -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes).',
   installerHidden: 'This names kh-orchestration\'s apply.mjs or uninstall.mjs with a word the hook cannot read whole (a variable, a substitution, a brace or glob pattern, or xargs), which could hide --yes. Write the path and arguments out; --yes is the owner\'s to run in their own terminal.',
   installerOwnerOnly: 'kh-orchestration\'s apply --yes and uninstall --yes are the owner\'s to run in their own terminal, outside Claude Code: they change the hooks and the files the commit gate checks. Ask the owner to run it; without --yes it is a dry run, open here.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
@@ -1658,6 +1658,9 @@ function judgeGitEnvironment(command, resolved, git) {
 // blocks every tool call. A path operand covers a file when it names it or a folder above it.
 const EXTENSION_PAIR = ['.claude/kh-harness/extensions.json', '.claude/kh-orchestration/scripts/extension.mjs'];
 function splitsExtensionPair(words) {
+  // --staged alone changes only the index, never the working copy kh-harness hashes.
+  const texts = words.map((word) => word.text);
+  if ((texts.includes('--staged') || texts.includes('-S')) && !texts.includes('--worktree') && !texts.includes('-W')) return false;
   const paths = words.filter((word) => !word.text.startsWith('-')).map((word) => normalizePath(word.text).replace(/^(?:\.\/)+/, '').replace(/\/+$/, ''));
   const covers = (file) => paths.some((path) => path === '.' || path === ':/' || file === path || file.startsWith(`${path}/`));
   return covers(EXTENSION_PAIR[0]) !== covers(EXTENSION_PAIR[1]);

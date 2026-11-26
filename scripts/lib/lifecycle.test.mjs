@@ -19,7 +19,7 @@ import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { indexTree } from '../../assets/scripts/ko-git.mjs';
-import { ownerCommand, stateDir } from '../../assets/scripts/ko-state.mjs';
+import { ownerCommand, stageInstall, stateDir } from '../../assets/scripts/ko-state.mjs';
 import { agentCommand } from '../../assets/scripts/ko-cli.mjs';
 
 isolateProcessEnv();
@@ -313,6 +313,24 @@ test('after an upgrade, following only the printed next steps lands a commit, an
     assert.ok(harnessAllowsRead(repo.root), `after step ${step}: ${next}`);
   }
   assert.ok(landed, 'the upgrade was committed');
+});
+
+test('after an upgrade, the gate\'s staging step stages the whole install, so an ordinary git restore . or git checkout -- .claude afterwards keeps the entry and its module together (after Task 9\'s second re-review)', () => {
+  const repo = fresh();
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  ageInstall(repo.root);
+  followSteps(repo.root, TEXT.steps(repo.root, ownerCommand(repo.root, 'approve'), agentCommand(repo.root, 'run')).join('\n'));
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  const attempt = git(repo.root, 'commit', '-q', '-m', 'upgrade');
+  assert.equal(attempt.status, 1);
+  const next = attempt.stderr.split('\n').find((line) => line.startsWith('Next: ')).slice('Next: '.length);
+  const stage = next.split(', or ')[0];
+  assert.equal(stage, stageInstall(null));
+  assert.equal(shell(stage, { cwd: repo.root }).status, 0);
+  for (const ordinary of ['git restore .', 'git checkout -- .claude']) {
+    assert.equal(shell(ordinary, { cwd: repo.root }).status, 0, ordinary);
+    assert.ok(harnessAllowsRead(repo.root), `after ${ordinary}`);
+  }
 });
 
 test('detect reports no install, a fresh install, and each broken state, and --json carries the same in a stable shape; it writes nothing', () => {

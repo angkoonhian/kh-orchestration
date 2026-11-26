@@ -300,6 +300,15 @@ export function switchOn(root) {
 // unstaged edit to the working copy never runs with the owner's authority.
 export const ownerCommand = (root, words) => `node ${shellWord(join(stateDir(root), BIN, 'ko.mjs'))} ${words}`;
 
+// What kh-orchestration's installer writes in the working tree, staged in one command (after Task
+// 9's second re-review): staged one file at a time, an extension entry and its module could be
+// split by an ordinary git restore, and kh-harness would then block every tool call. apply's
+// closing text, the gate's next step and status name this one list.
+export const INSTALL_PATHS = Object.freeze(['.claude/kh-orchestration', '.claude/kh-orchestration.manifest.json', '.claude/kh-harness/extensions.json', '.gitattributes']);
+// The command staging them: in the current directory (the worktree's top, as a hook's next lines
+// read), or with `rootWord` (a path already quoted for a shell) for git -C.
+export const stageInstall = (rootWord) => `git${rootWord === null ? '' : ` -C ${rootWord}`} add -- ${INSTALL_PATHS.join(' ')}`;
+
 const SCRIPTS_DIR = '.claude/kh-orchestration/scripts/';
 const BIN = 'bin';
 // What a refresh that ended early (a kill) can leave beside bin/; removed at the next refresh.

@@ -405,7 +405,8 @@ test('Critical 2: an index changed after the tree was judged is refused before t
 const gateText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
 const HOOK_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
 // The gate's next step for an installer's file that differs (after Task 9's re-review).
-const keptNext = (path) => `git add -- ${path}, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes`;
+// It stages the whole install in one command (after Task 9's second re-review).
+const keptNext = () => 'git add -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes';
 const refusalText = (reason, next) => `${gateText(reason, next)}${HOOK_LINE}`;
 // The entry's own text when ko-gate.mjs or a sibling cannot be loaded: literals only.
 // Its next command is apply, from the plugin: the owner's commands run from this same bin/.

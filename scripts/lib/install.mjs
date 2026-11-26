@@ -58,7 +58,7 @@ import { officersOfTree } from '../../assets/scripts/ko-officers.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { HOOK_NAMES, REFUSED_TEXT, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
 import {
-  StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stateDir, treeScripts,
+  INSTALL_PATHS, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stageInstall, stateDir, treeScripts,
 } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
@@ -134,9 +134,9 @@ export const khHarnessApply = (root) => `node <kh-harness>/scripts/apply.mjs ${s
 
 const sentence = (text) => `${text.replace(/\.$/, '')}.`;
 // Exactly what apply writes in the working tree, never .claude as a whole (after Task 9's review):
-// .claude holds the owner's settings.local.json and whatever else they keep there.
-const WRITTEN_PATHS = ['.claude/kh-orchestration', MANIFEST_PATH, EXTENSIONS_PATH, ATTRIBUTES_FILE];
-const stageCommand = (root) => `git -C ${shellWord(root)} add -- ${WRITTEN_PATHS.join(' ')}`;
+// .claude holds the owner's settings.local.json and whatever else they keep there. The list is
+// ko-state's, which the gate's next steps also name (after Task 9's second re-review).
+const stageCommand = (root) => stageInstall(shellWord(root));
 const USAGES = {
   apply: '<repository> [--yes] [--downgrade] [--bin-from-plugin]',
   detect: '<repository> [--json]',
@@ -1303,7 +1303,7 @@ function nextStep(root, planned, status) {
   if (planned.conflicts.length > 0) return planned.conflicts[0].next;
   if (planned.actions.length > 0) return askOwner(applyCommand(root));
   if (status === null) return agentCommand(root, 'status');
-  const unstaged = git(root, ['ls-files', '-z', '--others', '--modified', '--exclude-standard', '--', ...WRITTEN_PATHS]);
+  const unstaged = git(root, ['ls-files', '-z', '--others', '--modified', '--exclude-standard', '--', ...INSTALL_PATHS]);
   if (status.install?.present === false || unstaged.status !== 0 || unstaged.stdout !== '') return TEXT.stageAndApprove(root);
   if (status.digestApproved === false) return TEXT.approveNext(root);
   if (status.problems.length > 0) return status.problems[0].next;

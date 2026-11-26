@@ -36,7 +36,7 @@ import {
   isProtected, isValidGlob, matchesGlob, preToolUse, readOfficers, sharedStateDirSync, splitWords,
 } from '../../assets/scripts/extension.mjs';
 import { PROBE_PAYLOAD } from '../../assets/scripts/ko-contract.mjs';
-import { stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
+import { stageInstall, stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1, probeContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
 isolateProcessEnv();
@@ -991,7 +991,13 @@ test('git restore or checkout of kh-orchestration\'s extension entry or module o
     ['git checkout main', ALLOW],
     ['git diff -- .claude/kh-harness/extensions.json', ALLOW],
     ['git add -- .claude/kh-harness/extensions.json', ALLOW],
+    // --staged changes only the index (after Task 9's second re-review).
+    ['git restore --staged -- .claude/kh-harness/extensions.json', ALLOW],
+    ['git restore -S .claude/kh-orchestration/scripts/extension.mjs', ALLOW],
+    ['git restore --staged --worktree -- .claude/kh-harness/extensions.json', blocked(MESSAGES.restoreExtension)],
   ];
+  // Its advice stages the whole install, the list the installer and the gate name (ko-state).
+  assert.ok(MESSAGES.restoreExtension.includes(`(${stageInstall(null)})`), MESSAGES.restoreExtension);
   assert.deepEqual(mismatches(rows), []);
 });
 
