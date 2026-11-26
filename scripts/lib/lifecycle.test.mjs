@@ -17,7 +17,8 @@ import { PROBE_PAYLOAD, ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { indexTree } from '../../assets/scripts/ko-git.mjs';
-import { stateDir } from '../../assets/scripts/ko-state.mjs';
+import { ownerCommand, stateDir } from '../../assets/scripts/ko-state.mjs';
+import { agentCommand } from '../../assets/scripts/ko-cli.mjs';
 
 isolateProcessEnv();
 // The in-process calls run git with this process's environment: no user or system configuration.
@@ -204,7 +205,7 @@ test('apply repairs a missing bin/, a damaged bin/ file and a damaged hook, afte
   }
 });
 
-test('apply over a hook that is not kh-orchestration\'s writes none of the three, prints the line to add, and says the install is incomplete', () => {
+test('apply over a hook that is not kh-orchestration\'s leaves it, prints the line to add, and says the install is incomplete', () => {
   const repo = fresh();
   const preCommit = join(repo.root, '.git', 'hooks', 'pre-commit');
   writeFileSync(preCommit, '#!/bin/sh\nexit 0\n');
@@ -214,7 +215,47 @@ test('apply over a hook that is not kh-orchestration\'s writes none of the three
   assert.ok(applied.stdout.includes(TEXT.hookConflict('pre-commit', preCommit, hookLine('pre-commit', { env: envPath(), node: process.execPath }))));
   assert.ok(applied.stdout.endsWith(`${TEXT.incomplete}\n`));
   assert.equal(readFileSync(preCommit, 'utf8'), '#!/bin/sh\nexit 0\n');
-  for (const name of ['pre-merge-commit', 'reference-transaction']) assert.equal(existsSync(join(repo.root, '.git', 'hooks', name)), false);
+  for (const name of ['pre-merge-commit', 'reference-transaction']) assert.ok(existsSync(join(repo.root, '.git', 'hooks', name)), name);
+});
+
+test('a foreign hook of each name: the other two hooks are written, the printed line pasted into it completes the install, the gate then runs from it, and uninstall leaves it and says the line remains (after Task 9\'s review)', () => {
+  for (const name of HOOK_NAMES) {
+    const repo = fresh();
+    const hooks = join(repo.root, '.git', 'hooks');
+    const foreign = join(hooks, name);
+    writeFileSync(foreign, '#!/bin/sh\necho foreign-hook-ran >&2\nexit 0\n', { mode: 0o755 });
+    const first = run('apply', [repo.root, '--yes']);
+    assert.equal(first.status, 1, `${name}: ${first.stderr}`);
+    const line = hookLine(name, { env: envPath(), node: process.execPath });
+    assert.ok(first.stdout.includes(TEXT.hookConflict(name, foreign, line)), name);
+    for (const other of HOOK_NAMES.filter((hook) => hook !== name)) {
+      assert.equal(readFileSync(join(hooks, other), 'utf8'), hookText(other, { env: envPath(), node: process.execPath, version: KIT_VERSION }), `${name}: ${other} is written`);
+    }
+    const printed = first.stdout.split('\n').find((text) => text === `    ${line}`).slice(4);
+    const pasted = `#!/bin/sh\n${printed}\necho foreign-hook-ran >&2\nexit 0\n`;
+    writeFileSync(foreign, pasted);
+    const again = run('apply', [repo.root, '--yes']);
+    assert.deepEqual([again.status, again.stdout], [0, `${TEXT.nothingToDo(repo.root)}\n`], name);
+    assert.deepEqual(JSON.parse(run('detect', [repo.root, '--json']).stdout).hooks.find((hook) => hook.name === name).state, 'hosted', name);
+
+    // The owner's steps land a verdicted commit; an unverdicted one is refused by the gate.
+    const steps = run('apply', [repo.root]).stdout;
+    assert.equal(steps, `${TEXT.nothingToDo(repo.root)}\n`);
+    followSteps(repo.root, TEXT.steps(repo.root, ownerCommand(repo.root, 'approve'), agentCommand(repo.root, 'run')).join('\n'));
+    assert.deepEqual(statusJson(repo.root).problems, [], name);
+    writeFileSync(join(repo.root, 'unverdicted.txt'), 'x\n');
+    git(repo.root, 'add', 'unverdicted.txt');
+    const head = git(repo.root, 'rev-parse', 'HEAD').stdout;
+    const refused = git(repo.root, 'commit', '-q', '-m', 'unverdicted');
+    assert.equal(refused.status, 1, name);
+    assert.ok(refused.stderr.includes(`kh-orchestration: ${REASONS.noVerdict(indexTree(repo.root), git(repo.root, 'rev-parse', 'HEAD').stdout.trim()).split(' (')[0]}`), `${name}: ${refused.stderr}`);
+    assert.equal(git(repo.root, 'rev-parse', 'HEAD').stdout, head);
+
+    const removed = run('uninstall', [repo.root, '--yes', '--state']);
+    assert.equal(removed.status, 0, removed.stderr);
+    assert.equal(readFileSync(foreign, 'utf8'), pasted, `${name}: the foreign hook is left as it is`);
+    assert.ok(lines(removed.stdout).includes(TEXT.hostedRemains(name, foreign)), name);
+  }
 });
 
 test('detect reports no install, a fresh install, and each broken state, and --json carries the same in a stable shape; it writes nothing', () => {

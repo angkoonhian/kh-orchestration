@@ -377,7 +377,7 @@ test('another plugin\'s entry stays byte for byte in place through install, upda
   assert.equal(existsSync(join(alone.root, EXTENSIONS_PATH)), false, 'removed when kh-orchestration\'s entry was the last');
 });
 
-test('an existing hook that is not kh-orchestration\'s is a conflict: none of the three hooks is written, and the line printed to add runs the gate', () => {
+test('an existing hook that is not kh-orchestration\'s is a conflict: it is not written over, the other two are written, and the line printed to add runs the gate', () => {
   const repo = fresh();
   const preCommit = join(hooksDir(repo.root), 'pre-commit');
   writeFileSync(preCommit, '#!/bin/sh\necho owner-hook >&2\n');
@@ -385,13 +385,13 @@ test('an existing hook that is not kh-orchestration\'s is a conflict: none of th
   const planned = plan(repo.root);
   const line = hookLine('pre-commit', { env: envPath(), node: process.execPath });
   assert.deepEqual(planned.conflicts, [{ text: TEXT.hookConflict('pre-commit', preCommit, line), next: TEXT.askOwner(applyCommand(repo.root)) }]);
-  assert.equal(planned.actions.some((action) => action.kind === 'git-hook'), false);
+  assert.deepEqual(planned.actions.filter((action) => action.kind === 'git-hook').map((action) => action.name), ['pre-merge-commit', 'reference-transaction']);
   const result = applyPlan(repo.root, planned);
   assert.equal(result.refusal, null);
   assert.equal(readFileSync(preCommit, 'utf8'), '#!/bin/sh\necho owner-hook >&2\n');
-  for (const name of ['pre-merge-commit', 'reference-transaction']) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
-  assert.deepEqual(readManifest(repo.root).manifest.gitHooks, []);
-  assert.match(TEXT.hookConflict('pre-commit', '/h/pre-commit', 'L'), /^The pre-commit hook at \/h\/pre-commit is not kh-orchestration's, so none of the three hooks is written\. To run the commit gate from it, add this line directly after its first line:\n {4}L$/);
+  for (const name of ['pre-merge-commit', 'reference-transaction']) assert.ok(existsSync(join(hooksDir(repo.root), name)), name);
+  assert.deepEqual(readManifest(repo.root).manifest.gitHooks.map((hook) => hook.name), ['pre-merge-commit', 'reference-transaction']);
+  assert.equal(TEXT.hookConflict('pre-commit', '/h/pre-commit', 'L'), 'The pre-commit hook at /h/pre-commit is not kh-orchestration\'s, so it is not written over. To run the commit gate from it, add this line directly after its first line:\n    L');
 
   // The line, added after the first line, runs the gate: the commit is refused with the gate's own text.
   writeFileSync(preCommit, `#!/bin/sh\n${line}\necho owner-hook >&2\n`);

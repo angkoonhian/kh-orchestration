@@ -93,6 +93,23 @@ export function hookLine(hook, { env, node }) {
   return `case $1 in prepared) ko_d=\${0%/hooks/*}; for ko_f in "$ko_d/kh-orchestration/inflight-$PPID".jso[n]; do case $ko_f in *'.jso[n]') ;; *) ${check} ;; esac; done ;; esac`;
 }
 
+const LINE_START = new RegExp(`ko_out=\\$\\((${QUOTED}) -i .* (${QUOTED}) "\\$ko_d/kh-orchestration/bin/gate\\.mjs" `);
+
+/**
+ * The env and Node, `{ env, node }`, named by a line of `text` that is exactly the line hookLine
+ * gives for hook `hook` and those paths: a hook file that is someone else's and holds it runs the
+ * gate as that hook (after Task 9's review). Null when no line is.
+ */
+export function hostedParts(text, hook) {
+  for (const line of text.split('\n')) {
+    const start = line.includes('$ko_d/kh-orchestration/bin/gate.mjs') ? line.match(LINE_START) : null;
+    if (start === null) continue;
+    const parts = { env: unquote(start[1]), node: unquote(start[2]) };
+    if (hookLine(hook, parts) === line) return parts;
+  }
+  return null;
+}
+
 const HEADER = /^#!\/bin\/sh -p\n# kh-orchestration (\S+) (\S+)\. Do not edit\.\n/;
 const NODE_START = new RegExp(`^if out=\\$\\((${QUOTED}) -i .* (${QUOTED}) "\\$d/kh-orchestration/bin/gate\\.mjs" `, 'm');
 

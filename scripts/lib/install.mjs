@@ -48,7 +48,7 @@ import { EXTENSION_ID, STAMP } from '../../assets/scripts/ko-contract.mjs';
 import { hashesTo } from '../../assets/scripts/ko-digest.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { GitError, commonDir, currentBranch, git, repoRoot } from '../../assets/scripts/ko-git.mjs';
-import { HOOK_NAMES, hookLine, hookParts, hookText } from '../../assets/scripts/ko-hooks.mjs';
+import { HOOK_NAMES, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
 import { StateError, binEntriesOf, listInflight, ownerCommand, readApprovals, removeStaleInflight, replaceBin, stateDir } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1, lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 
@@ -175,7 +175,10 @@ export const TEXT = Object.freeze({
   scriptEdited: (path) => `${path} is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. Restore it (git checkout -- ${path}) or remove it, then run apply again to take this version.`,
   hooksStopped: 'The git hooks are not written while an installed script is kept: the install is incomplete until the scripts above are kh-orchestration\'s.',
   extensionSkipped: `kh-orchestration's entry in ${EXTENSIONS_PATH} is not written while ${MODULE} is kept: the entry would register bytes kh-orchestration did not ship.`,
-  hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so none of the three hooks is written. To run the commit gate from it, add this line directly after its first line:\n    ${line}`,
+  hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so it is not written over. To run the commit gate from it, add this line directly after its first line:\n    ${line}`,
+  hostedStale: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line for another env or Node, so the commit gate may not start from it. Replace that line with this one:\n    ${line}`,
+  hostedNotExecutable: (name, path) => `The ${name} hook at ${path} holds kh-orchestration's line but is not executable, so git skips it.`,
+  hostedRemains: (name, path) => `The ${name} hook at ${path} is not kh-orchestration's and is left as it is, but it still holds kh-orchestration's line, which refuses every commit once kh-orchestration is gone: remove that line from it by hand.`,
 
   baseBranchMain: 'officers.json names main as the base branch: the repository has a branch main.',
   baseBranchMaster: 'officers.json names master as the base branch: the repository has a branch master and no main.',
@@ -472,16 +475,24 @@ function scriptState(root, name, recorded) {
 }
 
 /**
- * A git hook's state for `expected`, the text this run writes: `missing`; `current` (that text,
- * executable); `ours` (its header names kh-orchestration and this hook: rewritten); `not-ours`.
+ * A git hook's state for this run's `env` and `node`: `missing`; `current` (the text this run
+ * writes, executable); `ours` (its header names kh-orchestration and this hook: rewritten);
+ * `hosted` (someone else's, holding exactly the line hookLine gives for these paths, executable:
+ * it runs the gate); `hosted-other` (holding that line for other paths); `hosted-off` (holding it,
+ * not executable); `not-ours`.
  */
-function hookState(path, name, expected) {
+function hookState(path, name, { env, node }) {
   const file = readRegular(path, MAX_HOOK_BYTES);
   if (file.absent) return { state: 'missing' };
   if (file.unusable) return { state: 'not-ours' };
   const text = file.bytes.toString('utf8');
-  if (text === expected && (file.mode & 0o111) === 0o111) return { state: 'current', bytes: file.bytes };
-  return hookParts(text)?.hook === name ? { state: 'ours', bytes: file.bytes } : { state: 'not-ours', bytes: file.bytes };
+  const executable = (file.mode & 0o111) === 0o111;
+  if (text === hookText(name, { env, node, version: KIT_VERSION }) && executable) return { state: 'current', bytes: file.bytes };
+  if (hookParts(text)?.hook === name) return { state: 'ours', bytes: file.bytes };
+  const hosted = hostedParts(text, name);
+  if (hosted === null) return { state: 'not-ours', bytes: file.bytes };
+  if (hosted.env !== env || hosted.node !== node) return { state: 'hosted-other', bytes: file.bytes };
+  return { state: executable ? 'hosted' : 'hosted-off', bytes: file.bytes };
 }
 
 // Whether a hook's bytes are exactly a text this kit writes, for the version, env and Node they name.
@@ -789,26 +800,28 @@ export function plan(dir) {
     actions.push({ kind: 'record', path: stateDir(root), detail: TEXT.record(stateDir(root)), stateDir: true });
   }
 
-  // (f) the hooks: none while a script is kept, none while one hook is someone else's
+  // (f) the hooks: none while a script is kept; else each one that is not someone else's, and for
+  // each that is, the line that runs the gate from it, until it holds that line (after Task 9's review)
   const hooks = join(commonDir(root), 'hooks');
   const hookActions = [];
   const hookConflicts = [];
   for (const name of HOOK_NAMES) {
     const path = join(hooks, name);
-    const expected = hookText(name, { env, node, version: KIT_VERSION });
-    const found = hookState(path, name, expected);
+    const found = hookState(path, name, { env, node });
     const recorded = manifest?.gitHooks.find((hook) => hook.name === name)?.sha256;
+    const line = hookLine(name, { env, node });
     if (found.state === 'missing') hookActions.push({ kind: 'git-hook', path, detail: TEXT.writeHook(path), name, create: true });
     else if (found.state === 'ours') hookActions.push({ kind: 'git-hook', path, detail: TEXT.rewriteHook(path), name, create: false });
     else if (found.state === 'current' && recorded !== sha256(found.bytes)) hookActions.push({ kind: 'record', path, detail: TEXT.record(path), gitHook: { name, sha256: sha256(found.bytes) } });
-    else if (found.state === 'not-ours') hookConflicts.push({ text: TEXT.hookConflict(name, path, hookLine(name, { env, node })), next });
+    else if (found.state === 'not-ours') hookConflicts.push({ text: TEXT.hookConflict(name, path, line), next });
+    else if (found.state === 'hosted-other') hookConflicts.push({ text: TEXT.hostedStale(name, path, line), next });
+    else if (found.state === 'hosted-off') hookConflicts.push({ text: TEXT.hostedNotExecutable(name, path), next: `chmod +x ${shellWord(path)}` });
   }
   if (kept.length > 0) {
     if (hookActions.some((action) => action.kind === 'git-hook') || hookConflicts.length > 0) conflicts.push({ text: TEXT.hooksStopped, next });
-  } else if (hookConflicts.length > 0) {
-    conflicts.push(...hookConflicts);
   } else {
     actions.push(...hookActions);
+    conflicts.push(...hookConflicts);
   }
 
   // (g) in-flight records of git processes that have ended
@@ -919,7 +932,7 @@ export function applyPlan(root, planned, { onWrite } = {}) {
       }
     }
     if (hooksWritten.length > 0) {
-      const failed = hooksFailing(root, planned);
+      const failed = hooksFailing(root, planned, hooksWritten.map((action) => action.name));
       if (failed !== null) {
         for (const name of HOOK_NAMES) {
           const path = join(commonDir(root), 'hooks', name);
@@ -940,11 +953,11 @@ export function applyPlan(root, planned, { onWrite } = {}) {
   return { manifest, refusal: null };
 }
 
-// The self-test after the hooks are written: the installed hooks are the texts written, and they
-// start the gate in bin/ as it now is. Null when they do, else what failed.
-function hooksFailing(root, planned) {
+// The self-test after the hooks are written: the hooks this run wrote (`names`) are the texts
+// written, and they start the gate in bin/ as it now is. Null when they do, else what failed.
+function hooksFailing(root, planned, names) {
   const hooks = join(commonDir(root), 'hooks');
-  for (const name of HOOK_NAMES) {
+  for (const name of names) {
     const file = readRegular(join(hooks, name), MAX_HOOK_BYTES);
     if (file.bytes?.toString('utf8') !== hookText(name, { env: planned.env, node: planned.node, version: KIT_VERSION })) return TEXT.hookTextDiffers;
   }
@@ -1019,6 +1032,7 @@ export function uninstallPlan(dir, { state }) {
     const recorded = manifest.gitHooks.find((hook) => hook.name === name)?.sha256;
     if (file.bytes === undefined) continue;
     if (sha256(file.bytes) === recorded || isExactlyOurs(file.bytes, name)) actions.push({ kind: 'git-hook', path, detail: TEXT.removeHook(path), name });
+    else if (hostedParts(file.bytes.toString('utf8'), name) !== null) notes.push(TEXT.hostedRemains(name, path));
     else if (recorded !== undefined) kept.push(TEXT.keptHook(path));
   }
   stateAction();
@@ -1125,7 +1139,15 @@ export function uninstallLines(planned, { dryRun }) {
 // ---- detect ----
 
 const SCRIPT_WORDS = { current: 'current', older: 'other bytes', edited: 'changed since kh-orchestration wrote it', 'not-ours': 'not kh-orchestration\'s', missing: 'missing' };
-const HOOK_WORDS = { current: 'kh-orchestration\'s, current', ours: 'kh-orchestration\'s, not this version\'s exact text', 'not-ours': 'not kh-orchestration\'s', missing: 'missing' };
+const HOOK_WORDS = {
+  current: 'kh-orchestration\'s, current',
+  ours: 'kh-orchestration\'s, not this version\'s exact text',
+  hosted: 'not kh-orchestration\'s, but holds its line, so it runs the gate',
+  'hosted-other': 'not kh-orchestration\'s, holding its line for another env or Node',
+  'hosted-off': 'not kh-orchestration\'s, holding its line, but not executable',
+  'not-ours': 'not kh-orchestration\'s',
+  missing: 'missing',
+};
 
 /**
  * What `detect` reports for the repository `dir` is in, as one object (the shape `--json`
@@ -1157,7 +1179,7 @@ export function detect(dir) {
   let statusError = null;
   try {
     const hooksDir = join(commonDir(root), 'hooks');
-    hooks = HOOK_NAMES.map((name) => ({ name, state: hookState(join(hooksDir, name), name, hookText(name, { env: env ?? '', node: process.execPath, version: KIT_VERSION })).state }));
+    hooks = HOOK_NAMES.map((name) => ({ name, state: hookState(join(hooksDir, name), name, { env: env ?? '', node: process.execPath }).state }));
     status = statusOf(root);
   } catch (error) {
     statusError = error instanceof GitError || error instanceof StateError ? error.message : TEXT.statusUnreadable;

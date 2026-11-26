@@ -32,7 +32,7 @@ import { REASONS, exemptionOf, installOf, judge, liveFilesRefusal, plainText, re
 import {
   GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, listEntries, repoRoot, tidy, treeOfCommit,
 } from './ko-git.mjs';
-import { HOOK_NAMES, hookParts, hookText } from './ko-hooks.mjs';
+import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
 import {
   RULE_ID, StateError, appendJournal, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
@@ -424,9 +424,11 @@ function attempt(problems, root, read, fallback) {
 // One hook as git would run it: present, ours (a kh-orchestration header for this hook), matching
 // (byte for byte the text this kit writes for the version, env and Node the hook names, so an
 // edited body is never "ok" by its header), executable, and the env and Node it names still there.
+// A hook that is someone else's but holds exactly the line apply prints for it is `hosted`: it runs
+// the gate (after Task 9's review), and is judged by the env and Node that line names.
 function inspectHook(root, name) {
   const path = join(commonDir(root), 'hooks', name);
-  const hook = { name, path, present: false, ours: false, matches: false, executable: false, env: null, envExists: false, node: null, nodeExists: false };
+  const hook = { name, path, present: false, ours: false, hosted: false, matches: false, executable: false, env: null, envExists: false, node: null, nodeExists: false };
   const stat = statOrNull(path);
   if (stat === null || !stat.isFile()) return hook;
   hook.present = true;
@@ -435,28 +437,31 @@ function inspectHook(root, name) {
   const text = read.bytes === undefined || read.bytes.length > MAX_HOOK_BYTES ? '' : read.bytes.toString('utf8');
   const parts = hookParts(text);
   hook.ours = parts !== null && parts.hook === name;
-  if (!hook.ours || parts.env === null) return hook;
-  hook.env = parts.env;
-  hook.node = parts.node;
-  hook.envExists = runnable(parts.env);
-  hook.nodeExists = runnable(parts.node);
-  hook.matches = hookText(name, parts) === text;
+  const hosted = hook.ours ? null : hostedParts(text, name);
+  hook.hosted = hosted !== null;
+  const named = hook.hosted ? hosted : parts;
+  if ((!hook.ours && !hook.hosted) || named.env === null) return hook;
+  hook.env = named.env;
+  hook.node = named.node;
+  hook.envExists = runnable(named.env);
+  hook.nodeExists = runnable(named.node);
+  hook.matches = hook.ours && hookText(name, parts) === text;
   return hook;
 }
 
 function hookProblems(root, hook) {
   const apply = APPLY(root);
   if (!hook.present) return [hook.name === REFERENCE_HOOK ? { text: TEXT.raceHookMissing(hook.path), next: apply } : { text: TEXT.hookMissing(hook.name, hook.path), next: apply }];
-  if (!hook.ours) return [{ text: TEXT.hookNotOurs(hook.name, hook.path), next: apply }];
+  if (!hook.ours && !hook.hosted) return [{ text: TEXT.hookNotOurs(hook.name, hook.path), next: apply }];
   const problems = [];
-  if (!hook.matches) problems.push({ text: TEXT.hookDiffers(hook.name, hook.path), next: apply });
+  if (hook.ours && !hook.matches) problems.push({ text: TEXT.hookDiffers(hook.name, hook.path), next: apply });
   if (!hook.executable) problems.push({ text: TEXT.hookNotExecutable(hook.name, hook.path), next: `chmod +x ${shellWord(hook.path)}` });
   if (hook.env !== null && !hook.envExists) problems.push({ text: TEXT.hookProgramGone(hook.name, 'env', hook.env), next: apply });
   if (hook.node !== null && !hook.nodeExists) problems.push({ text: TEXT.hookProgramGone(hook.name, 'Node', hook.node), next: apply });
   return problems;
 }
 
-const raceHookWorks = (hook) => hook.present && hook.matches && hook.executable;
+const raceHookWorks = (hook) => hook.present && (hook.matches || hook.hosted) && hook.executable;
 
 // bin/ against what it should hold: the scripts of the last approval that records its tree (the
 // tree approve last refreshed bin/ from), or before any such approval the working copy's
@@ -658,7 +663,7 @@ export function statusOf(root) {
     digest,
     inflight,
     bin,
-    hooks: hooks.map(({ name, present, ours, matches, executable, env, envExists, node, nodeExists }) => ({ name, present, ours, matches, executable, env, envExists, node, nodeExists })),
+    hooks: hooks.map(({ name, present, ours, hosted, matches, executable, env, envExists, node, nodeExists }) => ({ name, present, ours, hosted, matches, executable, env, envExists, node, nodeExists })),
     hooksPath,
     git: gitAt,
     problems,
@@ -668,7 +673,7 @@ export function statusOf(root) {
 const yesNo = (value, yes, no) => (value === null ? 'unknown (see the problems)' : value ? yes : no);
 
 function statusLines(root, status) {
-  const hookWord = (hook) => (!hook.present ? 'missing' : !hook.ours ? 'not ours' : hook.matches && hook.executable && hook.envExists && hook.nodeExists ? 'ok' : 'broken');
+  const hookWord = (hook) => (!hook.present ? 'missing' : !hook.ours && !hook.hosted ? 'not ours' : (hook.matches || hook.hosted) && hook.executable && hook.envExists && hook.nodeExists ? (hook.hosted ? 'ok (its line in a hook of another)' : 'ok') : 'broken');
   const binWord = (bin) => (bin === null ? 'unknown' : !bin.present ? 'missing' : binProblems(root, bin).length === 0 ? `equal to ${bin.baseline.kind === 'approved' ? 'the last approved tree' : 'the working copy'}` : 'differs');
   return [
     TEXT.statusHeader(root),
