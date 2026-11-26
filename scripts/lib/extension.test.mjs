@@ -469,9 +469,24 @@ const BLOCKED = [
   ['git commit -m "$(cat <<\'EOF\'\nmsg\nEOF\n)" --no-verify', MESSAGES.noVerify],
   ["bash -c 'git commit -n'", MESSAGES.noVerify], ["sh -ec 'git commit -n'", MESSAGES.noVerify], ["bash -o pipefail -c 'git commit -n'", MESSAGES.noVerify],
   ["bash -c -- 'git commit -n'", MESSAGES.noVerify], ['xargs sh -c "git commit -n"', MESSAGES.noVerify], ["bash -c 'bash -c \"git commit -n\"'", MESSAGES.noVerify],
+  // after Task 7's review: inline code or a fed script that names the plugin's scripts or modules
+  // (importing them to call their functions is the one-line way to forge state)
+  ['echo approve | node -e "import(\'./.claude/kh-orchestration/scripts/ko-cli.mjs\').then(m=>m.main([\'approve\'],{env:{}}))"', MESSAGES.runsCode],
+  ['node -e "import(\'./.claude/kh-orchestration/scripts/ko-cli.mjs\').then(m=>m.main([\'off\'],{env:{}}))"', MESSAGES.runsCode],
+  ['node -e "import(\'./.claude/kh-orchestration/scripts/ko-state.mjs\').then(m=>m.writeState(\'.\',\'approvals.json\',{digests:[]}))"', MESSAGES.runsCode],
+  ['node --input-type=module -e "import {switchOff} from \'./.claude/kh-orchestration/scripts/ko-state.mjs\'"', MESSAGES.runsCode],
+  ['python3 -c "open(\'.claude/kh-orchestration/scripts/ko-cli.mjs\',\'w\')"', MESSAGES.runsCode],
+  ['node -e "import(process.argv[1])" /x/.git/kh-orchestration/bin/ko-gate.mjs', MESSAGES.guardedPath],
+  ['node -e "x" && node -e "import(\'./ko-gate.mjs\')"', MESSAGES.runsCode],
+  ['node <<EOF\nimport(\'./.claude/kh-orchestration/scripts/ko-state.mjs\')\nEOF', MESSAGES.feedsScript],
+  ['echo "import(\'./kh-orchestration/bin/ko-cli.mjs\')" | node', MESSAGES.feedsScript],
 ];
 
 const ALLOWED = [
+  // after Task 7's review: the plugin's scripts named outside code stay allowed
+  'node .claude/kh-orchestration/scripts/ko.mjs run', 'node .claude/kh-orchestration/scripts/ko.mjs status --json', 'cat .claude/kh-orchestration/scripts/ko-cli.mjs',
+  'grep -n main .claude/kh-orchestration/scripts/ko-cli.mjs', 'git add .claude/kh-orchestration/scripts/ko-cli.mjs', 'git commit -m "ko-cli.mjs: approve asks for the word"',
+  'node .claude/kh-orchestration/scripts/ko.mjs verify-branch --no-run', 'node -e "console.log(1)"',
   // the brief's rows, and the rows the old rules blocked that the review found everyday
   'git commit -m "fix -n flag"', 'git commit -m "--no-verify is banned"', 'git merge -n x', 'git log -n 5', `${KO} run`, 'ls .git/hooks',
   'git commit -m "docs: say core.hooksPath conflicts are reported"', 'git commit -m "fix(extension): block writes to .git/hooks"',

@@ -937,10 +937,10 @@ node .claude/kh-orchestration/scripts/ko.mjs "$X" approve
 allow
 node .claude/kh-orchestration/scripts/ko.mjs $CMD
 =====
-allow
+block
 node -e "import('./.claude/kh-orchestration/scripts/ko-state.mjs').then(m=>m.x())"
 =====
-allow
+block
 node --input-type=module -e "import('./.claude/kh-orchestration/scripts/ko-approve.mjs')"
 =====
 allow

@@ -83,7 +83,7 @@ function refExists(root, ref) {
 
 // The commit HEAD names, or null when HEAD is unborn: a symbolic ref to a
 // branch that does not exist. A HEAD that cannot be read is an error.
-function headCommit(root) {
+export function headCommit(root) {
   const commit = git(root, ['rev-parse', '--verify', '-q', 'HEAD^{commit}']);
   if (commit.status === 0) return oneLine(commit.stdout);
   const symbolic = git(root, ['symbolic-ref', '-q', 'HEAD']);

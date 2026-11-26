@@ -9,13 +9,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXTENSION_MODULE, KIT_VERSION, installGate, makeRepo, testEnv } from './test-repo.mjs';
 import {
-  OFFICERS_PATH, approve, approveTree, commit, gitIn, head, headOrNull, installed, ko, officersFile, repos, runAndApprove, stage, subject,
+  OFFICERS_PATH, approve, approveTree, commit, gitIn, head, headOrNull, installed, ko, officersFile, owner, repos, runAndApprove, stage, subject,
 } from './gate-fixture.mjs';
 import { REASONS, exemptCommand, installOf, judge, liveFilesRefusal, runGate } from '../../assets/scripts/ko-gate.mjs';
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, currentBranch, gitFailedMessage, indexTree } from '../../assets/scripts/ko-git.mjs';
-import { corruptMessage, readInflight, shapeMessage, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
+import { corruptMessage, ownerCommand, readAccepted, readInflight, shapeMessage, stateDir, writeFailedMessage, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 import { readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
@@ -45,15 +45,12 @@ const allowed = (reason) => ({ allow: true, reason, next: '' });
 // ---- judge, one check of decision 17 at a time (step 2) ----
 
 test('the command table is the one ko.mjs and the extension name', () => {
-  assert.deepEqual(COMMANDS, {
+  assert.deepEqual({ ...COMMANDS }, {
     run: 'node .claude/kh-orchestration/scripts/ko.mjs run',
-    approve: 'node .claude/kh-orchestration/scripts/ko.mjs approve',
     status: 'node .claude/kh-orchestration/scripts/ko.mjs status',
     verifyBranch: 'node .claude/kh-orchestration/scripts/ko.mjs verify-branch',
-    propose: 'node .claude/kh-orchestration/scripts/ko.mjs propose',
-    on: 'node .claude/kh-orchestration/scripts/ko.mjs on',
     unexempt: 'node .claude/kh-orchestration/scripts/ko.mjs unexempt',
-  });
+  }, 'the agents\' commands only: the owner\'s are built by ownerCommand, naming the copy in bin/');
 });
 
 test('1. the off switch allows, saying kh-orchestration is switched off, before anything else is read', () => {
@@ -112,7 +109,7 @@ test('7. a contract problem in the working directory is refused, naming the firs
   const at = subject(repo.root);
   writeFileSync(join(repo.root, '.claude/settings.local.json'), '{ "disableAllHooks": true }\n');
   const { digest } = digestOfTree(repo.root, at.tree);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digest), COMMANDS.approve), 'not approved is reported first');
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digest), ownerCommand(repo.root, 'approve')), 'not approved is reported first');
   approveTree(repo.root, at.tree);
   assert.deepEqual(judge(repo.root, at), refused(
     REASONS.contract('.claude/settings.local.json sets disableAllHooks to a value other than false'), COMMANDS.status,
@@ -139,7 +136,7 @@ test('6. a digest that is not approved is refused with next naming approve', () 
   recordVerdict(repo.root, at, [result('check', 'pass')]);
   const { digest } = digestOfTree(repo.root, at.tree);
   writeState(repo.root, 'approvals.json', { digests: [{ digest: 'f'.repeat(64), approvedAt: 'x', branch: 'main' }] });
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digest), COMMANDS.approve));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digest), ownerCommand(repo.root, 'approve')));
   assert.equal(REASONS.unapproved('0123456789abcdef'), 'The protected files of this tree (digest 0123456789ab) are not approved. The owner reviews and approves them in their own terminal.');
 });
 
@@ -305,11 +302,28 @@ test('verify-branch\'s reading: with honourSwitches false the off switch and an 
   const at = subject(repo.root);
   writeFileSync(join(stateDir(repo.root), 'off'), '');
   writeState(repo.root, 'exemptions.json', { branches: [{ name: 'main', reason: 'r', at: 'x' }] });
-  assert.deepEqual(judge(repo.root, at, { honourSwitches: false }), refused(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  assert.deepEqual(judge(repo.root, at, { honourSwitches: false }), refused(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('check', 'pass')]);
   assert.deepEqual(judge(repo.root, at, { honourSwitches: false }), allowed(REASONS.allowed));
   assert.deepEqual(judge(repo.root, at), allowed(REASONS.off));
+});
+
+test('judge with probe false runs no repository code: checkContract1 alone, every other check as before', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  const marker = join(repo.root, '..', 'probe-ran');
+  replaceDispatcher(repo.root, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'x');\n`);
+  stage(repo);
+  const now = subject(repo.root);
+  approveTree(repo.root, now.tree);
+  recordVerdict(repo.root, now, [result('check', 'pass')]);
+  assert.deepEqual(judge(repo.root, now, { probe: false }), allowed(REASONS.allowed));
+  assert.equal(existsSync(marker), false, 'the dispatcher never ran');
+  assert.notDeepEqual(judge(repo.root, now), allowed(REASONS.allowed), 'with the probe the rewritten dispatcher fails the contract');
+  assert.equal(existsSync(marker), true);
 });
 
 test('liveFilesRefusal is step 4 alone, for status: null while the live files equal the tree, else the gate\'s refusal', () => {
@@ -372,8 +386,10 @@ const gateText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n
 const HOOK_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
 const refusalText = (reason, next) => `${gateText(reason, next)}${HOOK_LINE}`;
 // The entry's own text when ko-gate.mjs or a sibling cannot be loaded: literals only.
+// Its next command is apply, from the plugin: the owner's commands run from this same bin/.
 const UNLOADABLE = gateText(
-  'the gate could not decide: a script in <git-common-dir>/kh-orchestration/bin/ is missing, out of date or cannot be loaded. The commit is refused.', COMMANDS.approve,
+  'the gate could not decide: a script in <git-common-dir>/kh-orchestration/bin/ is missing, out of date or cannot be loaded. The commit is refused.',
+  'node <kh-orchestration>/scripts/apply.mjs <repository> --yes',
 );
 
 // git did not commit: the command failed and HEAD is where it was.
@@ -387,8 +403,8 @@ test('git commit is refused with the gate\'s text, then accepted after ko.mjs ap
   const repo = installed();
   const before = head(repo.root);
   const at = subject(repo.root);
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
-  assert.equal(ko(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
+  assert.equal(owner(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
   assert.equal(ko(repo.root, ['run']).status, 0);
   const accepted = commit(repo.root);
@@ -449,7 +465,7 @@ test('Important 1 through git: a neutered live extension, unstaged, with an ordi
   assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.liveDiffers(first), `git restore -- ${first}`));
 });
 
-test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commit; a missing sibling with fixed text', async () => {
+test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commit; a missing sibling with fixed text, a missing gate or bin/ with only the hook\'s line', async () => {
   const repo = installed();
   await runAndApprove(repo.root);
   const before = head(repo.root);
@@ -457,7 +473,9 @@ test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commi
   rmSync(join(bin, 'ko-git.mjs'));
   assertRefused(repo.root, commit(repo.root), before, `${UNLOADABLE}${HOOK_LINE}`);
   rmSync(join(bin, 'gate.mjs'));
-  assertRefused(repo.root, commit(repo.root), before);
+  assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
+  rmSync(bin, { recursive: true });
+  assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
 });
 
 test('Critical 1: an empty or a truncated bin/gate.mjs refuses: the hook allows only on the gate\'s token', async () => {
@@ -558,7 +576,7 @@ const HOOK_COMMENT = [
   '# them. Nothing else reaches node: no NODE_*, no LD_*, no BASH_*.',
 ];
 
-test('installGate writes the three hooks in decision 18\'s final form: sh -p, no git call, env -i with the allowlist', () => {
+test('installGate writes the three hooks in decision 18\'s final form: sh -p, no git call, a gate that cannot be opened refused in the shell, env -i with the allowlist', () => {
   const repo = installed();
   const hook = (name) => readFileSync(join(repo.root, '.git', 'hooks', name), 'utf8');
   assert.equal(hook('pre-merge-commit'), [
@@ -566,6 +584,8 @@ test('installGate writes the three hooks in decision 18\'s final form: sh -p, no
     `# kh-orchestration ${KIT_VERSION} pre-merge-commit. Do not edit.`,
     ...HOOK_COMMENT,
     'd=${0%/hooks/*}',
+    '# A gate that cannot be opened refuses here, before node could print a trace.',
+    '{ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
     `if out=$(${startNode('pre-merge-commit')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
@@ -584,6 +604,8 @@ test('installGate writes the three hooks in decision 18\'s final form: sh -p, no
     'for f in "$d/kh-orchestration/inflight-$PPID".jso[n]; do',
     "  case $f in *'.jso[n]') exit 0 ;; esac",
     'done',
+    '# A gate that cannot be opened refuses here, before node could print a trace.',
+    '{ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
     `if out=$(${startNode('reference-transaction')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
@@ -604,11 +626,11 @@ test('the gate refuses when started with no hook name, an unknown one, or withou
 
 test('on an allow the gate records the tree for the git process before printing its token on standard output', async () => {
   const repo = installed();
-  const { tree } = await runAndApprove(repo.root);
+  const { tree, base } = await runAndApprove(repo.root);
   const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
   const outcome = spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
   assert.deepEqual([outcome.status, outcome.stdout, outcome.stderr], [0, 'kh-orchestration: allowed\n', '']);
-  assert.equal(readInflight(repo.root, PID), tree);
+  assert.deepEqual(readInflight(repo.root, PID), { tree, base });
 });
 
 test('an in-flight record that cannot be written refuses the commit', async () => {
@@ -796,7 +818,7 @@ const commitOf = (root, tree) => gitIn(root, ['commit-tree', '-m', 'x', tree]).s
 test('reference-transaction: an update of a branch or HEAD to a commit of the recorded tree is allowed; other refs and deletions are not judged', () => {
   const repo = installed();
   const tree = indexTree(repo.root);
-  writeInflight(repo.root, PID, tree);
+  writeInflight(repo.root, PID, { tree, base: 'none' });
   const commitId = commitOf(repo.root, tree);
   const head = gitIn(repo.root, ['rev-parse', 'HEAD']).stdout.trim();
   const input = [
@@ -805,6 +827,23 @@ test('reference-transaction: an update of a branch or HEAD to a commit of the re
   ].join('\n');
   assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input }), allowed(REASONS.updateAllowed));
   assert.equal(readInflight(repo.root, PID), null, 'the branch update is judged, so the record goes');
+  assert.deepEqual(readAccepted(repo.root, commitId), { tree, base: 'none' }, 'the commit it let through is recorded with what was judged');
+  assert.deepEqual(readdirSync(join(stateDir(repo.root), 'accepted')), [`${commitId}.json`], 'once for HEAD and the branch, and nothing for other refs');
+});
+
+test('reference-transaction: an accepted record that cannot be written refuses the update, and git commit lands nothing', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  writeFileSync(join(stateDir(repo.root), 'accepted'), 'a file where the directory goes\n');
+  const before = head(repo.root);
+  const refusedCommit = commit(repo.root);
+  assert.notEqual(refusedCommit.status, 0);
+  assert.equal(head(repo.root), before);
+  const name = refusedCommit.stderr.match(/accepted\/[0-9a-f]{40}\.json/)?.[0];
+  assert.ok(refusedCommit.stderr.includes(gateText(REASONS.couldNotDecide(writeFailedMessage(name)), COMMANDS.status)), refusedCommit.stderr);
+  rmSync(join(stateDir(repo.root), 'accepted'));
+  assert.equal(commit(repo.root).status, 0);
+  assert.deepEqual(readAccepted(repo.root, head(repo.root)), { tree: gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim(), base: before });
 });
 
 test('reference-transaction: a commit of another tree, a non-commit, a symbolic update, an unreadable line or no record is refused, and the record removed', () => {
@@ -821,7 +860,7 @@ test('reference-transaction: a commit of another tree, a non-commit, a symbolic 
     [`${head} ${'f'.repeat(40)} HEAD`, swapped],
     ['not an update', refused(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)],
   ]) {
-    writeInflight(repo.root, PID, tree);
+    writeInflight(repo.root, PID, { tree, base: 'none' });
     assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${line}\n` }), expected, line);
     assert.equal(readInflight(repo.root, PID), null, line);
   }
@@ -975,7 +1014,7 @@ test('forge 2: a staged dispatcher that forges a verdict and an approval for its
   const at = subject(repo.root);
   const approvalsBefore = readFileSync(join(stateDir(repo.root), 'approvals.json'), 'utf8');
   const before = head(repo.root);
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
   assert.equal(readFileSync(join(stateDir(repo.root), 'approvals.json'), 'utf8'), approvalsBefore, 'the forger did not run');
 });
 
@@ -986,7 +1025,7 @@ test('no check that runs repository code comes before the approval check: an una
   rmSync(join(repo.root, 'fail.txt'));
   stage(repo);
   const at = subject(repo.root);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
   assert.equal(existsSync(marker), false, 'the dispatcher ran before the approval check');
   approveTree(repo.root, at.tree);
   assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
@@ -1012,10 +1051,10 @@ const inflightNames = (root) => readdirSync(stateDir(root)).filter((name) => nam
 test('every gate run first removes in-flight records of processes that no longer exist', () => {
   const repo = installed();
   const dead = deadPid();
-  writeInflight(repo.root, dead, indexTree(repo.root));
+  writeInflight(repo.root, dead, { tree: indexTree(repo.root), base: 'none' });
   runGate(['reference-transaction', PID], repo.root, { input: '' });
   assert.deepEqual(inflightNames(repo.root), []);
-  writeInflight(repo.root, dead, indexTree(repo.root));
+  writeInflight(repo.root, dead, { tree: indexTree(repo.root), base: 'none' });
   runGate(['pre-commit', PID], repo.root);
   assert.equal(inflightNames(repo.root).includes(`inflight-${dead}.json`), false);
 });
@@ -1060,9 +1099,9 @@ test('the reference-transaction hook: no record starts no node; a record that is
 test('the gate removes the record once it has allowed a branch or HEAD update, and keeps it for a transaction of other refs', () => {
   const repo = installed();
   const tree = indexTree(repo.root);
-  writeInflight(repo.root, PID, tree);
+  writeInflight(repo.root, PID, { tree, base: 'none' });
   assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${NULL_ID} ${NULL_ID} AUTO_MERGE\n` }), allowed(REASONS.updateAllowed));
-  assert.equal(readInflight(repo.root, PID), tree);
+  assert.deepEqual(readInflight(repo.root, PID), { tree, base: 'none' });
   const commitId = commitOf(repo.root, tree);
   assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${NULL_ID} ${commitId} refs/heads/main\n` }), allowed(REASONS.updateAllowed));
   assert.equal(readInflight(repo.root, PID), null);
@@ -1457,14 +1496,14 @@ test('rule 5 (L5): an env in settings.local.json or settings.json that sets NODE
 test('the owner\'s flow still lands: edit a live file, stage, approve, run, commit, with the real commands', () => {
   const repo = installed();
   assert.equal(ko(repo.root, ['run']).status, 0);
-  assert.equal(ko(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
+  assert.equal(owner(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assert.equal(commit(repo.root).status, 0);
   const live = '.claude/kh-orchestration/scripts/ko-git.mjs';
   repo.write(live, `${readFileSync(join(repo.root, live), 'utf8')}// owner's change\n`);
   stage(repo);
   const at = subject(repo.root);
-  assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
   assert.equal(ko(repo.root, ['run']).status, 0);
-  assert.equal(ko(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
+  assert.equal(owner(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assert.equal(commit(repo.root).status, 0);
 });

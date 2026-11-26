@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { KIT_VERSION, installGate, installKhHarness, isolateProcessEnv, makeRepo, registerExtension, testEnv } from './test-repo.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, currentBranch, indexTree } from '../../assets/scripts/ko-git.mjs';
-import { writeState } from '../../assets/scripts/ko-state.mjs';
+import { stateDir, writeState } from '../../assets/scripts/ko-state.mjs';
 import { produceVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 isolateProcessEnv();
@@ -75,6 +75,11 @@ export const KO_SCRIPT = '.claude/kh-orchestration/scripts/ko.mjs';
 // session variables) and `input` on standard input; `closedStdin` gives it none at all.
 export const ko = (root, args, { cwd = root, env = testEnv(), input, closedStdin = false } = {}) => spawnSync(
   process.execPath, [join(root, KO_SCRIPT), ...args], { cwd, env, input, encoding: 'utf8', ...(closedStdin ? { stdio: ['ignore', 'pipe', 'pipe'] } : {}) },
+);
+
+// The same, run from the approved copy in <common>/kh-orchestration/bin/: the owner's commands act only from there.
+export const owner = (root, args, { cwd = root, env = testEnv(), input, closedStdin = false } = {}) => spawnSync(
+  process.execPath, [join(stateDir(root), 'bin', 'ko.mjs'), ...args], { cwd, env, input, encoding: 'utf8', ...(closedStdin ? { stdio: ['ignore', 'pipe', 'pipe'] } : {}) },
 );
 
 export const gitIn = (root, argv, env = testEnv()) => spawnSync('git', argv, { cwd: root, env, encoding: 'utf8' });

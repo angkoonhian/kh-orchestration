@@ -33,12 +33,14 @@
 import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, constants, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
-import { COMMANDS } from './extension.mjs';
+import { COMMANDS, shellWord } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
 import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { StateError, isOff, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, stateDir, writeInflight } from './ko-state.mjs';
+import {
+  FILE_MODES, StateError, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, writeAccepted, writeInflight,
+} from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
@@ -50,8 +52,6 @@ const TOKEN = /^\S+$/;
 // A symbolic ref's value as the hook is given it: `ref:refs/heads/main`.
 const SYMBOLIC = /^ref:\S+$/;
 const EXTENSION = '.claude/kh-orchestration/scripts/extension.mjs';
-// git file modes of a regular file; a link (120000) or a submodule (160000) is not one.
-const FILE_MODES = ['100644', '100755'];
 const NAMED_AT_MOST = 10;
 // What this session's hooks run from the working directory (amended decision 17): kh-harness's
 // files and settings and this plugin's scripts. Their working copies must equal the tree.
@@ -67,9 +67,13 @@ const MAX_SETTINGS_BYTES = 1024 * 1024;
 // Project env names that would load code into every hook process of a session.
 const LOADER_ENV = /^(?:NODE_|LD_|DYLD_)/i;
 const REASON_SHOWN_AT_MOST = 200;
-// C0 and C1 controls, DEL, and the zero-width and bidi characters: what can make a terminal show
-// other text than the record holds.
-const UNSHOWABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+// C0 and C1 controls, DEL, the line and paragraph separators, and the zero-width and bidi
+// characters: what can make a terminal show other text than the record holds. The one definition
+// (ko.mjs uses it too).
+const UNSHOWABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+// Text shown in full (a name, a path, a diff): every such character but TAB and newline written as
+// \u{…}, so what is shown cannot differ from what is meant, and two names never look the same.
+export const visible = (text) => text.replace(UNSHOWABLE, (char) => (char === '\t' || char === '\n' ? char : `\\u{${char.codePointAt(0).toString(16)}}`));
 // Text without what a terminal would act on: ko.mjs records a reason in this form.
 export const plainText = (text) => text.replace(UNSHOWABLE, '');
 // Recorded or repository text as it is printed (an exemption's reason, a path, an officer's
@@ -126,21 +130,16 @@ export const REASONS = Object.freeze({
   indexChanged: 'The index changed while the gate ran, so the tree git would commit is not the one judged. Run the officers again on the staged tree.',
 });
 
-// A word the shell reads as itself: as it is when it holds nothing the shell would act on, else in single quotes.
-export const shellWord = (text) => (/^[A-Za-z0-9._/@+=,:-]+$/.test(text) ? text : `'${text.replaceAll("'", "'\\''")}'`);
 
-// The owner's command to exempt `branch`, run with the copy of ko.mjs in bin/: a tree without the
-// install has no .claude/kh-orchestration/scripts/ko.mjs to run.
-export function exemptCommand(root, branch) {
-  const script = join(stateDir(root), 'bin', 'ko.mjs');
-  return `node ${shellWord(script)} exempt ${shellWord(branch)} --reason "<why>"`;
-}
+// The owner's command to exempt `branch`: like every owner command, the copy of ko.mjs in bin/.
+export const exemptCommand = (root, branch) => ownerCommand(root, `exempt ${shellWord(branch)} --reason "<why>"`);
 
 const allow = (reason) => ({ allow: true, reason, next: '' });
 const refuse = (reason, next) => ({ allow: false, reason, next });
 
-// 2. An exemption names a branch exactly; a detached HEAD (branch null) is never exempt.
-function exemptionOf(root, branch) {
+// 2. An exemption names a branch exactly; a detached HEAD (branch null) is never exempt. ko.mjs
+// reads it through this too.
+export function exemptionOf(root, branch) {
   if (branch === null) return null;
   return readExemptions(root).find((entry) => entry.name === branch) ?? null;
 }
@@ -358,10 +357,11 @@ function verdictRefusal(verdict, { tree, base }, digest, officers) {
  * `tree` is the tree being committed, `base` its base (decision 7) or null when the tree's
  * officers file cannot be read (step 3 then refuses), and `branch` the current branch or null for
  * a detached HEAD. With `honourSwitches` false, steps 1 and 2 decide nothing: verify-branch asks
- * whether a tree passes, not whether a commit of it would be checked. Throws what the state and
+ * whether a tree passes, not whether a commit of it would be checked. With `probe` false, step 7
+ * is checkContract1 alone and nothing from the repository runs (verify-branch --no-run). Throws what the state and
  * git helpers throw (a StateError for a damaged state file): the caller refuses on a throw.
  */
-export function judge(root, { tree, base, branch }, { honourSwitches = true } = {}) {
+export function judge(root, { tree, base, branch }, { honourSwitches = true, probe = true } = {}) {
   if (honourSwitches) {
     if (isOff(root)) return allow(REASONS.off);
     const exemption = exemptionOf(root, branch);
@@ -379,11 +379,11 @@ export function judge(root, { tree, base, branch }, { honourSwitches = true } = 
   if (liveProblem !== null) return liveProblem;
   const digest = digestOfTree(root, tree);
   if (digest.problem !== undefined) return refuse(REASONS.undigestable(digest.problem), COMMANDS.run);
-  if (!approved(root, digest.digest)) return refuse(REASONS.unapproved(digest.digest), COMMANDS.approve);
+  if (!approved(root, digest.digest)) return refuse(REASONS.unapproved(digest.digest), ownerCommand(root, 'approve'));
   const verdict = readVerdict(root, tree, base);
   const envProblem = projectEnvRefusal(root);
   if (envProblem !== null) return envProblem;
-  const { holds, problem } = contractOnPrivateCopy(root, live);
+  const { holds, problem } = probe ? contractOnPrivateCopy(root, live) : { holds: contractHolds(root, { probe: false }) };
   if (problem !== undefined) return refuse(REASONS.couldNotDecide(problem), COMMANDS.status);
   if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), COMMANDS.status);
   return verdictRefusal(verdict, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
@@ -409,7 +409,7 @@ function judgeIndex(root, pid, readTree) {
   const decision = judge(root, { tree, base, branch });
   if (decision.reason !== REASONS.allowed) return decision;
   if (readTree(root) !== tree) return refuse(REASONS.indexChanged, COMMANDS.run);
-  writeInflight(root, pid, tree);
+  writeInflight(root, pid, { tree, base });
   return decision;
 }
 
@@ -440,22 +440,30 @@ function keepsTree(root, update, tree) {
 // update: allowed only when every branch or HEAD it moves names a commit of the recorded tree.
 // Other refs (ORIG_HEAD, AUTO_MERGE, tags, remotes) are not judged. The record is removed on a
 // refusal, and once a transaction that moves a branch or HEAD is allowed: the commit's own update
-// has then been judged, and a later update by the same process has no record to pass.
+// has then been judged, and a later update by the same process has no record to pass. On that
+// allow, each commit it puts on a branch or HEAD is recorded as accepted with the tree and base
+// judged (accepted/<commit>.json), for status and verify-branch; a record that cannot be written
+// refuses the transaction.
 function judgeUpdate(root, pid, input) {
-  let tree;
+  let judged;
   try {
-    tree = readInflight(root, pid);
+    judged = readInflight(root, pid);
   } catch (error) {
     // A record that is not a readable file (a directory, a dangling symlink) is never "no record".
     removeInflight(root, pid);
     throw error;
   }
-  if (tree === null) return refuse(REASONS.noRecord, COMMANDS.run);
+  if (judged === null) return refuse(REASONS.noRecord, COMMANDS.run);
   const updates = parseUpdates(input);
   const decision = updates === null
     ? refuse(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)
-    : updates.every((update) => keepsTree(root, update, tree)) ? allow(REASONS.updateAllowed) : refuse(REASONS.treeSwapped, COMMANDS.run);
-  if (!decision.allow || updates.some(movesBranch)) removeInflight(root, pid);
+    : updates.every((update) => keepsTree(root, update, judged.tree)) ? allow(REASONS.updateAllowed) : refuse(REASONS.treeSwapped, COMMANDS.run);
+  const landing = decision.allow ? [...new Set(updates.filter((update) => movesBranch(update) && !NULL_ID.test(update.next)).map((update) => update.next))] : [];
+  try {
+    for (const commit of landing) writeAccepted(root, commit, judged);
+  } finally {
+    if (!decision.allow || updates?.some(movesBranch)) removeInflight(root, pid);
+  }
   return decision;
 }
 

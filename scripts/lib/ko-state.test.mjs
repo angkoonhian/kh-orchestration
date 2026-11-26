@@ -8,6 +8,7 @@ import {
   StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readInflight, readState, removeInflight, removeStaleInflight, shapeMessage, stateDir,
   invalidPidMessage, stateUnreadableMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
   binIncompleteMessage, binEntryMessage, listInflight, readProposals, readWaivers, refreshBin, switchOff, switchOn,
+  invalidCommitMessage, ownerCommand, readAccepted, writeAccepted,
 } from '../../assets/scripts/ko-state.mjs';
 import { objectMismatchMessage } from '../../assets/scripts/ko-digest.mjs';
 
@@ -246,14 +247,15 @@ test('readExemptions throws a StateError with fixed text for any other shape, ne
 });
 
 const INFLIGHT_TREE = 'c'.repeat(40);
+const INFLIGHT = { tree: INFLIGHT_TREE, base: 'none' };
 
 test('an in-flight record: written by temporary file and rename, read back, removed; absent reads as null', () => {
   withRepo((repo) => {
     assert.equal(readInflight(repo.root, '4242'), null);
-    writeInflight(repo.root, '4242', INFLIGHT_TREE);
-    assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'inflight-4242.json'), 'utf8')), { tree: INFLIGHT_TREE });
+    writeInflight(repo.root, '4242', INFLIGHT);
+    assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'inflight-4242.json'), 'utf8')), INFLIGHT);
     assert.deepEqual(readdirSync(stateDir(repo.root)).filter((name) => name.endsWith('.tmp')), []);
-    assert.equal(readInflight(repo.root, '4242'), INFLIGHT_TREE);
+    assert.deepEqual(readInflight(repo.root, '4242'), INFLIGHT);
     removeInflight(repo.root, '4242');
     assert.equal(readInflight(repo.root, '4242'), null);
     removeInflight(repo.root, '4242');
@@ -263,11 +265,15 @@ test('an in-flight record: written by temporary file and rename, read back, remo
 test('an in-flight record is named by digits only, holds a full tree id, and any other shape is a StateError', () => {
   withRepo((repo) => {
     for (const pid of ['', '0', '01', '12a', '../x', '1/2', ' 1', '12345678901', 12]) {
-      assert.throws(() => writeInflight(repo.root, pid, INFLIGHT_TREE), { name: 'StateError', message: invalidPidMessage }, String(pid));
+      assert.throws(() => writeInflight(repo.root, pid, INFLIGHT), { name: 'StateError', message: invalidPidMessage }, String(pid));
       assert.throws(() => readInflight(repo.root, pid), { name: 'StateError', message: invalidPidMessage }, String(pid));
     }
-    assert.throws(() => writeInflight(repo.root, '7', 'abc'), { name: 'StateError', message: shapeMessage('inflight-7.json') });
-    for (const value of [{}, { tree: 'x' }, { tree: INFLIGHT_TREE, more: 1 }, [INFLIGHT_TREE]]) {
+    for (const value of [{ tree: 'abc', base: 'none' }, { tree: INFLIGHT_TREE, base: 'x' }, { tree: INFLIGHT_TREE }]) {
+      assert.throws(() => writeInflight(repo.root, '7', value), { name: 'StateError', message: shapeMessage('inflight-7.json') }, JSON.stringify(value));
+    }
+    writeInflight(repo.root, '7', { tree: INFLIGHT_TREE, base: 'd'.repeat(40) });
+    assert.deepEqual(readInflight(repo.root, '7'), { tree: INFLIGHT_TREE, base: 'd'.repeat(40) });
+    for (const value of [{}, { tree: 'x' }, { tree: INFLIGHT_TREE }, { tree: INFLIGHT_TREE, base: 'none', more: 1 }, { tree: INFLIGHT_TREE, base: 7 }, [INFLIGHT_TREE]]) {
       writeState(repo.root, 'inflight-7.json', value);
       assert.throws(() => readInflight(repo.root, '7'), { name: 'StateError', message: shapeMessage('inflight-7.json') });
     }
@@ -277,12 +283,12 @@ test('an in-flight record is named by digits only, holds a full tree id, and any
 test('removeStaleInflight removes the records of processes that no longer exist and keeps a live one\'s', () => {
   withRepo((repo) => {
     const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
-    writeInflight(repo.root, dead, INFLIGHT_TREE);
-    writeInflight(repo.root, String(process.pid), INFLIGHT_TREE);
+    writeInflight(repo.root, dead, INFLIGHT);
+    writeInflight(repo.root, String(process.pid), INFLIGHT);
     writeFileSync(join(stateDir(repo.root), 'inflight-x.json'), '{}');
     assert.deepEqual(removeStaleInflight(repo.root), [dead]);
     assert.equal(readInflight(repo.root, dead), null);
-    assert.equal(readInflight(repo.root, String(process.pid)), INFLIGHT_TREE);
+    assert.deepEqual(readInflight(repo.root, String(process.pid)), INFLIGHT);
     assert.ok(existsSync(join(stateDir(repo.root), 'inflight-x.json')), 'a name that is not ours is left alone');
   });
 });
@@ -360,12 +366,12 @@ test('listInflight names every in-flight record with whether its process is aliv
   withRepo((repo) => {
     assert.deepEqual(listInflight(repo.root), []);
     const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
-    writeInflight(repo.root, dead, INFLIGHT_TREE);
-    writeInflight(repo.root, String(process.pid), INFLIGHT_TREE);
+    writeInflight(repo.root, dead, INFLIGHT);
+    writeInflight(repo.root, String(process.pid), INFLIGHT);
     writeFileSync(join(stateDir(repo.root), 'inflight-x.json'), '{}');
     const expected = [{ pid: dead, live: false }, { pid: String(process.pid), live: true }].sort((a, b) => (`inflight-${a.pid}.json` < `inflight-${b.pid}.json` ? -1 : 1));
     assert.deepEqual(listInflight(repo.root), expected);
-    assert.equal(readInflight(repo.root, dead), INFLIGHT_TREE);
+    assert.deepEqual(readInflight(repo.root, dead), INFLIGHT);
   });
 });
 
@@ -456,4 +462,41 @@ test('refreshBin killed at any moment leaves bin/ whole: one tree\'s scripts or 
   } finally {
     repo.cleanup();
   }
+});
+
+test('an accepted record names a commit the gate let through by its full id and holds { tree, base }; absent reads as null; any other shape is a StateError', () => {
+  withRepo((repo) => {
+    const commit = 'e'.repeat(40);
+    assert.equal(readAccepted(repo.root, commit), null);
+    writeAccepted(repo.root, commit, INFLIGHT);
+    assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'accepted', `${commit}.json`), 'utf8')), INFLIGHT);
+    assert.deepEqual(readAccepted(repo.root, commit), INFLIGHT);
+    assert.deepEqual(readdirSync(join(stateDir(repo.root), 'accepted')), [`${commit}.json`], 'written by temporary file and rename');
+    for (const id of ['', 'e'.repeat(39), 'E'.repeat(40), '../x', 7]) {
+      assert.throws(() => writeAccepted(repo.root, id, INFLIGHT), { name: 'StateError', message: invalidCommitMessage }, String(id));
+      assert.throws(() => readAccepted(repo.root, id), { name: 'StateError', message: invalidCommitMessage }, String(id));
+    }
+    assert.throws(() => writeAccepted(repo.root, commit, { tree: 'x', base: 'none' }), { name: 'StateError', message: shapeMessage(`accepted/${commit}.json`) });
+    for (const value of [{}, { tree: INFLIGHT_TREE }, { ...INFLIGHT, more: 1 }]) {
+      writeState(repo.root, `accepted/${commit}.json`, value);
+      assert.throws(() => readAccepted(repo.root, commit), { name: 'StateError', message: shapeMessage(`accepted/${commit}.json`) }, JSON.stringify(value));
+    }
+  });
+});
+
+test('ownerCommand names the approved copy of ko.mjs in the shared state, quoted for a shell when it must be', () => {
+  withRepo((repo) => {
+    assert.equal(ownerCommand(repo.root, 'approve'), `node ${join(stateDir(repo.root), 'bin', 'ko.mjs')} approve`);
+    const second = repo.addWorktree('side');
+    assert.equal(ownerCommand(second, 'propose'), `node ${join(stateDir(repo.root), 'bin', 'ko.mjs')} propose`, 'the same copy from a linked worktree');
+  });
+});
+
+test('a write whose directory is a file throws the fixed StateError, not the error of removing its temporary file', () => {
+  withRepo((repo) => {
+    mkdirSync(stateDir(repo.root), { recursive: true });
+    writeFileSync(join(stateDir(repo.root), 'accepted'), 'a file where the directory goes\n');
+    const name = `accepted/${'e'.repeat(40)}.json`;
+    assert.throws(() => writeAccepted(repo.root, 'e'.repeat(40), INFLIGHT), { name: 'StateError', message: writeFailedMessage(name) });
+  });
 });

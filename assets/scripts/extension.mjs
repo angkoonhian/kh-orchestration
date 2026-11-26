@@ -219,18 +219,21 @@ export function readOfficers(officersJsonText) {
 // ---------------------------------------------------------------------------
 // Messages
 
+// A word the shell reads as itself: as it is when it holds nothing the shell would act on, else in single quotes.
+export const shellWord = (text) => (/^[A-Za-z0-9._/@+=,:-]+$/.test(text) ? text : `'${text.replaceAll("'", "'\\''")}'`);
+
 const KO = 'node .claude/kh-orchestration/scripts/ko.mjs';
-// The commands a refusal names, in one table: the gate and ko.mjs import it from here, so every
-// message names a command in the same words.
+// The agents' commands a refusal names, in one table: the gate and ko.mjs import it from here, so
+// every message names a command in the same words. The owner's commands act only from the
+// approved copy in <git-common-dir>/kh-orchestration/bin/, a path of each repository: ko-state's
+// ownerCommand builds them, and this file's own messages name that copy through git.
 export const COMMANDS = Object.freeze({
   run: `${KO} run`,
-  approve: `${KO} approve`,
   status: `${KO} status`,
   verifyBranch: `${KO} verify-branch`,
-  propose: `${KO} propose`,
-  on: `${KO} on`,
   unexempt: `${KO} unexempt`,
 });
+const OWNER_KO = 'node "$(git rev-parse --git-common-dir)/kh-orchestration/bin/ko.mjs"';
 const RUN = COMMANDS.run;
 const unseen = (reason) => `This command's structure cannot be seen (${reason}) and its text holds a way round the commit gate (no-verify, hooksPath, a .git path, an owner-only ko.mjs command), so it is blocked. Run it as plain commands.`;
 
@@ -246,7 +249,7 @@ export const MESSAGES = Object.freeze({
   xargs: 'A git command or ko.mjs run through xargs takes words the hook cannot see, so it is blocked. Run the command directly, with its subcommand and options written out.',
   guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
-  ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code. Ask the owner to run ${KO} ${command}.`,
+  ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code, from the approved copy. Ask the owner to run ${OWNER_KO} ${command}.`,
   sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
   feedsScript: unseen('it feeds a script to a shell or an interpreter'),
@@ -256,7 +259,7 @@ export const MESSAGES = Object.freeze({
   pathTooLong: 'The working directory, the project directory or a path in this call is longer than 4,096 characters, so the call is blocked. Use a shorter path.',
   noCommand: 'This Bash call carries no command text to check, so it is blocked. Send the command as a string in the command field.',
   noTarget: 'This edit names no file path the hook can resolve, so it is blocked. Give the file\'s absolute path.',
-  protectedEdit: `This file decides what passes the commit gate and is not edited from a session. The owner can open this worktree for proposals by running ${KO} propose in their own terminal here.`,
+  protectedEdit: `This file decides what passes the commit gate and is not edited from a session. The owner can open this worktree for proposals by running ${OWNER_KO} propose in their own terminal here.`,
   localSettingsEdit: '.claude/settings.local.json can switch the hooks off and, being untracked, no approval can cover it, so it is never edited from a session. The owner edits it in their own editor.',
   gitDirEdit: `Files inside the git directory (its hooks, its config, the kh-orchestration shared state) are not edited from a session. Use git commands for git's own files, and ${RUN} for a verdict.`,
   stateUnreadable: 'The .git of this repository is neither a directory nor a readable gitdir file, so the commit gate\'s state cannot be found and this call is blocked. Repair .git outside this session.',
@@ -1779,6 +1782,14 @@ function holdsAny(tokens, texts) {
 const scanned = (message, ...texts) => {
   if (holdsAny(DANGER, texts)) refuse(message);
 };
+// Code that names the plugin's own scripts (after Task 7's review): importing them and calling
+// their functions is the one-line way to write a verdict, an approval or the switch, or to run
+// an owner command with a forged environment. Scanned in inline code and in fed scripts only, so
+// running, reading, staging or committing those files stays allowed.
+const PLUGIN_MODULES = [/kh-orchestration\/+(?:scripts|bin)(?![a-z0-9_.-])/i, /ko-(?:cli|state|gate)\.mjs/i];
+const scannedCode = (message, ...texts) => {
+  if (holdsAny([...DANGER, ...PLUGIN_MODULES], texts)) refuse(message);
+};
 
 // A sed program that runs a shell command: an `e` command (after an address, `!`, `;` or a
 // brace, or at the start) or an `s` command whose flags hold `e`.
@@ -1838,8 +1849,8 @@ const hasHereString = (command) => command.redirects.some((redirect) => redirect
 // A script fed on standard input: from a pipe the whole command line is the script's source;
 // from a here-document or a here-string, the command and its bodies.
 function scanFedScript(command, context) {
-  if (command.pipe) scanned(MESSAGES.feedsScript, context.command);
-  if (command.heredocs.length > 0 || hasHereString(command)) scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
+  if (command.pipe) scannedCode(MESSAGES.feedsScript, context.command);
+  if (command.heredocs.length > 0 || hasHereString(command)) scannedCode(MESSAGES.feedsScript, command.raw, ...command.heredocs);
 }
 
 // A shell: its -c script is parsed and judged as commands; a script from standard input,
@@ -1867,7 +1878,7 @@ function judgeShell(command, args, context, depth) {
     return;
   }
   if (i < args.length && !stdin && !stdinOperand(args[i])) return;
-  if (i < args.length && stdinOperand(args[i])) scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
+  if (i < args.length && stdinOperand(args[i])) scannedCode(MESSAGES.feedsScript, command.raw, ...command.heredocs);
   scanFedScript(command, context);
 }
 
@@ -1885,7 +1896,7 @@ function judgeInterpreter(command, args, inlineOptions, context) {
     const short = /^-[A-Za-z]+$/.test(text) && [...inlineOptions.short].some((letter) => text.includes(letter));
     if (long || short) inline = true;
   }
-  if (inline) scanned(MESSAGES.runsCode, command.raw, ...command.heredocs);
+  if (inline) scannedCode(MESSAGES.runsCode, command.raw, ...command.heredocs);
   else if (operand === null || stdinOperand(operand)) scanFedScript(command, context);
 }
 
@@ -1917,7 +1928,7 @@ function judgeUnseen(command, resolved, values, context, depth) {
   }
   const { name } = resolved;
   const args = resolved.words.slice(resolved.index + 1);
-  if (name === 'deno' && args[0]?.text === 'eval') scanned(MESSAGES.runsCode, command.raw);
+  if (name === 'deno' && args[0]?.text === 'eval') scannedCode(MESSAGES.runsCode, command.raw);
   if (name === 'sed') judgeSed(args);
   if (SHELLS.has(name)) judgeShell(command, args, context, depth);
   const script = commandString(resolved);
@@ -1927,7 +1938,7 @@ function judgeUnseen(command, resolved, values, context, depth) {
   const runner = COMMAND_STRING.has(name) || resolved.wrappers.includes('flock');
   if ((runner && script === null) || args.some((word) => !values.has(word) && SHELLS.has(commandName(word)))) scanFedScript(command, context);
   if ((name === 'source' || name === '.') && (args.length === 0 || stdinOperand(args[0]))) {
-    scanned(MESSAGES.feedsScript, command.raw, ...command.heredocs);
+    scannedCode(MESSAGES.feedsScript, command.raw, ...command.heredocs);
     scanFedScript(command, context);
   }
   const inlineOptions = inlineOptionsOf(name);

@@ -3,6 +3,7 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
+import { shellWord } from './extension.mjs';
 import { hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { commonDir, listEntries, readBlobs } from './ko-git.mjs';
 
@@ -20,6 +21,7 @@ export const invalidValueMessage = (name) => `The value for ${name} cannot be wr
 export const invalidVerdictKeyMessage = 'A verdict is named by a full hexadecimal tree id and a full hexadecimal base id or none.';
 export const writeFailedMessage = (name) => `The shared state file ${name} could not be written.`;
 export const stateUnreadableMessage = 'The shared state directory could not be read; nothing proceeds on state that cannot be read.';
+export const invalidCommitMessage = 'An accepted record is named by a full hexadecimal commit id.';
 export const invalidPidMessage = 'An in-flight record is named by the process id of a git command: digits only, without a leading zero.';
 export const binIncompleteMessage = 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs, so bin/ is not refreshed from it: the hooks would find no gate. Stage the install\'s scripts first.';
 export const binEntryMessage = (path) => `${path} is not a regular file in the tree, so bin/ is not refreshed from it.`;
@@ -38,11 +40,14 @@ export const shapeMessage = (name) =>
 // exemptions.json is `{ branches: [{ name, reason, at }] }`: the branches, by exact name, the gate
 // lets through without an install, why (non-empty) and when. Absent, no branch is exempt. Read
 // through readExemptions.
-// inflight-<pid>.json is `{ tree }`: the tree the gate allowed for the git commit or git merge
-// process <pid> (decision 18, further amended). The reference-transaction hook refuses that
+// inflight-<pid>.json is `{ tree, base }`: the tree the gate allowed for the git commit or git
+// merge process <pid>, and the base it judged it against (decision 18, further amended). The reference-transaction hook refuses that
 // process's branch update unless its commit holds this tree. Written by the gate on an allow of
 // the index, removed by the gate once it has judged that process's branch or HEAD update; a record
 // whose process is gone is stale (removeStaleInflight).
+// accepted/<commit>.json is `{ tree, base }`: a commit the reference-transaction check let onto a
+// branch or HEAD, with the tree and base the gate judged (after Task 7's review). status and
+// verify-branch look HEAD's commit up here before they compute a base.
 // off is a file whose presence is the owner's switch (isOff); its content means nothing.
 // proposals.json is `{ worktrees: [<absolute real path of a worktree root>...] }`, the worktrees
 // open for proposals. The hook extension reads it itself (it cannot import this file): absent,
@@ -56,6 +61,7 @@ const STATE_NAMES = new Set(['approvals.json', 'waivers.json', 'exemptions.json'
 const OBJECT_ID = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
 const VERDICT_NAME = new RegExp(`^verdicts/${OBJECT_ID}-(?:${OBJECT_ID}|none)\\.json$`);
 const INFLIGHT_NAME = /^inflight-[1-9][0-9]{0,9}\.json$/;
+const ACCEPTED_NAME = new RegExp(`^accepted/${OBJECT_ID}\\.json$`);
 const PID = /^[1-9][0-9]{0,9}$/;
 const OFF_FILE = 'off';
 const JOURNAL_FILE = 'journal.jsonl';
@@ -72,7 +78,7 @@ export function verdictName(tree, base) {
 }
 
 function checkName(name) {
-  if (!STATE_NAMES.has(name) && !VERDICT_NAME.test(name) && !INFLIGHT_NAME.test(name)) throw new StateError(unknownNameMessage(name));
+  if (!STATE_NAMES.has(name) && !VERDICT_NAME.test(name) && !INFLIGHT_NAME.test(name) && !ACCEPTED_NAME.test(name)) throw new StateError(unknownNameMessage(name));
 }
 
 // An absent file is the fallback; a file that exists but cannot be read or
@@ -110,6 +116,16 @@ function serialise(name, value, indent) {
   throw new StateError(invalidValueMessage(name));
 }
 
+// Removes a temporary file after a failed write; what cannot be removed (its directory is not
+// one) was never written, so the write's own error is the one reported.
+function removeTemporary(path) {
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // nothing was written there
+  }
+}
+
 export function writeState(root, name, value) {
   checkName(name);
   const text = serialise(name, value, 2);
@@ -120,7 +136,7 @@ export function writeState(root, name, value) {
     writeFileSync(temporary, `${text}\n`);
     renameSync(temporary, target);
   } catch {
-    rmSync(temporary, { force: true });
+    removeTemporary(temporary);
     throw new StateError(writeFailedMessage(name));
   }
 }
@@ -129,7 +145,7 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 const hasExactKeys = (value, keys) => isPlainObject(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 const isText = (value) => typeof value === 'string' && value !== '';
 const DIGEST = /^[0-9a-f]{64}$/;
-const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const TREE_ID = new RegExp(`^${OBJECT_ID}$`);
 // A rule id as the registry reads one (ko-registry.mjs), at most 64 characters.
 export const RULE_ID = /^[A-Za-z][\w.-]{0,63}$/;
 
@@ -167,21 +183,38 @@ function inflightName(pid) {
   return `inflight-${pid}.json`;
 }
 
-// Records the tree the gate allowed for git process `pid`. Throws a StateError when it cannot.
-export function writeInflight(root, pid, tree) {
-  const name = inflightName(pid);
-  if (typeof tree !== 'string' || !TREE_ID.test(tree)) throw new StateError(shapeMessage(name));
-  writeState(root, name, { tree });
+// `{ tree, base }` as the gate judged them: a full tree id, and a full commit id or `none`.
+const judgedHasShape = (value) => hasExactKeys(value, ['tree', 'base'])
+  && typeof value.tree === 'string' && TREE_ID.test(value.tree) && typeof value.base === 'string' && (value.base === 'none' || TREE_ID.test(value.base));
+
+function writeJudged(root, name, judged) {
+  if (!judgedHasShape(judged)) throw new StateError(shapeMessage(name));
+  writeState(root, name, { tree: judged.tree, base: judged.base });
 }
 
-// The tree recorded for git process `pid`, or null when there is no record. Any other shape throws.
-export function readInflight(root, pid) {
-  const name = inflightName(pid);
+function readJudged(root, name) {
   const value = readState(root, name, null);
   if (value === null) return null;
-  if (!hasExactKeys(value, ['tree']) || typeof value.tree !== 'string' || !TREE_ID.test(value.tree)) throw new StateError(shapeMessage(name));
-  return value.tree;
+  if (!judgedHasShape(value)) throw new StateError(shapeMessage(name));
+  return value;
 }
+
+// Records the tree and base the gate allowed for git process `pid`. Throws a StateError when it cannot.
+export const writeInflight = (root, pid, judged) => writeJudged(root, inflightName(pid), judged);
+
+// `{ tree, base }` recorded for git process `pid`, or null when there is no record. Any other shape throws.
+export const readInflight = (root, pid) => readJudged(root, inflightName(pid));
+
+function acceptedName(commit) {
+  if (typeof commit !== 'string' || !TREE_ID.test(commit)) throw new StateError(invalidCommitMessage);
+  return `accepted/${commit}.json`;
+}
+
+// Records that the gate let `commit` onto a branch or HEAD, judged as `{ tree, base }`. Throws a StateError when it cannot.
+export const writeAccepted = (root, commit, judged) => writeJudged(root, acceptedName(commit), judged);
+
+// `{ tree, base }` the gate recorded for `commit`, or null when it recorded nothing. Any other shape throws.
+export const readAccepted = (root, commit) => readJudged(root, acceptedName(commit));
 
 export function removeInflight(root, pid) {
   const name = inflightName(pid);
@@ -246,7 +279,7 @@ export function switchOff(root) {
     writeFileSync(temporary, '');
     renameSync(temporary, target);
   } catch {
-    rmSync(temporary, { force: true });
+    removeTemporary(temporary);
     throw new StateError(writeFailedMessage(OFF_FILE));
   }
 }
@@ -259,11 +292,17 @@ export function switchOn(root) {
   }
 }
 
+// The owner's command `words` (`approve`, `exempt x --reason "<why>"`), run with the approved copy
+// of ko.mjs in bin/: the owner's commands act only from there (after Task 7's review), so an
+// unstaged edit to the working copy never runs with the owner's authority.
+export const ownerCommand = (root, words) => `node ${shellWord(join(stateDir(root), BIN, 'ko.mjs'))} ${words}`;
+
 const SCRIPTS_DIR = '.claude/kh-orchestration/scripts/';
 const BIN = 'bin';
 // What a refresh that ended early (a kill) can leave beside bin/; removed at the next refresh.
 const BIN_LEFTOVER = /^bin\.[0-9]+\.[0-9a-f-]+\.(?:tmp|old)$/;
-const FILE_MODES = ['100644', '100755'];
+// git file modes of a regular file; a link (120000) or a submodule (160000) is not one.
+export const FILE_MODES = ['100644', '100755'];
 
 /**
  * Replaces <state>/bin/ with the scripts of `tree` (decision 19): every `.mjs` file directly in
@@ -275,8 +314,13 @@ const FILE_MODES = ['100644', '100755'];
  * that does not hash to its id leaves bin/ as it was and throws a StateError; a failed read throws
  * what ko-git throws. Called by `approve`, and by `apply` (Task 9).
  */
+// The entries bin/ is made of from `tree`: every `.mjs` directly in the installed scripts folder.
+// status compares bin/ with the same selection.
+export const binEntriesOf = (root, tree) => listEntries(root, tree)
+  .filter((entry) => entry.path.startsWith(SCRIPTS_DIR) && entry.path.endsWith('.mjs') && !entry.path.slice(SCRIPTS_DIR.length).includes('/'));
+
 export function refreshBin(root, tree) {
-  const scripts = listEntries(root, tree).filter((entry) => entry.path.startsWith(SCRIPTS_DIR) && entry.path.endsWith('.mjs') && !entry.path.slice(SCRIPTS_DIR.length).includes('/'));
+  const scripts = binEntriesOf(root, tree);
   if (!scripts.some((entry) => entry.path === `${SCRIPTS_DIR}gate.mjs`)) throw new StateError(binIncompleteMessage);
   const notFile = scripts.find((entry) => entry.type !== 'blob' || !FILE_MODES.includes(entry.mode));
   if (notFile !== undefined) throw new StateError(binEntryMessage(notFile.path));

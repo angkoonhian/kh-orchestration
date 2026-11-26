@@ -2,32 +2,41 @@
 // ko.mjs is the entry and calls `main`; this file runs nothing when imported, so tests and the
 // session brief (Task 10, which calls `statusOf`) can import it.
 //
-// Agents run `run`, `status`, `verify-branch` and `unexempt` (which only tightens). The owner
-// alone runs `approve`, `propose`, `waive`, `exempt`, `off` and `on`: each refuses, before doing
-// anything else, when CLAUDECODE or CLAUDE_CODE_SESSION_ID is set (decision 13). That guards
-// against a skipped step, not against an agent set on cheating.
+// Agents run `run`, `status`, `verify-branch` and `unexempt` (which only tightens), from the
+// working copy. The owner alone runs `approve`, `propose`, `waive`, `exempt`, `off` and `on`:
+// - each refuses, before doing anything else, when CLAUDECODE or CLAUDE_CODE_SESSION_ID is set in
+//   this process's environment (decision 13); no argument can say otherwise;
+// - each acts only when this file is the copy in <git-common-dir>/kh-orchestration/bin/, the one
+//   refreshed from the approved tree in the guarded directory (after Task 7's review): an unstaged
+//   edit to the working copy's scripts must never run with the owner's authority.
+// That guards against a skipped step, not against an agent set on cheating.
+//
+// status and verify-branch --no-run execute nothing from the repository: contract 1 is judged by
+// checkContract1 alone, without the probe.
 //
 // Exit codes: 0 done, 1 refused or failing, 2 usage. Every message is fixed text with values
-// substituted (TEXT below), and names the next command from the one COMMANDS table. A refusal
-// goes to standard error as `kh-orchestration: <reason>` and `Next: <command>`; a report goes to
-// standard output. Any throw is caught in `main` and printed as fixed text.
+// substituted (TEXT below), and names the next command: an agent's from the one COMMANDS table,
+// an owner's through ko-state's ownerCommand. A refusal goes to standard error as
+// `kh-orchestration: <reason>` and `Next: <command>`; a report goes to standard output. Any throw
+// is caught in `main` and printed as fixed text.
 //
 // The state files are read, changed and written with no lock: each owner command keeps its read
 // and its write adjacent, and two owner commands at once may still lose one update.
-import { accessSync, constants, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { accessSync, constants, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { COMMANDS } from './extension.mjs';
-import { contractHolds, ownEntry } from './ko-contract.mjs';
-import { agentRuleChanges, digestOfTree } from './ko-digest.mjs';
-import { REASONS, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shellWord, shownText } from './ko-gate.mjs';
+import { COMMANDS, shellWord } from './extension.mjs';
+import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
+import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
+import { REASONS, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
-  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headTree, indexTree, repoRoot, tidy, treeOfCommit,
+  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, listEntries, repoRoot, tidy, treeOfCommit,
 } from './ko-git.mjs';
+import { HOOK_NAMES, hookParts, hookText } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
 import {
-  RULE_ID, StateError, appendJournal, isOff, listInflight, readApprovals, readExemptions, readProposals, readWaivers, refreshBin, removeStaleInflight,
-  switchOff, switchOn, writeState,
+  RULE_ID, StateError, appendJournal, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
+  refreshBin, removeStaleInflight, stateDir, switchOff, switchOn, verdictName, writeState,
 } from './ko-state.mjs';
 import { passing, produceVerdict, readVerdict, writeVerdict } from './ko-verdict.mjs';
 import { checkContract1 } from './verify-contract-1.mjs';
@@ -37,30 +46,31 @@ const NAMED_AT_MOST = 10;
 const OUTPUT_LINES = 10;
 const MAX_REASON = 500;
 const MIN_GIT = [2, 30];
-const HOOKS = ['pre-commit', 'pre-merge-commit', 'reference-transaction'];
 const REFERENCE_HOOK = 'reference-transaction';
 const CONTRACT_FILE = '.claude/kh-harness/contract.json';
 const HARNESS_LOG = '.claude/scripts/harness-log.mjs';
+const SCRIPTS = '.claude/kh-orchestration/scripts';
 // What recordExternalEvent needs listed in the contract file (CONTRACT.md, step 2): the log, and
 // the seal that expires an event's data.
 const LOG_FILES = [HARNESS_LOG, '.claude/scripts/harness-seal.mjs'];
 // Bounds on the session-log event, well inside kh-harness's 16,384 bytes.
 const EVENT_OFFICERS = 50;
 const EVENT_ID_CHARACTERS = 64;
-const STAMP = /^\/\/ Generated by kh-orchestration (\S+)\. Do not edit\.\r?\n/;
+const MAX_HOOK_BYTES = 64 * 1024;
+// Where this file runs from: the owner's commands act only when it is bin/.
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const short = (id) => (id === null ? 'none' : id === 'none' ? 'none' : id.slice(0, 12));
 const sentence = (text) => `${text.replace(/\.$/, '')}.`;
+// A name (a branch, a path, an id) as it is shown: every invisible or control character written
+// as \u{…}, so two names never look the same, then cut at 200 characters.
+const shownName = (text) => shownText(visible(text));
 function named(items) {
-  const shown = items.slice(0, NAMED_AT_MOST).map(shownText).join(', ');
+  const shown = items.slice(0, NAMED_AT_MOST).map(shownName).join(', ');
   return items.length > NAMED_AT_MOST ? `${shown} and ${items.length - NAMED_AT_MOST} more` : shown;
 }
-// Text shown to the owner in full (a diff, a path), with every character a terminal would act on
-// or hide (controls but TAB and newline, zero-width and bidi characters) written as \u{…}, so a
-// file cannot make what approve shows differ from what it approves.
-const INVISIBLE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\ufeff]/g;
-const visible = (text) => text.replace(INVISIBLE, (char) => `\\u{${char.codePointAt(0).toString(16)}}`);
-const withReason = (entries, label) => entries.map((entry) => `${shownText(entry[label])} (${shownText(entry.reason)})`).join(', ');
+const withReason = (entries, label) => entries.map((entry) => `${shownName(entry[label])} (${shownText(entry.reason)})`).join(', ');
+const branchWords = (branch) => (branch === null ? 'a detached HEAD' : shownName(branch));
 const KO = COMMANDS.status.slice(0, -' status'.length);
 const APPLY = (root) => `node <kh-orchestration>/scripts/apply.mjs ${shellWord(root)} --yes`;
 
@@ -69,7 +79,8 @@ export const USAGE = `usage: ${KO} <command>
   status [--json]                  what the commit gate sees in this worktree
   verify-branch [--no-run]         whether HEAD's tree passed the gate's checks (runs the officers first unless --no-run)
   unexempt <branch>                end a branch's exemption
-The owner's commands, run in their own terminal outside Claude Code:
+The owner's commands, run in their own terminal outside Claude Code, from the approved copy:
+node <git-common-dir>/kh-orchestration/bin/ko.mjs <command>
   approve                          approve the protected files of the staged tree (asks for the word approve)
   propose                          open this worktree for edits to the protected files until the next approve
   waive <rule> --reason <text>     waive an officer's rule on the current branch
@@ -80,37 +91,38 @@ The owner's commands, run in their own terminal outside Claude Code:
 // Every text ko.mjs prints, with values substituted.
 export const TEXT = Object.freeze({
   noCommand: 'No command was given.',
-  unknownCommand: (word) => `${shownText(word)} is not a ko.mjs command.`,
-  unexpectedArgument: (command, word) => `${command} does not take ${shownText(word)}.`,
+  unknownCommand: (word) => `${shownName(word)} is not a ko.mjs command.`,
+  unexpectedArgument: (command, word) => `${command} does not take ${shownName(word)}.`,
   missingOperand: (command, what) => `${command} needs ${what}.`,
   reasonMissing: (command) => `${command} needs --reason <text>, saying why in a few words.`,
   reasonEmpty: 'The reason holds no text once control characters are removed. Say why in a few words.',
   reasonTooLong: `The reason is longer than ${MAX_REASON} characters. Say why in fewer words.`,
-  badRule: (rule) => `${shownText(rule)} is not a rule id: a letter, then letters, digits, _, . or -, at most 64 characters, as RULES.md writes it.`,
-  badBranch: (name) => `${shownText(name)} is not a branch name git accepts (git check-ref-format --branch).`,
+  badRule: (rule) => `${shownName(rule)} is not a rule id: a letter, then letters, digits, _, . or -, at most 64 characters, as RULES.md writes it.`,
+  badBranch: (name) => `${shownName(name)} is not a branch name git accepts (git check-ref-format --branch), written as the short name.`,
 
   notARepository: 'This directory is not inside a git working tree.',
   ownerOnly: (command, variable) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code: ${variable} is set here, so this is a Claude Code session. Nothing was changed.`,
+  notFromBin: (command) => `ko.mjs ${command} acts only from the approved copy in the shared state, not from the working copy, whose scripts a session can change. Nothing was changed.`,
   failed: (reason) => `ko.mjs could not finish: ${sentence(reason)}`,
   unexpected: 'an unexpected error stopped it',
-  filterDriver: (name, key) => `The git filter driver ${shownText(name)} is configured (${shownText(key)}). A clean filter can make a working tree that differs from the index look tidy, and the officers run on the working tree, so they are not run here. Remove the driver from the configuration file shown below; only lfs is allowed.`,
+  filterDriver: (name, key) => `The git filter driver ${shownName(name)} is configured (${shownName(key)}). A clean filter can make a working tree that differs from the index look tidy, and the officers run on the working tree, so they are not run here. Remove the driver from the configuration file shown below; only lfs is allowed.`,
   untidy: (paths) => `The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage or remove: ${named(paths)}.`,
   cannotRun: (problem) => `The officers cannot be run on this tree: ${sentence(problem)}`,
 
   runHeader: (tree, base) => `Officers on the staged tree ${short(tree)} against the base ${short(base)}:`,
   verifyHeader: (where, tree, base) => `verify-branch on ${where}: HEAD's tree ${short(tree)} against the base ${short(base)}.`,
   noOfficers: '  (the tree names no officers)',
-  officerLine: (entry) => `  ${shownText(entry.id)}  ${entry.result}  ${entry.seconds.toFixed(1)} s`,
+  officerLine: (entry) => `  ${shownName(entry.id)}  ${entry.result}  ${entry.seconds.toFixed(1)} s`,
   outputLine: (line) => `    | ${shownText(line)}`,
   agentChanges: (changes) => (changes.length === 0
     ? 'Rules marked approval: agent reworded since the base: none.'
     : `Rules marked approval: agent reworded since the base: ${named(changes.map((change) => change.id))}.`),
   waivers: (branch, waivers) => (branch === null
     ? 'Waivers: none, HEAD is detached.'
-    : `Waivers in force on ${shownText(branch)}: ${waivers.length === 0 ? 'none' : withReason(waivers, 'rule')}.`),
+    : `Waivers in force on ${shownName(branch)}: ${waivers.length === 0 ? 'none' : withReason(waivers, 'rule')}.`),
   exemption: (branch, exemption) => (exemption === null
-    ? `Exemption: none for ${branch === null ? 'a detached HEAD' : shownText(branch)}.`
-    : `Exemption in force: ${shownText(exemption.name)} (${shownText(exemption.reason)}); the gate lets its commits through unchecked.`),
+    ? `Exemption: none for ${branchWords(branch)}.`
+    : `Exemption in force: ${shownName(exemption.name)} (${shownText(exemption.reason)}); the gate lets its commits through unchecked.`),
   passingApproved: (tree) => `Passing: the staged tree ${short(tree)} may be committed; its protected files are approved.`,
   passingUnapproved: (digest) => `Passing, but the protected files of this tree (digest ${short(digest)}) are not approved, so the commit gate refuses it until the owner approves them in their own terminal.`,
   failing: (ids) => `Failing: these officers did not pass: ${named(ids)}. Fix what they report, stage the fix, and run the officers again.`,
@@ -118,18 +130,23 @@ export const TEXT = Object.freeze({
   noHead: 'HEAD names no commit yet, so there is no branch head to verify.',
   stagedChanges: 'The index holds changes HEAD does not, so the working tree is not HEAD\'s tree and the officers cannot run on it. Commit or stash them first.',
   untidyHead: (paths) => `The working tree differs from HEAD, so the officers would not run on HEAD's tree. Commit or stash: ${named(paths)}.`,
+  headRecorded: 'HEAD\'s commit is recorded as accepted by the gate; it is judged against the base the gate used.',
+  headNotRecorded: 'No record of HEAD\'s commit passing the gate (it predates the install, or git never ran the hooks for it: a rebase, a cherry-pick or the like); it is judged against the base computed from the branch.',
   noRaceHook: 'Note: the reference-transaction hook is not installed, so a change to the index in the instant after the gate allows a commit is not caught when it is committed; this check is the remedy, run it before merging.',
   verified: 'Pass: HEAD\'s tree has a passing verdict against its base, its protected files are approved and contract 1 holds.',
   notVerified: (reason) => `Fail: ${reason}`,
 
   approveUndigestable: (problem) => `The protected files of the staged tree cannot be approved: ${sentence(problem)}`,
-  approveHeader: (tree, digest, branch) => `Approving the protected files of the staged tree ${short(tree)} (digest ${short(digest)}) on ${branch === null ? 'a detached HEAD' : shownText(branch)}.`,
+  approveHeader: (tree, digest, branch) => `Approving the protected files of the staged tree ${short(tree)} (digest ${short(digest)}) on ${branchWords(branch)}.`,
   coveredFiles: (count) => `The ${count} files the digest covers:`,
   coveredFile: (path) => `  ${visible(path)}`,
-  sinceApproval: (tree, at) => `Changes to them since the approval of ${shownText(at)} on this branch (tree ${short(tree)}):`,
+  baselineBranch: (tree, at) => `Changes to them since the last approval on this branch (${shownText(at)}, tree ${short(tree)}):`,
+  baselineMergeBase: (tree, at, commit) => `No approval on this branch records its tree; changes to them since the approved tree whose digest is the merge base's (merge base ${short(commit)}; approved ${shownText(at)}, tree ${short(tree)}):`,
+  baselineAny: (tree, at, branch) => `Neither this branch nor its merge base has an approval that records its tree; changes to them since the most recent approved tree (on ${branchWords(branch)}, ${shownText(at)}, tree ${short(tree)}):`,
   noChange: '  (none: the files are as that approval left them)',
-  noEarlierApproval: 'No earlier approval on this branch records its tree, so read these files in full before approving.',
-  earlierTreeGone: (tree) => `The tree of the last approval on this branch (${short(tree)}) is no longer in the object store, so read these files in full before approving.`,
+  newlyCovered: (paths) => `Newly covered, their content unchanged since that tree: ${named(paths)}.`,
+  noEarlierApproval: 'No earlier approval records a tree to compare with, so read these files in full before approving.',
+  earlierTreeGone: (tree) => `The tree of the last approval on this branch (${short(tree)}) is no longer in the object store.`,
   alreadyApproved: 'This digest is approved already; approving again refreshes bin/ from this tree and closes this worktree for proposals.',
   prompt: 'Type approve and press Enter to approve; anything else cancels: ',
   notApproved: 'Nothing was approved: the answer was not the word approve.',
@@ -137,35 +154,45 @@ export const TEXT = Object.freeze({
   approved: (digest, tree) => `Approved: digest ${short(digest)} of tree ${short(tree)}. bin/ now holds this tree's scripts, and this worktree is closed for proposals.`,
   approvedNext: `${COMMANDS.run}, then git commit`,
 
-  proposed: (path) => `This worktree (${shownText(path)}) is open for proposals: a session here may edit the protected files, though never .claude/settings.local.json or the git directory. The next approve closes it.`,
-  alreadyProposed: (path) => `This worktree (${shownText(path)}) is open for proposals already. The next approve closes it.`,
+  proposed: (path) => `This worktree (${shownName(path)}) is open for proposals: a session here may edit the protected files, though never .claude/settings.local.json or the git directory. The next approve closes it.`,
+  alreadyProposed: (path) => `This worktree (${shownName(path)}) is open for proposals already. The next approve closes it.`,
   waiveDetached: 'HEAD is detached; a waiver applies to a branch. Switch to the branch first.',
-  waived: (rule, branch) => `Rule ${rule} is waived on ${shownText(branch)}; its officer sees the waiver in KO_WAIVERS from the next run.`,
-  exempted: (branch) => `The branch ${shownText(branch)} is exempt: the commit gate lets its commits through unchecked.`,
+  waived: (rule, branch) => `Rule ${rule} is waived on ${shownName(branch)}; its officer sees the waiver in KO_WAIVERS from the next run.`,
+  exempted: (branch) => `The branch ${shownName(branch)} is exempt: the commit gate lets its commits through unchecked.`,
   exemptions: (list) => `Exempt branches: ${list.length === 0 ? 'none' : withReason(list, 'name')}.`,
-  unexempted: (branch) => `The branch ${shownText(branch)} is no longer exempt.`,
-  notExempt: (branch) => `The branch ${shownText(branch)} was not exempt; nothing changed.`,
-  off: `kh-orchestration is switched off for this repository: no commit is checked until it is switched on with ${COMMANDS.on}.`,
+  unexempted: (branch) => `The branch ${shownName(branch)} is no longer exempt.`,
+  notExempt: (branch) => `The branch ${shownName(branch)} was not exempt; nothing changed.`,
+  off: (onCommand) => `kh-orchestration is switched off for this repository: no commit is checked until it is switched on with ${onCommand}.`,
   on: 'kh-orchestration is switched on for this repository: every commit is checked.',
 
-  statusHeader: (root) => `kh-orchestration status of ${shownText(root)}`,
+  statusHeader: (root) => `kh-orchestration status of ${shownName(root)}`,
   problemsHeader: 'Problems:',
   noProblems: 'No problems found.',
-  offProblem: `kh-orchestration is switched off: no commit is checked. The owner switches it on with ${COMMANDS.on}.`,
+  offProblem: (onCommand) => `kh-orchestration is switched off: no commit is checked. The owner switches it on with ${onCommand}.`,
+  exemptHere: (branch, reason) => `This branch, ${shownName(branch)}, is exempt (${shownText(reason)}): the commit gate lets its commits through unchecked.`,
   noInstall: (problem) => `The staged tree holds no usable install: ${sentence(problem)}`,
   installProblem: (problem) => `The officers file of the staged tree cannot be used: ${sentence(problem)}`,
   contractProblem: (problem) => `kh-harness contract 1 does not hold in this working directory: ${sentence(problem)}`,
   undigestable: (problem) => `The protected files of the staged tree cannot be checked: ${sentence(problem)}`,
   unapproved: (digest) => `The protected files of the staged tree (digest ${short(digest)}) are not approved.`,
-  headUnverdicted: (tree, base) => `HEAD's tree (${short(tree)}) has no passing verdict against its base (${short(base)}): it was committed without passing the gate (a rebase, cherry-pick, amend or merge git does not hook, a commit made while the gate was off or before the install, or a change to the index after the gate allowed it). Run the officers on it before merging.`,
-  hookMissing: (name, path) => `The ${name} hook is not installed at ${shownText(path)}, so git does not run the commit gate there.`,
-  raceHookMissing: (path) => `The reference-transaction hook is not installed at ${shownText(path)}, so a change to the index in the instant after the gate allows a commit is not caught: verify-branch is then the remedy.`,
-  hookNotOurs: (name, path) => `The ${name} hook at ${shownText(path)} is not kh-orchestration's, so the commit gate may not run.`,
-  hookNotExecutable: (name, path) => `The ${name} hook at ${shownText(path)} is not executable, so git skips it.`,
-  hookUnreadable: (name, path) => `The ${name} hook at ${shownText(path)} does not start env and Node as kh-orchestration writes it.`,
-  hookProgramGone: (name, what, path) => `The ${name} hook starts ${what} as ${shownText(path)}, which no longer exists, so every commit is refused. Run kh-orchestration's apply again to record where it is now.`,
-  hooksPath: (value, scope) => `core.hooksPath is set to ${shownText(value)} in the ${scope} git configuration, so git runs no hook from the repository's hooks directory and the commit gate is off for every commit.`,
-  oldGit: (version) => `git ${shownText(version)} is older than 2.30, the oldest git kh-orchestration works with. Install git 2.30 or later.`,
+  indexFailing: (ids) => `The verdict for the staged tree is failing: ${named(ids)} did not pass.`,
+  indexStale: 'The verdict for the staged tree records other officers or other protected files than the tree holds, so the gate does not trust it.',
+  verdictDamaged: (name) => `The shared state file ${name} exists but is not a verdict kh-orchestration can use; the gate treats it as no verdict.`,
+  headNoRecord: (tree, base) => `There is no record of HEAD's commit passing the gate and no passing verdict for its tree (${short(tree)}) against its base (${short(base)}): it predates the install, or git never ran the hooks for it (a rebase, a cherry-pick or the like). Run verify-branch before merging.`,
+  headAcceptedUnverdicted: (tree, base) => `HEAD's commit is recorded as accepted by the gate, but no passing verdict for its tree (${short(tree)}) against that base (${short(base)}) is recorded now: the verdict file was removed or damaged. Run verify-branch before merging.`,
+  binMissing: (bin) => `There is no ${shownName(bin)}/, so the hooks find no gate and every commit is refused.`,
+  binNoGate: (bin) => `${shownName(bin)}/ holds no gate.mjs, so the hooks find no gate and every commit is refused.`,
+  binBaselineApproved: (tree) => `the scripts of the last approved tree (${short(tree)})`,
+  binBaselineWorking: 'the installed scripts of the working copy (no approval records a tree yet)',
+  binDiffers: (bin, baseline, names) => `${shownName(bin)}/ differs from ${baseline}: ${named(names)}. The hooks and the owner's commands run bin/; kh-orchestration's apply restores it from the approved tree.`,
+  hookMissing: (name, path) => `The ${name} hook is not installed at ${shownName(path)}, so git does not run the commit gate there.`,
+  raceHookMissing: (path) => `The reference-transaction hook is not installed at ${shownName(path)}, so a change to the index in the instant after the gate allows a commit is not caught: verify-branch is then the remedy.`,
+  hookNotOurs: (name, path) => `The ${name} hook at ${shownName(path)} is not kh-orchestration's, so the commit gate may not run.`,
+  hookDiffers: (name, path) => `The ${name} hook at ${shownName(path)} is not exactly the text kh-orchestration writes for the env and Node it names, so it may not run the gate as it should.`,
+  hookNotExecutable: (name, path) => `The ${name} hook at ${shownName(path)} is not executable, so git skips it.`,
+  hookProgramGone: (name, what, path) => `The ${name} hook starts ${what} as ${shownName(path)}, which no longer exists, so every commit is refused. Run kh-orchestration's apply again to record where it is now.`,
+  hooksPath: (value, scope) => `core.hooksPath is set to ${shownName(value)} in the ${scope} git configuration, so git runs no hook from the repository's hooks directory and the commit gate is off for every commit.`,
+  oldGit: (version) => `git ${shownName(version)} is older than 2.30, the oldest git kh-orchestration works with. Install git 2.30 or later.`,
   unknownGit: 'The version of git could not be read.',
   staleInflight: (pids) => `In-flight records of git processes that have ended are left: ${named(pids)}. The next gate run, approve or apply removes them.`,
 });
@@ -203,6 +230,35 @@ function kitVersion() {
   }
 }
 
+const statOrNull = (path) => {
+  try {
+    return statSync(path);
+  } catch {
+    return null;
+  }
+};
+const runnable = (path) => {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const realOrNull = (path) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+};
+
+// Whether this file runs from <state>/bin/, the approved copy.
+function fromApprovedCopy(root) {
+  const here = realOrNull(HERE);
+  return here !== null && here === realOrNull(join(stateDir(root), 'bin'));
+}
+
 // A filter driver other than lfs configured at any level, `{ name, key }`, or null. Reads the
 // configuration only (amended decision 17, rule 8): no working-tree content is read before it.
 function foreignFilter(root) {
@@ -219,7 +275,6 @@ function foreignFilter(root) {
 
 // The waivers in force on `branch`: none on a detached HEAD.
 const waiversOf = (root, branch) => (branch === null ? [] : readWaivers(root).filter((entry) => entry.branch === branch));
-const exemptionOf = (root, branch) => (branch === null ? null : readExemptions(root).find((entry) => entry.name === branch) ?? null);
 
 // A reason as recorded: its control, zero-width and bidi characters removed, trimmed, at most MAX_REASON.
 function cleanReason(command, reason) {
@@ -259,8 +314,8 @@ const verdictSummary = (verdict, isPassing) => ({
 // the contract file lists harness-log.mjs and harness-seal.mjs; only then is the installed
 // harness-log.mjs imported. Anything else, a refusal from kh-harness (the log is off by default)
 // included, records nothing and says nothing: the run journal is the record.
-async function recordSessionEvent(root, env, data) {
-  const sessionId = env.CLAUDE_CODE_SESSION_ID;
+async function recordSessionEvent(root, data) {
+  const sessionId = process.env.CLAUDE_CODE_SESSION_ID;
   if (sessionId === undefined) return;
   try {
     const { problems, warnings } = checkContract1(root, ownEntry(root));
@@ -277,7 +332,7 @@ async function recordSessionEvent(root, env, data) {
 }
 
 // Runs the officers on `tree` (the working tree equals it: the caller checked) and records the
-// verdict and the journal line. `{ verdict, officers }` or `{ problem }`.
+// verdict and the journal line. `{ verdict, isPassing }` or `{ problem }`.
 async function runAndRecord(root, { tree, base, branch, officers, command }) {
   const produced = await produceVerdict(root, { tree, base, branch, waivers: waiversOf(root, branch), kitVersion: kitVersion() });
   if (produced.problem !== undefined) return produced;
@@ -294,9 +349,14 @@ function untidyPaths(root) {
   return state.tidy ? [] : [...state.unstaged, ...state.untracked];
 }
 
+const treeExists = (root, tree) => {
+  const type = git(root, ['cat-file', '-t', '--end-of-options', tree]);
+  return type.status === 0 && type.stdout.trim() === 'tree';
+};
+
 // ---- run ----
 
-async function run(root, env) {
+async function run(root) {
   const filter = foreignFilter(root);
   if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
   const untidy = untidyPaths(root);
@@ -309,7 +369,7 @@ async function run(root, env) {
   const recorded = await runAndRecord(root, { tree, base, branch, officers: read.officers, command: 'run' });
   if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), COMMANDS.status);
   const { verdict, isPassing } = recorded;
-  await recordSessionEvent(root, env, verdictSummary(verdict, isPassing));
+  await recordSessionEvent(root, verdictSummary(verdict, isPassing));
   const lines = [TEXT.runHeader(tree, base), ...officerLines(verdict), TEXT.agentChanges(verdict.agentRuleChanges)];
   if (verdict.waivers.length > 0) lines.push(TEXT.waivers(branch, verdict.waivers));
   print(lines);
@@ -319,7 +379,9 @@ async function run(root, env) {
     return 1;
   }
   const approvedAlready = readApprovals(root).some((entry) => entry.digest === verdict.digest);
-  print(approvedAlready ? [TEXT.passingApproved(tree), nextLine('git commit')] : [TEXT.passingUnapproved(verdict.digest), nextLine(COMMANDS.approve)]);
+  print(approvedAlready
+    ? [TEXT.passingApproved(tree), nextLine('git commit')]
+    : [TEXT.passingUnapproved(verdict.digest), nextLine(ownerCommand(root, 'approve'))]);
   return 0;
 }
 
@@ -335,48 +397,26 @@ function attempt(problems, read, fallback, next = COMMANDS.status) {
   }
 }
 
-const statOrNull = (path) => {
-  try {
-    return statSync(path);
-  } catch {
-    return null;
-  }
-};
-const runnable = (path) => {
-  try {
-    accessSync(path, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-// A word written by the installer's shell quoting ('…', with '\'' for a quote), and its value.
-const QUOTED = "'[^']*'(?:\\\\''[^']*')*";
-const NODE_START = new RegExp(`^if out=\\$\\((${QUOTED}) -i .* (${QUOTED}) "\\$d/kh-orchestration/bin/gate\\.mjs" `, 'm');
-const unquote = (word) => word.slice(1, -1).replaceAll("'\\''", "'");
-const MAX_HOOK_BYTES = 64 * 1024;
-
-// One hook as git would run it: present, ours by its header line (decision 18), executable, and
-// the absolute env and Node it names, each still there.
+// One hook as git would run it: present, ours (a kh-orchestration header for this hook), matching
+// (byte for byte the text this kit writes for the version, env and Node the hook names, so an
+// edited body is never "ok" by its header), executable, and the env and Node it names still there.
 function inspectHook(root, name) {
   const path = join(commonDir(root), 'hooks', name);
-  const hook = { name, path, present: false, ours: false, executable: false, env: null, envExists: false, node: null, nodeExists: false };
+  const hook = { name, path, present: false, ours: false, matches: false, executable: false, env: null, envExists: false, node: null, nodeExists: false };
   const stat = statOrNull(path);
   if (stat === null || !stat.isFile()) return hook;
   hook.present = true;
   hook.executable = runnable(path);
   const read = readNoFollow(path);
   const text = read.bytes === undefined || read.bytes.length > MAX_HOOK_BYTES ? '' : read.bytes.toString('utf8');
-  const lines = text.split('\n');
-  hook.ours = lines[0] === '#!/bin/sh -p' && new RegExp(`^# kh-orchestration \\S+ ${name}\\. Do not edit\\.$`).test(lines[1] ?? '');
-  const start = text.match(NODE_START);
-  if (start !== null) {
-    hook.env = unquote(start[1]);
-    hook.node = unquote(start[2]);
-    hook.envExists = runnable(hook.env);
-    hook.nodeExists = runnable(hook.node);
-  }
+  const parts = hookParts(text);
+  hook.ours = parts !== null && parts.hook === name;
+  if (!hook.ours || parts.env === null) return hook;
+  hook.env = parts.env;
+  hook.node = parts.node;
+  hook.envExists = runnable(parts.env);
+  hook.nodeExists = runnable(parts.node);
+  hook.matches = hookText(name, parts) === text;
   return hook;
 }
 
@@ -385,14 +425,59 @@ function hookProblems(root, hook) {
   if (!hook.present) return [hook.name === REFERENCE_HOOK ? { text: TEXT.raceHookMissing(hook.path), next: apply } : { text: TEXT.hookMissing(hook.name, hook.path), next: apply }];
   if (!hook.ours) return [{ text: TEXT.hookNotOurs(hook.name, hook.path), next: apply }];
   const problems = [];
+  if (!hook.matches) problems.push({ text: TEXT.hookDiffers(hook.name, hook.path), next: apply });
   if (!hook.executable) problems.push({ text: TEXT.hookNotExecutable(hook.name, hook.path), next: `chmod +x ${shellWord(hook.path)}` });
-  if (hook.env === null) problems.push({ text: TEXT.hookUnreadable(hook.name, hook.path), next: apply });
   if (hook.env !== null && !hook.envExists) problems.push({ text: TEXT.hookProgramGone(hook.name, 'env', hook.env), next: apply });
   if (hook.node !== null && !hook.nodeExists) problems.push({ text: TEXT.hookProgramGone(hook.name, 'Node', hook.node), next: apply });
   return problems;
 }
 
-const raceHookWorks = (hook) => hook.present && hook.ours && hook.executable;
+const raceHookWorks = (hook) => hook.present && hook.matches && hook.executable;
+
+// bin/ against what it should hold: the scripts of the last approval that records its tree (the
+// tree approve last refreshed bin/ from), or before any such approval the working copy's
+// installed scripts. `{ present, gate, baseline: { kind, tree }, differs, missing, extra }`.
+function binOf(root, approvals) {
+  const bin = join(stateDir(root), 'bin');
+  const stat = statOrNull(bin);
+  if (stat === null || !stat.isDirectory()) return { present: false, gate: false, baseline: null, differs: [], missing: [], extra: [] };
+  const last = (approvals ?? []).filter((entry) => entry.tree !== undefined).at(-1);
+  const expected = new Map();
+  let baseline;
+  if (last !== undefined && treeExists(root, last.tree)) {
+    baseline = { kind: 'approved', tree: last.tree };
+    for (const entry of binEntriesOf(root, last.tree)) expected.set(basename(entry.path), (bytes) => hashesTo(entry.oid, bytes));
+  } else {
+    baseline = { kind: 'working', tree: null };
+    const scripts = join(root, SCRIPTS);
+    const names = statOrNull(scripts)?.isDirectory() ? readdirSync(scripts).filter((name) => name.endsWith('.mjs')) : [];
+    for (const name of names) {
+      const working = readNoFollow(join(scripts, name)).bytes;
+      if (working !== undefined) expected.set(name, (bytes) => bytes.equals(working));
+    }
+  }
+  const present = readdirSync(bin).sort();
+  const differs = [];
+  const missing = [];
+  for (const [name, same] of [...expected].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    if (!present.includes(name)) missing.push(name);
+    else if (!same(readNoFollow(join(bin, name)).bytes ?? Buffer.alloc(0))) differs.push(name);
+  }
+  return { present: true, gate: present.includes('gate.mjs'), baseline, differs, missing, extra: present.filter((name) => !expected.has(name)) };
+}
+
+// The remedy is apply, run from the plugin: approve itself runs from bin/, so it cannot restore a
+// bin/ that is missing or damaged.
+function binProblems(root, bin) {
+  const directory = join(stateDir(root), 'bin');
+  const next = APPLY(root);
+  if (!bin.present) return [{ text: TEXT.binMissing(directory), next }];
+  if (!bin.gate) return [{ text: TEXT.binNoGate(directory), next }];
+  const names = [...bin.differs, ...bin.missing, ...bin.extra].sort();
+  if (names.length === 0) return [];
+  const baseline = bin.baseline.kind === 'approved' ? TEXT.binBaselineApproved(bin.baseline.tree) : TEXT.binBaselineWorking;
+  return [{ text: TEXT.binDiffers(directory, baseline, names), next }];
+}
 
 // The effective core.hooksPath across every level, `{ value, scope }`, or null when it is not set.
 function hooksPathOf(root) {
@@ -415,26 +500,42 @@ function gitVersion(root) {
   return { version: `${match[1]}.${match[2]}${match[3]}`, supported: major > MIN_GIT[0] || (major === MIN_GIT[0] && minor >= MIN_GIT[1]) };
 }
 
-// The verdict for `tree` against `base` as the gate reads it: 'passing' only when it passes for the
-// tree's officers and records the tree's digest; 'none' when no verdict is recorded.
+// The verdict for `tree` against `base` as the gate reads it, `{ state, failed }`: 'passing' only
+// when it passes for the tree's officers and records the tree's digest; 'damaged' when a file is
+// there that readVerdict does not accept; 'none' when there is no file. `failed`: the officers it
+// shows not passing.
 function verdictState(root, tree, base, officers, digest) {
   const verdict = readVerdict(root, tree, base);
-  if (verdict === null) return 'none';
-  return passing(verdict, officers) && verdict.digest === digest ? 'passing' : 'failing';
+  if (verdict === null) return { state: statOrNull(join(stateDir(root), verdictName(tree, base))) === null ? 'none' : 'damaged', failed: [] };
+  const isPassing = passing(verdict, officers) && verdict.digest === digest;
+  return { state: isPassing ? 'passing' : 'failing', failed: isPassing ? [] : failedIds(verdict) };
+}
+
+// HEAD's commit as the gate saw it: `{ accepted, base }`, the base from its accepted record when
+// the gate recorded one for this tree, else computed from the branch (headBaseOf); base null when
+// HEAD's tree has no usable officers file and no record.
+function headJudged(root, head, read) {
+  const commit = headCommit(root);
+  const record = commit === null ? null : readAccepted(root, commit);
+  if (record !== null && record.tree === head) return { accepted: true, base: record.base };
+  return { accepted: false, base: read.problem === undefined ? headBaseOf(root, read.baseBranch) : null };
 }
 
 /**
  * What the commit gate sees in this worktree, as one object (the shape `status --json` prints and
- * the session brief, Task 10, reads). Never throws for a damaged state file or a check that
- * cannot be made: each becomes an entry of `problems`, `{ text, next }`, and its field is null.
+ * the session brief, Task 10, reads). Executes nothing from the repository. Never throws for a
+ * damaged state file or a check that cannot be made: each becomes an entry of `problems`,
+ * `{ text, next }`, and its field is null.
  */
 export function statusOf(root) {
   const problems = [];
+  const approveNext = ownerCommand(root, 'approve');
   const off = isOff(root);
-  if (off) problems.push({ text: TEXT.offProblem, next: COMMANDS.on });
+  if (off) problems.push({ text: TEXT.offProblem(ownerCommand(root, 'on')), next: ownerCommand(root, 'on') });
   const branch = currentBranch(root);
   const tree = attempt(problems, () => indexTree(root), null);
   const head = attempt(problems, () => headTree(root), null);
+  const approvals = attempt(problems, () => readApprovals(root), null);
 
   const read = tree === null ? null : officersOfTree(root, tree);
   const officers = read?.problem === undefined ? read?.officers ?? null : null;
@@ -460,34 +561,50 @@ export function statusOf(root) {
       problems.push({ text: TEXT.undigestable(digested.problem), next: COMMANDS.status });
     } else {
       digest = digested.digest;
-      digestApproved = attempt(problems, () => readApprovals(root).some((entry) => entry.digest === digest), null);
-      if (digestApproved === false) problems.push({ text: TEXT.unapproved(digest), next: COMMANDS.approve });
+      digestApproved = approvals === null ? null : approvals.some((entry) => entry.digest === digest);
+      if (digestApproved === false) problems.push({ text: TEXT.unapproved(digest), next: approveNext });
     }
-    if (officers !== null && base !== null && digest !== null) verdict = attempt(problems, () => verdictState(root, tree, base, officers, digest), 'none');
+    if (officers !== null && base !== null && digest !== null) {
+      const judged = attempt(problems, () => verdictState(root, tree, base, officers, digest), { state: 'none', failed: [] });
+      verdict = judged.state;
+      if (verdict === 'damaged') problems.push({ text: TEXT.verdictDamaged(verdictName(tree, base)), next: COMMANDS.run });
+      if (verdict === 'failing') problems.push({ text: judged.failed.length > 0 ? TEXT.indexFailing(judged.failed) : TEXT.indexStale, next: COMMANDS.run });
+    }
   }
 
   let headBase = null;
+  let headAccepted = null;
   let headVerdict = null;
   if (head !== null) {
     const headRead = officersOfTree(root, head);
+    const judged = attempt(problems, () => headJudged(root, head, headRead), { accepted: false, base: null });
+    headAccepted = judged.accepted;
+    headBase = judged.base;
     const headDigest = digestOfTree(root, head);
-    headBase = headRead.problem === undefined ? attempt(problems, () => headBaseOf(root, headRead.baseBranch), null) : null;
-    headVerdict = headBase === null || headDigest.problem !== undefined ? 'none' : attempt(problems, () => verdictState(root, head, headBase, headRead.officers, headDigest.digest), 'none');
-    if (headVerdict !== 'passing') problems.push({ text: TEXT.headUnverdicted(head, headBase), next: COMMANDS.verifyBranch });
+    headVerdict = headBase === null || headRead.problem !== undefined || headDigest.problem !== undefined
+      ? 'none'
+      : attempt(problems, () => verdictState(root, head, headBase, headRead.officers, headDigest.digest).state, 'none');
+    if (headVerdict !== 'passing') {
+      problems.push({ text: headAccepted ? TEXT.headAcceptedUnverdicted(head, headBase) : TEXT.headNoRecord(head, headBase), next: COMMANDS.verifyBranch });
+    }
   }
 
-  const contract = contractHolds(root);
+  const contract = contractHolds(root, { probe: false });
   for (const problem of contract.ok ? [] : contract.problems) problems.push({ text: TEXT.contractProblem(problem), next: COMMANDS.status });
 
   const here = realpathSync(root);
   const proposals = attempt(problems, () => readProposals(root), null);
   const exemptions = attempt(problems, () => readExemptions(root), null);
+  const exemptionHere = exemptions?.find((entry) => entry.name === branch);
+  if (exemptionHere !== undefined) problems.push({ text: TEXT.exemptHere(branch, exemptionHere.reason), next: `${COMMANDS.unexempt} ${shellWord(branch)}` });
   const waivers = attempt(problems, () => waiversOf(root, branch), null);
   const records = attempt(problems, () => listInflight(root), []);
   const inflight = { live: records.filter((record) => record.live).map((record) => record.pid), stale: records.filter((record) => !record.live).map((record) => record.pid) };
   if (inflight.stale.length > 0) problems.push({ text: TEXT.staleInflight(inflight.stale), next: COMMANDS.status });
 
-  const hooks = HOOKS.map((name) => inspectHook(root, name));
+  const bin = attempt(problems, () => binOf(root, approvals), null);
+  if (bin !== null) problems.push(...binProblems(root, bin));
+  const hooks = HOOK_NAMES.map((name) => inspectHook(root, name));
   for (const hook of hooks) problems.push(...hookProblems(root, hook));
   const hooksPath = attempt(problems, () => hooksPathOf(root), null);
   if (hooksPath !== null) problems.push({ text: TEXT.hooksPath(hooksPath.value, hooksPath.scope), next: hooksPathNext(hooksPath.scope) });
@@ -507,13 +624,15 @@ export function statusOf(root) {
     waivers,
     headTree: head,
     headBase,
+    headAccepted,
     headVerdict,
     install,
     contract: contract.ok ? { ok: true, problems: [] } : { ok: false, problems: contract.problems },
     liveFiles,
     digest,
     inflight,
-    hooks: hooks.map(({ name, present, ours, executable, env, envExists, node, nodeExists }) => ({ name, present, ours, executable, env, envExists, node, nodeExists })),
+    bin,
+    hooks: hooks.map(({ name, present, ours, matches, executable, env, envExists, node, nodeExists }) => ({ name, present, ours, matches, executable, env, envExists, node, nodeExists })),
     hooksPath,
     git: gitAt,
     problems,
@@ -523,22 +642,24 @@ export function statusOf(root) {
 const yesNo = (value, yes, no) => (value === null ? 'unknown (see the problems)' : value ? yes : no);
 
 function statusLines(root, status) {
-  const hookWord = (hook) => (!hook.present ? 'missing' : !hook.ours ? 'not ours' : hook.executable && hook.envExists && hook.nodeExists ? 'ok' : 'broken');
+  const hookWord = (hook) => (!hook.present ? 'missing' : !hook.ours ? 'not ours' : hook.matches && hook.executable && hook.envExists && hook.nodeExists ? 'ok' : 'broken');
+  const binWord = (bin) => (bin === null ? 'unknown' : !bin.present ? 'missing' : binProblems(root, bin).length === 0 ? `equal to ${bin.baseline.kind === 'approved' ? 'the last approved tree' : 'the working copy'}` : 'differs');
   return [
     TEXT.statusHeader(root),
     `  switch: ${status.off ? 'off' : 'on'}`,
-    `  branch: ${status.branch === null ? '(detached HEAD)' : shownText(status.branch)}; base: ${short(status.base)}; staged tree: ${short(status.tree)}; HEAD's tree: ${short(status.headTree)}`,
+    `  branch: ${status.branch === null ? '(detached HEAD)' : shownName(status.branch)}; base: ${short(status.base)}; staged tree: ${short(status.tree)}; HEAD's tree: ${short(status.headTree)}`,
     `  install in the staged tree: ${status.install === null ? 'unknown' : status.install.present ? 'present' : 'absent'}`,
-    `  contract 1: ${status.contract.ok ? 'holds' : 'does not hold'}`,
+    `  contract 1 (by its files): ${status.contract.ok ? 'holds' : 'does not hold'}`,
     `  live files: ${status.liveFiles === null ? 'unknown' : status.liveFiles.equal ? 'equal to the staged tree' : 'differ from the staged tree'}`,
     `  digest: ${short(status.digest)}, ${yesNo(status.digestApproved, 'approved', 'not approved')}`,
-    `  verdict for the staged tree: ${status.verdict}; for HEAD's tree: ${status.headVerdict ?? '(no commit yet)'}`,
+    `  verdict for the staged tree: ${status.verdict}; for HEAD's tree: ${status.headVerdict ?? '(no commit yet)'}${status.headAccepted ? ' (recorded as accepted by the gate)' : ''}`,
     `  this worktree: ${yesNo(status.openForProposals, 'open for proposals', 'closed for proposals')}`,
     `  ${status.exemptions === null ? 'Exempt branches: unknown (see the problems).' : TEXT.exemptions(status.exemptions)}`,
     `  ${status.waivers === null ? 'Waivers: unknown (see the problems).' : TEXT.waivers(status.branch, status.waivers)}`,
     `  in-flight records: ${status.inflight.live.length + status.inflight.stale.length === 0 ? 'none' : [...status.inflight.live.map((pid) => `${pid} (live)`), ...status.inflight.stale.map((pid) => `${pid} (stale)`)].join(', ')}`,
+    `  bin/: ${binWord(status.bin)}`,
     `  hooks: ${status.hooks.map((hook) => `${hook.name} ${hookWord(hook)}`).join(', ')}`,
-    `  core.hooksPath: ${status.hooksPath === null ? 'not set' : `${shownText(status.hooksPath.value)} (${status.hooksPath.scope})`}`,
+    `  core.hooksPath: ${status.hooksPath === null ? 'not set' : `${shownName(status.hooksPath.value)} (${status.hooksPath.scope})`}`,
     `  git: ${status.git.version ?? 'unknown'}`,
     ...(status.problems.length === 0 ? [TEXT.noProblems] : [TEXT.problemsHeader, ...status.problems.flatMap((problem) => [`  - ${problem.text}`, `    ${nextLine(problem.next)}`])]),
   ];
@@ -553,12 +674,16 @@ function status(root, { json }) {
 
 // ---- verify-branch ----
 
+// HEAD's tree judged by the gate's checks, the switches aside. Its base is the one the gate
+// recorded when it accepted HEAD's commit, else the one computed from the branch. By default the
+// officers run first (on a tidy tree that is HEAD's) and the probe runs as at a commit; with
+// --no-run the existing verdict is read and nothing from the repository is executed.
 async function verifyBranch(root, { noRun }) {
   const head = headTree(root);
   if (head === null) return refusal(TEXT.noHead, COMMANDS.run);
   const branch = currentBranch(root);
   const read = officersOfTree(root, head);
-  const base = read.problem === undefined ? headBaseOf(root, read.baseBranch) : null;
+  const { accepted, base } = headJudged(root, head, read);
   if (!noRun) {
     const filter = foreignFilter(root);
     if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
@@ -570,15 +695,16 @@ async function verifyBranch(root, { noRun }) {
       if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), COMMANDS.status);
     }
   }
-  const decision = judge(root, { tree: head, base, branch }, { honourSwitches: false });
+  const decision = judge(root, { tree: head, base, branch }, { honourSwitches: false, probe: !noRun });
   const verdict = base === null ? null : readVerdict(root, head, base);
   const changes = base === null ? [] : agentRuleChanges(root, treeOfCommit(root, base), head);
   const lines = [
-    TEXT.verifyHeader(branch === null ? 'a detached HEAD' : shownText(branch), head, base),
+    TEXT.verifyHeader(branchWords(branch), head, base),
     ...(verdict === null ? [] : officerLines(verdict)),
     TEXT.exemption(branch, exemptionOf(root, branch)),
     TEXT.waivers(branch, waiversOf(root, branch)),
     TEXT.agentChanges(changes),
+    accepted ? TEXT.headRecorded : TEXT.headNotRecorded,
   ];
   if (!raceHookWorks(inspectHook(root, REFERENCE_HOOK))) lines.push(TEXT.noRaceHook);
   if (decision.reason === REASONS.allowed) {
@@ -616,27 +742,52 @@ function readAnswer() {
   }
 }
 
-const treeExists = (root, tree) => {
-  const type = git(root, ['cat-file', '-t', '--end-of-options', tree]);
-  return type.status === 0 && type.stdout.trim() === 'tree';
-};
+// The approved tree approve compares the staged tree with, in order (after Task 7's review): the
+// last approval on this branch that records its tree; an approved tree whose digest is the digest
+// of the merge base's tree; the most recent approved tree on any branch; none. `{ record, line,
+// notes }`: the approval used (or null), the line saying which, and what was passed over.
+function approvalBaseline(root, { tree, branch, approvals }) {
+  const usable = (entry) => entry.tree !== undefined && treeExists(root, entry.tree);
+  const notes = [];
+  const ofBranch = approvals.filter((entry) => entry.branch === branch && entry.tree !== undefined).at(-1);
+  if (ofBranch !== undefined) {
+    if (treeExists(root, ofBranch.tree)) return { record: ofBranch, line: TEXT.baselineBranch(ofBranch.tree, ofBranch.approvedAt), notes };
+    notes.push(TEXT.earlierTreeGone(ofBranch.tree));
+  }
+  const read = officersOfTree(root, tree);
+  if (read.problem === undefined) {
+    const base = baseOf(root, read.baseBranch);
+    const baseTree = treeOfCommit(root, base);
+    const baseDigest = baseTree === null ? undefined : digestOfTree(root, baseTree).digest;
+    const match = baseDigest === undefined ? undefined : approvals.filter((entry) => entry.digest === baseDigest && usable(entry)).at(-1);
+    if (match !== undefined) return { record: match, line: TEXT.baselineMergeBase(match.tree, match.approvedAt, base), notes };
+  }
+  const any = approvals.filter(usable).at(-1);
+  if (any !== undefined) return { record: any, line: TEXT.baselineAny(any.tree, any.approvedAt, any.branch), notes };
+  return { record: null, line: TEXT.noEarlierApproval, notes };
+}
 
-// What approve shows before it asks: the covered files, and their diff against the last approved
-// tree of this branch (tree to tree: no working file is read, no external diff or text conversion runs).
+// What approve shows before it asks: the covered files, their diff against the baseline tree
+// (tree to tree: no working file is read, no external diff or text conversion runs), and the
+// paths newly covered though their content is unchanged, which no diff shows.
 function approvalPreview(root, { tree, digest, branch }) {
   const approvals = readApprovals(root);
   const lines = [TEXT.approveHeader(tree, digest.digest, branch), TEXT.coveredFiles(digest.paths.length), ...digest.paths.map(TEXT.coveredFile)];
-  const last = approvals.filter((entry) => entry.branch === branch && entry.tree !== undefined).at(-1);
-  if (last === undefined) {
-    lines.push(TEXT.noEarlierApproval);
-  } else if (!treeExists(root, last.tree)) {
-    lines.push(TEXT.earlierTreeGone(last.tree));
-  } else {
-    const earlier = digestOfTree(root, last.tree);
+  const { record, line, notes } = approvalBaseline(root, { tree, branch, approvals });
+  lines.push(...notes, line);
+  if (record !== null) {
+    const earlier = digestOfTree(root, record.tree);
     const paths = [...new Set([...digest.paths, ...(earlier.paths ?? [])])].sort();
-    const diff = git(root, ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--end-of-options', last.tree, tree, '--', ...paths]);
+    const diff = git(root, ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--end-of-options', record.tree, tree, '--', ...paths]);
     if (diff.status !== 0) throw new GitError(gitFailedMessage('show the changes'));
-    lines.push(TEXT.sinceApproval(last.tree, last.approvedAt), diff.stdout === '' ? TEXT.noChange : visible(diff.stdout.replace(/\n$/, '')));
+    lines.push(diff.stdout === '' ? TEXT.noChange : visible(diff.stdout.replace(/\n$/, '')));
+    if (earlier.paths !== undefined) {
+      const before = new Set(earlier.paths);
+      const was = new Map(listEntries(root, record.tree).map((entry) => [entry.path, entry]));
+      const now = new Map(listEntries(root, tree).map((entry) => [entry.path, entry]));
+      const newly = digest.paths.filter((path) => !before.has(path) && was.get(path)?.oid === now.get(path).oid && was.get(path)?.mode === now.get(path).mode);
+      if (newly.length > 0) lines.push(TEXT.newlyCovered(newly));
+    }
   }
   if (approvals.some((entry) => entry.digest === digest.digest)) lines.push(TEXT.alreadyApproved);
   return lines;
@@ -656,14 +807,13 @@ function approve(root) {
   process.stdout.write(TEXT.prompt);
   const answer = readAnswer();
   process.stdout.write('\n');
-  if (answer === null) return refusal(TEXT.noAnswer, COMMANDS.approve);
-  if (answer !== 'approve') return refusal(TEXT.notApproved, COMMANDS.approve);
+  if (answer === null) return refusal(TEXT.noAnswer, ownerCommand(root, 'approve'));
+  if (answer !== 'approve') return refusal(TEXT.notApproved, ownerCommand(root, 'approve'));
   refreshBin(root, tree);
-  // Read and written together; no lock (see the header).
-  const approvals = readApprovals(root);
-  if (!approvals.some((entry) => entry.digest === digest.digest)) {
-    writeState(root, 'approvals.json', { digests: [...approvals, { digest: digest.digest, tree, approvedAt: new Date().toISOString(), branch }] });
-  }
+  // Read and written together; no lock (see the header). A digest approved again moves to the end
+  // with this tree, so the last record is always the tree bin/ was refreshed from.
+  const others = readApprovals(root).filter((entry) => entry.digest !== digest.digest);
+  writeState(root, 'approvals.json', { digests: [...others, { digest: digest.digest, tree, approvedAt: new Date().toISOString(), branch }] });
   closeProposal(root, realpathSync(root));
   removeStaleInflight(root);
   print([TEXT.approved(digest.digest, tree), nextLine(TEXT.approvedNext)]);
@@ -672,14 +822,15 @@ function approve(root) {
 
 function propose(root) {
   const path = realpathSync(root);
+  const next = nextLine(ownerCommand(root, 'approve'));
   // Read and written together; no lock (see the header).
   const open = readProposals(root);
   if (open.includes(path)) {
-    print([TEXT.alreadyProposed(path), nextLine(COMMANDS.approve)]);
+    print([TEXT.alreadyProposed(path), next]);
     return 0;
   }
   writeState(root, 'proposals.json', { worktrees: [...open, path] });
-  print([TEXT.proposed(path), nextLine(COMMANDS.approve)]);
+  print([TEXT.proposed(path), next]);
   return 0;
 }
 
@@ -694,9 +845,12 @@ function waive(root, { rule, reason }) {
   return 0;
 }
 
+// A branch's short name as git accepts it: not an option, not `@`, not a refs/ path (an exemption
+// is matched against the short name), and unchanged by git check-ref-format --branch (which would
+// turn @{-1} into the branch it names).
 function branchName(root, name) {
   const checked = git(root, ['check-ref-format', '--branch', name]);
-  if (name.startsWith('-') || checked.status !== 0 || checked.stdout.replace(/\n$/, '') !== name) throw new UsageError(TEXT.badBranch(name));
+  if (name.startsWith('-') || name === '@' || name.startsWith('refs/') || checked.status !== 0 || checked.stdout.replace(/\n$/, '') !== name) throw new UsageError(TEXT.badBranch(name));
   return name;
 }
 
@@ -724,7 +878,8 @@ function unexempt(root, { branch }) {
 
 function off(root) {
   switchOff(root);
-  print([TEXT.off, nextLine(COMMANDS.on)]);
+  const onCommand = ownerCommand(root, 'on');
+  print([TEXT.off(onCommand), nextLine(onCommand)]);
   return 0;
 }
 
@@ -776,7 +931,14 @@ function parse(command, words) {
   return { operands, flags, reason: spec.reason ? cleanReason(command, reason) : undefined };
 }
 
-async function dispatch(argv, env, cwd) {
+// The next line of the session refusal: the approved copy's command when the repository can be
+// found, the working copy's otherwise (there is then no shared state to name).
+function ownerNext(command) {
+  const root = repoRoot(process.cwd());
+  return `${root === null ? `${KO} ${command}` : ownerCommand(root, command)}, in the owner's own terminal`;
+}
+
+async function dispatch(argv) {
   if (argv.includes('--help') || argv.includes('-h')) {
     process.stdout.write(USAGE);
     return 0;
@@ -784,23 +946,25 @@ async function dispatch(argv, env, cwd) {
   const [command, ...words] = argv;
   if (command === undefined) throw new UsageError(TEXT.noCommand);
   if (!Object.hasOwn(SPECS, command)) throw new UsageError(TEXT.unknownCommand(command));
-  if (SPECS[command].owner) {
-    const variable = OWNER_VARIABLES.find((name) => env[name] !== undefined);
-    if (variable !== undefined) return refusal(TEXT.ownerOnly(command, variable), `${KO} ${command}, in the owner's own terminal`);
+  const isOwners = SPECS[command].owner === true;
+  if (isOwners) {
+    // This process's own environment, never one passed in (after Task 7's review).
+    const variable = OWNER_VARIABLES.find((name) => process.env[name] !== undefined);
+    if (variable !== undefined) return refusal(TEXT.ownerOnly(command, variable), ownerNext(command));
   }
   const { operands, flags, reason } = parse(command, words);
-  const root = repoRoot(cwd);
+  if (command === 'waive' && !RULE_ID.test(operands[0])) throw new UsageError(TEXT.badRule(operands[0]));
+  const root = repoRoot(process.cwd());
   if (root === null) return refusal(TEXT.notARepository, `cd <the repository> && ${KO} ${command}`);
+  if (isOwners && !fromApprovedCopy(root)) return refusal(TEXT.notFromBin(command), ownerCommand(root, argv.map(shellWord).join(' ')));
   switch (command) {
-    case 'run': return run(root, env);
+    case 'run': return run(root);
     case 'status': return status(root, { json: flags.has('--json') });
     case 'verify-branch': return verifyBranch(root, { noRun: flags.has('--no-run') });
     case 'unexempt': return unexempt(root, { branch: operands[0] });
     case 'approve': return approve(root);
     case 'propose': return propose(root);
-    case 'waive':
-      if (!RULE_ID.test(operands[0])) throw new UsageError(TEXT.badRule(operands[0]));
-      return waive(root, { rule: operands[0], reason });
+    case 'waive': return waive(root, { rule: operands[0], reason });
     case 'exempt': return exempt(root, { branch: operands[0], reason });
     case 'off': return off(root);
     default: return on(root);
@@ -808,12 +972,13 @@ async function dispatch(argv, env, cwd) {
 }
 
 /**
- * Runs one ko.mjs command and returns its exit code: 0 done, 1 refused or failing, 2 usage.
- * Never throws: a failure is printed as fixed text and is exit 1.
+ * Runs one ko.mjs command, `argv` as typed after `ko.mjs`, in this process's working directory and
+ * environment, and returns its exit code: 0 done, 1 refused or failing, 2 usage. Never throws: a
+ * failure is printed as fixed text and is exit 1.
  */
-export async function main(argv, { env = process.env, cwd = process.cwd() } = {}) {
+export async function main(argv) {
   try {
-    return await dispatch(argv, env, cwd);
+    return await dispatch(argv);
   } catch (error) {
     if (error instanceof UsageError) {
       process.stderr.write(`kh-orchestration: ${error.message}\n${USAGE}`);

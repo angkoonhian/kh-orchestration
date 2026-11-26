@@ -3,18 +3,20 @@
 // tests about them. Every refusal's exact text is asserted.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { KH_HARNESS_DIR, KIT_VERSION, installGate, testEnv } from './test-repo.mjs';
-import { commit, gitIn, head, installed, ko, stage } from './gate-fixture.mjs';
+import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
+import { commit, gitIn, head, installed, ko, owner, stage } from './gate-fixture.mjs';
 import { TEXT, USAGE } from '../../assets/scripts/ko-cli.mjs';
-import { COMMANDS } from '../../assets/scripts/extension.mjs';
+import { COMMANDS, shellWord } from '../../assets/scripts/extension.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, headBaseOf, indexTree } from '../../assets/scripts/ko-git.mjs';
-import { corruptMessage, readApprovals, readProposals, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
+import { corruptMessage, ownerCommand, readAccepted, readApprovals, readProposals, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { readVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 const refusalText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
@@ -35,7 +37,7 @@ function stateSnapshot(root) {
   return Object.fromEntries(walk(''));
 }
 
-const approveAnswer = (root, extra = {}) => ko(root, ['approve'], { input: 'approve\n', ...extra });
+const approveAnswer = (root, extra = {}) => owner(root, ['approve'], { input: 'approve\n', ...extra });
 // `run` then `approve` as the owner does them, then a commit through the hooks.
 function runApproveCommit(repo, message = 'work') {
   assert.equal(ko(repo.root, ['run']).status, 0);
@@ -112,7 +114,7 @@ test('run writes a verdict for the index tree, appends the journal and reports e
   const digest = digestOfTree(repo.root, tree).digest;
   assert.equal(out[0], TEXT.runHeader(tree, base));
   assert.match(out[1], /^ {2}check {2}pass {2}\d+\.\d s$/);
-  assert.deepEqual(out.slice(2), [TEXT.agentChanges([]), TEXT.passingUnapproved(digest), `Next: ${COMMANDS.approve}`]);
+  assert.deepEqual(out.slice(2), [TEXT.agentChanges([]), TEXT.passingUnapproved(digest), `Next: ${ownerCommand(repo.root, 'approve')}`]);
   const verdict = readVerdict(repo.root, tree, base);
   assert.deepEqual([verdict.tree, verdict.base, verdict.branch, verdict.digest, verdict.kitVersion, verdict.waivers], [tree, base, 'main', digest, KIT_VERSION, []]);
   const journal = readFileSync(join(stateDir(repo.root), 'journal.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
@@ -287,8 +289,8 @@ test('every owner-only command refuses with fixed text when CLAUDECODE or CLAUDE
   const before = stateSnapshot(repo.root);
   for (const variable of ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID']) {
     for (const args of [...OWNER_COMMANDS, ['waive']]) {
-      const result = ko(repo.root, args, { env: { ...testEnv(), [variable]: variable === 'CLAUDECODE' ? '1' : 'abc' }, input: 'approve\n' });
-      assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.ownerOnly(args[0], variable), `${KO} ${args[0]}, in the owner's own terminal`)], `${variable} ${args.join(' ')}`);
+      const result = owner(repo.root, args, { env: { ...testEnv(), [variable]: variable === 'CLAUDECODE' ? '1' : 'abc' }, input: 'approve\n' });
+      assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.ownerOnly(args[0], variable), `${ownerCommand(repo.root, args[0])}, in the owner's own terminal`)], `${variable} ${args.join(' ')}`);
     }
   }
   assert.deepEqual(stateSnapshot(repo.root), before);
@@ -296,7 +298,7 @@ test('every owner-only command refuses with fixed text when CLAUDECODE or CLAUDE
     TEXT.ownerOnly('approve', 'CLAUDECODE'),
     'ko.mjs approve is the owner\'s to run in their own terminal, outside Claude Code: CLAUDECODE is set here, so this is a Claude Code session. Nothing was changed.',
   );
-  const empty = ko(repo.root, ['off'], { env: { ...testEnv(), CLAUDECODE: '' } });
+  const empty = owner(repo.root, ['off'], { env: { ...testEnv(), CLAUDECODE: '' } });
   assert.equal(empty.status, 1, 'set to the empty string is still set');
 });
 
@@ -306,8 +308,8 @@ test('approve shows the covered files, reads the word approve, records the index
   writeState(repo.root, 'proposals.json', { worktrees: [realpathSync(side), realpathSync(repo.root)] });
   writeFileSync(join(stateDir(repo.root), 'bin', 'stale.mjs'), 'from an older kit\n');
   const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
-  writeInflight(repo.root, dead, indexTree(repo.root));
-  writeInflight(repo.root, String(process.pid), indexTree(repo.root));
+  writeInflight(repo.root, dead, { tree: indexTree(repo.root), base: 'none' });
+  writeInflight(repo.root, String(process.pid), { tree: indexTree(repo.root), base: 'none' });
   const tree = indexTree(repo.root);
   const digest = digestOfTree(repo.root, tree);
   const result = approveAnswer(repo.root);
@@ -338,13 +340,13 @@ test('approve with any other answer, or no answer, records nothing and leaves bi
     [{ input: 'no\n' }, TEXT.notApproved], [{ input: 'approve please\n' }, TEXT.notApproved], [{ input: ' approve\n' }, TEXT.notApproved],
     [{ input: '' }, TEXT.noAnswer], [{ closedStdin: true }, TEXT.noAnswer],
   ]) {
-    const result = ko(repo.root, ['approve'], options);
-    assert.deepEqual([result.status, result.stderr], [1, refusalText(reason, COMMANDS.approve)], JSON.stringify(options));
+    const result = owner(repo.root, ['approve'], options);
+    assert.deepEqual([result.status, result.stderr], [1, refusalText(reason, ownerCommand(repo.root, 'approve'))], JSON.stringify(options));
     assert.ok(result.stdout.endsWith(`${TEXT.prompt}\n`));
   }
   assert.deepEqual(stateSnapshot(repo.root), before);
   assert.equal(TEXT.notApproved, 'Nothing was approved: the answer was not the word approve.');
-  const crlf = ko(repo.root, ['approve'], { input: 'approve\r\n' });
+  const crlf = owner(repo.root, ['approve'], { input: 'approve\r\n' });
   assert.equal(crlf.status, 0, 'a terminal\'s CR before the newline is not part of the answer');
 });
 
@@ -359,7 +361,7 @@ test('approve shows the diff of the covered files against the last approved tree
   repo.write('tools/check.mjs', 'an unstaged change approve must not show\n');
   const result = approveAnswer(repo.root);
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(result.stdout.includes(`${TEXT.sinceApproval(earlier, approvedAt)}\n`));
+  assert.ok(result.stdout.includes(`${TEXT.baselineBranch(earlier, approvedAt)}\n`));
   assert.ok(result.stdout.includes('+// hidden\\u{1b}[8m text'), result.stdout);
   assert.equal(result.stdout.includes('a.txt'), false);
   assert.equal(result.stdout.includes('an unstaged change'), false);
@@ -383,7 +385,7 @@ test('approve refuses a staged tree whose protected files cannot be digested, na
   repo.write('docs/harness/RULES.md', '# Rules\n\n## R1 — one\n\n## R1 — two\n');
   stage(repo);
   const problem = digestOfTree(repo.root, indexTree(repo.root)).problem;
-  const result = ko(repo.root, ['approve'], { input: 'approve\n' });
+  const result = owner(repo.root, ['approve'], { input: 'approve\n' });
   assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.approveUndigestable(problem), COMMANDS.status)]);
   assert.deepEqual(readApprovals(repo.root), []);
 });
@@ -404,12 +406,12 @@ test('approve\'s refreshed bin/ is what the next hook runs: a changed gate in th
 test('propose opens only the worktree it is run in, by its real path, and says so again when it is open', () => {
   const repo = installed();
   const side = repo.addWorktree('side');
-  const first = ko(repo.root, ['propose']);
-  assert.deepEqual([first.status, first.stdout], [0, `${TEXT.proposed(realpathSync(repo.root))}\nNext: ${COMMANDS.approve}\n`]);
+  const first = owner(repo.root, ['propose']);
+  assert.deepEqual([first.status, first.stdout], [0, `${TEXT.proposed(realpathSync(repo.root))}\nNext: ${ownerCommand(repo.root, 'approve')}\n`]);
   assert.deepEqual(readProposals(repo.root), [realpathSync(repo.root)]);
-  const second = ko(repo.root, ['propose'], { cwd: join(repo.root, 'tools') });
-  assert.deepEqual([second.status, second.stdout], [0, `${TEXT.alreadyProposed(realpathSync(repo.root))}\nNext: ${COMMANDS.approve}\n`]);
-  assert.equal(ko(repo.root, ['propose'], { cwd: side }).status, 0);
+  const second = owner(repo.root, ['propose'], { cwd: join(repo.root, 'tools') });
+  assert.deepEqual([second.status, second.stdout], [0, `${TEXT.alreadyProposed(realpathSync(repo.root))}\nNext: ${ownerCommand(repo.root, 'approve')}\n`]);
+  assert.equal(owner(repo.root, ['propose'], { cwd: side }).status, 0);
   assert.deepEqual(readProposals(repo.root), [realpathSync(repo.root), realpathSync(side)]);
 });
 
@@ -424,27 +426,27 @@ test('waive needs a rule id and a reason, applies to the current branch, strips 
     assert.deepEqual([result.status, result.stderr], [2, usageText(reason)], args.join(' '));
   }
   assert.equal(TEXT.reasonMissing('waive'), 'waive needs --reason <text>, saying why in a few words.');
-  const result = ko(repo.root, ['waive', 'V8', '--reason', 'docs\u001b[2J follow\nnext week']);
+  const result = owner(repo.root, ['waive', 'V8', '--reason', 'docs\u001b[2J follow\nnext week']);
   assert.equal(result.status, 0, result.stderr);
   const [waiver] = JSON.parse(readFileSync(join(stateDir(repo.root), 'waivers.json'), 'utf8')).waivers;
   assert.deepEqual({ ...waiver, at: 'x' }, { rule: 'V8', branch: 'main', reason: 'docs[2J follownext week', at: 'x' });
   assert.equal(result.stdout, `${TEXT.waived('V8', 'main')}\n${TEXT.waivers('main', [waiver])}\nNext: ${COMMANDS.run}\n`);
-  assert.equal(ko(repo.root, ['waive', 'V8', '--reason=later']).status, 0);
+  assert.equal(owner(repo.root, ['waive', 'V8', '--reason=later']).status, 0);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'waivers.json'), 'utf8')).waivers.map((entry) => entry.reason), ['later']);
 
   assert.equal(gitIn(repo.root, ['checkout', '-q', '--detach']).status, 0);
-  const detached = ko(repo.root, ['waive', 'V8', '--reason', 'r']);
+  const detached = owner(repo.root, ['waive', 'V8', '--reason', 'r']);
   assert.deepEqual([detached.status, detached.stderr], [1, refusalText(TEXT.waiveDetached, 'git switch <branch>')]);
 });
 
 test('exempt needs a branch name git accepts and a reason; unexempt is not owner-only and ends the exemption', () => {
   const repo = installed();
   for (const name of ['a..b', '@{-1}', 'x.lock', 'HEAD~1']) {
-    const result = ko(repo.root, ['exempt', name, '--reason', 'r']);
+    const result = owner(repo.root, ['exempt', name, '--reason', 'r']);
     assert.deepEqual([result.status, result.stderr], [2, usageText(TEXT.badBranch(name))], name);
   }
   assert.equal(ko(repo.root, ['exempt', 'old/feature']).stderr, usageText(TEXT.reasonMissing('exempt')));
-  const result = ko(repo.root, ['exempt', 'old/feature', '--reason', 'predates the install']);
+  const result = owner(repo.root, ['exempt', 'old/feature', '--reason', 'predates the install']);
   assert.equal(result.status, 0, result.stderr);
   const branches = JSON.parse(readFileSync(join(stateDir(repo.root), 'exemptions.json'), 'utf8')).branches;
   assert.deepEqual(branches.map((entry) => [entry.name, entry.reason]), [['old/feature', 'predates the install']]);
@@ -457,12 +459,13 @@ test('exempt needs a branch name git accepts and a reason; unexempt is not owner
 
 test('off creates the switch and says no commit is checked until on; on removes it', () => {
   const repo = installed();
-  const off = ko(repo.root, ['off']);
-  assert.deepEqual([off.status, off.stdout], [0, `${TEXT.off}\nNext: ${COMMANDS.on}\n`]);
+  const off = owner(repo.root, ['off']);
+  const onCommand = ownerCommand(repo.root, 'on');
+  assert.deepEqual([off.status, off.stdout], [0, `${TEXT.off(onCommand)}\nNext: ${onCommand}\n`]);
   assert.ok(existsSync(join(stateDir(repo.root), 'off')));
-  assert.equal(TEXT.off, `kh-orchestration is switched off for this repository: no commit is checked until it is switched on with ${COMMANDS.on}.`);
+  assert.equal(TEXT.off(onCommand), `kh-orchestration is switched off for this repository: no commit is checked until it is switched on with ${onCommand}.`);
   assert.equal(commit(repo.root).status, 0, 'with the switch off a commit goes through unchecked');
-  const on = ko(repo.root, ['on']);
+  const on = owner(repo.root, ['on']);
   assert.deepEqual([on.status, on.stdout], [0, `${TEXT.on}\nNext: ${COMMANDS.status}\n`]);
   assert.equal(existsSync(join(stateDir(repo.root), 'off')), false);
 });
@@ -477,31 +480,33 @@ const statusJson = (root, options) => {
 const problemTexts = (status) => status.problems.map((problem) => problem.text);
 const hookProblemsOf = (status) => status.problems.filter((problem) => /^The (?:pre-commit|pre-merge-commit|reference-transaction) hook /.test(problem.text));
 
-test('status --json of a fresh install: the brief\'s fields and the rest, nothing approved, HEAD\'s tree committed without the gate', () => {
+test('status --json of a fresh install: the brief\'s fields and the rest, nothing approved, no record of HEAD\'s commit passing the gate', () => {
   const repo = installed();
   const status = statusJson(repo.root);
   const tree = indexTree(repo.root);
   const digest = digestOfTree(repo.root, tree).digest;
   assert.deepEqual(Object.keys(status), [
     'off', 'branch', 'base', 'tree', 'digestApproved', 'verdict', 'openForProposals', 'exemptions', 'waivers',
-    'headTree', 'headBase', 'headVerdict', 'install', 'contract', 'liveFiles', 'digest', 'inflight', 'hooks', 'hooksPath', 'git', 'problems',
+    'headTree', 'headBase', 'headAccepted', 'headVerdict', 'install', 'contract', 'liveFiles', 'digest', 'inflight', 'bin', 'hooks', 'hooksPath', 'git', 'problems',
   ]);
   assert.deepEqual(
     [status.off, status.branch, status.base, status.tree, status.digestApproved, status.verdict, status.openForProposals, status.exemptions, status.waivers],
     [false, 'main', head(repo.root), tree, false, 'none', false, [], []],
   );
   // The fixture's first commit predates the install: its tree has no officers file, so no base.
-  assert.deepEqual([status.headTree, status.headBase, status.headVerdict], [gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim(), null, 'none']);
+  assert.deepEqual([status.headTree, status.headBase, status.headAccepted, status.headVerdict], [gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim(), null, false, 'none']);
   assert.deepEqual([status.install, status.contract, status.liveFiles, status.digest], [{ present: true, problem: null }, { ok: true, problems: [] }, { equal: true, reason: null, next: null }, digest]);
   assert.deepEqual(status.inflight, { live: [], stale: [] });
-  assert.deepEqual(status.hooks.map((hook) => [hook.name, hook.present, hook.ours, hook.executable, hook.envExists, hook.node, hook.nodeExists]), [
-    ['pre-commit', true, true, true, true, process.execPath, true], ['pre-merge-commit', true, true, true, true, process.execPath, true], ['reference-transaction', true, true, true, true, process.execPath, true],
+  assert.deepEqual(status.hooks.map((hook) => [hook.name, hook.present, hook.ours, hook.matches, hook.executable, hook.envExists, hook.node, hook.nodeExists]), [
+    ['pre-commit', true, true, true, true, true, process.execPath, true], ['pre-merge-commit', true, true, true, true, true, process.execPath, true],
+    ['reference-transaction', true, true, true, true, true, process.execPath, true],
   ]);
+  assert.deepEqual(status.bin, { present: true, gate: true, baseline: { kind: 'working', tree: null }, differs: [], missing: [], extra: [] });
   assert.equal(status.hooksPath, null);
   assert.equal(status.git.supported, true);
   assert.deepEqual(status.problems, [
-    { text: TEXT.unapproved(digest), next: COMMANDS.approve },
-    { text: TEXT.headUnverdicted(status.headTree, null), next: COMMANDS.verifyBranch },
+    { text: TEXT.unapproved(digest), next: ownerCommand(repo.root, 'approve') },
+    { text: TEXT.headNoRecord(status.headTree, null), next: COMMANDS.verifyBranch },
   ]);
 });
 
@@ -513,7 +518,8 @@ test('status after run, approve and a commit: verdicts passing, nothing wrong; t
   assert.equal(approveAnswer(repo.root).status, 0);
   assert.equal(commit(repo.root).status, 0);
   const status = statusJson(repo.root);
-  assert.deepEqual([status.digestApproved, status.headVerdict, status.headBase, status.problems], [true, 'passing', headBaseOf(repo.root, 'main'), []]);
+  assert.deepEqual([status.digestApproved, status.headAccepted, status.headVerdict, status.headBase, status.problems], [true, true, 'passing', readAccepted(repo.root, head(repo.root)).base, []]);
+  assert.deepEqual(status.bin.baseline, { kind: 'approved', tree: status.headTree });
   const text = ko(repo.root, ['status']);
   assert.equal(text.status, 0);
   assert.deepEqual([lines(text.stdout)[0], lines(text.stdout).at(-1)], [TEXT.statusHeader(repo.root), TEXT.noProblems]);
@@ -542,12 +548,12 @@ test('status shows the switch, proposals, exemptions, this branch\'s waivers and
   writeState(repo.root, 'exemptions.json', { branches: exemptions });
   writeState(repo.root, 'waivers.json', { waivers: [{ rule: 'V8', branch: 'main', reason: 'r', at: 'x' }, { rule: 'V9', branch: 'other', reason: 'r', at: 'x' }] });
   const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
-  writeInflight(repo.root, dead, indexTree(repo.root));
-  writeInflight(repo.root, String(process.pid), indexTree(repo.root));
+  writeInflight(repo.root, dead, { tree: indexTree(repo.root), base: 'none' });
+  writeInflight(repo.root, String(process.pid), { tree: indexTree(repo.root), base: 'none' });
   const status = statusJson(repo.root);
   assert.deepEqual([status.off, status.openForProposals, status.exemptions, status.waivers.map((entry) => entry.rule)], [true, true, exemptions, ['V8']]);
   assert.deepEqual(status.inflight, { live: [String(process.pid)], stale: [dead] });
-  assert.deepEqual(status.problems.slice(0, 1), [{ text: TEXT.offProblem, next: COMMANDS.on }]);
+  assert.deepEqual(status.problems.slice(0, 1), [{ text: TEXT.offProblem(ownerCommand(repo.root, 'on')), next: ownerCommand(repo.root, 'on') }]);
   assert.ok(status.problems.some((problem) => problem.text === TEXT.staleInflight([dead])));
   assert.ok(existsSync(join(stateDir(repo.root), `inflight-${dead}.json`)), 'status removes nothing');
 });
@@ -595,17 +601,22 @@ test('status reports the staged tree without an install, with an unusable office
   assert.ok(rules.problems.some((problem) => problem.text === TEXT.undigestable(digestOfTree(repo.root, indexTree(repo.root)).problem)));
 });
 
-test('status reports a missing pre-commit hook and one of ours that no longer starts env and Node as written', () => {
+test('status reports a missing pre-commit hook, and one of ours whose text is not exactly what this kit writes for the paths it names', () => {
   const repo = installed();
   const hooks = join(repo.root, '.git', 'hooks');
   rmSync(join(hooks, 'pre-commit'));
   const ours = readFileSync(join(hooks, 'pre-merge-commit'), 'utf8').split('\n');
   writeFileSync(join(hooks, 'pre-merge-commit'), `${ours.slice(0, 2).join('\n')}\nexit 0\n`);
+  const race = readFileSync(join(hooks, 'reference-transaction'), 'utf8');
+  writeFileSync(join(hooks, 'reference-transaction'), race.replace("case $out in 'kh-orchestration: allowed') exit 0 ;; esac", 'exit 0'));
   const apply = `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
-  assert.deepEqual(hookProblemsOf(statusJson(repo.root)), [
+  const status = statusJson(repo.root);
+  assert.deepEqual(hookProblemsOf(status), [
     { text: TEXT.hookMissing('pre-commit', join(hooks, 'pre-commit')), next: apply },
-    { text: TEXT.hookUnreadable('pre-merge-commit', join(hooks, 'pre-merge-commit')), next: apply },
+    { text: TEXT.hookDiffers('pre-merge-commit', join(hooks, 'pre-merge-commit')), next: apply },
+    { text: TEXT.hookDiffers('reference-transaction', join(hooks, 'reference-transaction')), next: apply },
   ]);
+  assert.deepEqual(status.hooks.map((hook) => [hook.ours, hook.matches]), [[false, false], [true, false], [true, false]]);
 });
 
 test('status reports a git older than 2.30, and one whose version cannot be read', () => {
@@ -705,8 +716,8 @@ test('verify-branch lists the exemption, the waivers and every agent rule change
   repo.write('docs/harness/RULES.md', rules('second wording'));
   stage(repo);
   runApproveCommit(repo, 'reworded');
-  assert.equal(ko(repo.root, ['waive', 'V8', '--reason', 'docs follow']).status, 0);
-  assert.equal(ko(repo.root, ['exempt', 'feature', '--reason', 'trial']).status, 0);
+  assert.equal(owner(repo.root, ['waive', 'V8', '--reason', 'docs follow']).status, 0);
+  assert.equal(owner(repo.root, ['exempt', 'feature', '--reason', 'trial']).status, 0);
   rmSync(join(repo.root, '.git', 'hooks', 'reference-transaction'));
   const result = ko(repo.root, ['verify-branch', '--no-run']);
   assert.equal(result.status, 0, result.stdout);
@@ -714,15 +725,15 @@ test('verify-branch lists the exemption, the waivers and every agent rule change
   const exemption = JSON.parse(readFileSync(join(stateDir(repo.root), 'exemptions.json'), 'utf8')).branches[0];
   const waiver = JSON.parse(readFileSync(join(stateDir(repo.root), 'waivers.json'), 'utf8')).waivers[0];
   assert.deepEqual(out.slice(2), [
-    TEXT.exemption('feature', exemption), TEXT.waivers('feature', [waiver]), TEXT.agentChanges([{ id: 'R1', change: 'reworded' }]), TEXT.noRaceHook, TEXT.verified,
+    TEXT.exemption('feature', exemption), TEXT.waivers('feature', [waiver]), TEXT.agentChanges([{ id: 'R1', change: 'reworded' }]), TEXT.headRecorded, TEXT.noRaceHook, TEXT.verified,
   ]);
   assert.equal(TEXT.agentChanges([{ id: 'R1' }]), 'Rules marked approval: agent reworded since the base: R1.');
 });
 
 test('verify-branch is not passed by the off switch or an exemption: they decide nothing about whether HEAD\'s tree passed', () => {
   const repo = installed();
-  assert.equal(ko(repo.root, ['off']).status, 0);
-  assert.equal(ko(repo.root, ['exempt', 'main', '--reason', 'r']).status, 0);
+  assert.equal(owner(repo.root, ['off']).status, 0);
+  assert.equal(owner(repo.root, ['exempt', 'main', '--reason', 'r']).status, 0);
   const result = ko(repo.root, ['verify-branch', '--no-run']);
   assert.equal(result.status, 1);
   assert.equal(lines(result.stdout).at(-2), TEXT.notVerified(REASONS.noInstall(REASONS.officersAbsent)), 'the initial commit holds no install');
@@ -743,4 +754,272 @@ test('verify-branch on an unborn HEAD has nothing to verify', () => {
   assert.equal(gitIn(repo.root, ['checkout', '-q', '--orphan', 'fresh']).status, 0);
   const result = ko(repo.root, ['verify-branch', '--no-run']);
   assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.noHead, COMMANDS.run)]);
+});
+
+// ---- after Task 7's review ----
+
+test('I1: the owner check reads the process environment; main given an empty env still refuses in a session, from either copy', () => {
+  const repo = installed();
+  for (const script of [join(repo.root, '.claude/kh-orchestration/scripts/ko-cli.mjs'), join(stateDir(repo.root), 'bin', 'ko-cli.mjs')]) {
+    const code = `const m = await import(${JSON.stringify(pathToFileURL(script).href)}); process.exitCode = await m.main(['off'], { env: {} });`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: repo.root, env: { ...testEnv(), CLAUDECODE: '1' }, encoding: 'utf8' });
+    assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.ownerOnly('off', 'CLAUDECODE'), `${ownerCommand(repo.root, 'off')}, in the owner's own terminal`)], script);
+    assert.equal(existsSync(join(stateDir(repo.root), 'off')), false);
+  }
+});
+
+test('I1: an owner command run from the working copy refuses, naming the approved copy with its words; nothing changes', () => {
+  const repo = installed();
+  const before = stateSnapshot(repo.root);
+  for (const args of [...OWNER_COMMANDS, ['exempt', 'old feature', '--reason', 'it\'s old']]) {
+    const result = ko(repo.root, args, { input: 'approve\n' });
+    const next = ownerCommand(repo.root, args.map(shellWord).join(' '));
+    assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.notFromBin(args[0]), next)], args.join(' '));
+  }
+  assert.deepEqual(stateSnapshot(repo.root), before);
+  assert.equal(
+    TEXT.notFromBin('approve'),
+    'ko.mjs approve acts only from the approved copy in the shared state, not from the working copy, whose scripts a session can change. Nothing was changed.',
+  );
+  assert.equal(owner(repo.root, ['off']).status, 0, 'from bin/ it acts');
+});
+
+// A change staged, the officers run, and a commit through the hooks.
+function gated(repo, message, file) {
+  if (file !== undefined) repo.write(file, `${message}\n`);
+  stage(repo);
+  assert.equal(ko(repo.root, ['run']).status, 0, message);
+  const committed = gitIn(repo.root, ['commit', '-q', '-m', message]);
+  assert.equal(committed.status, 0, committed.stderr);
+}
+// What status and verify-branch --no-run say of HEAD's commit.
+function assertAccepted(repo, label) {
+  const status = statusJson(repo.root);
+  assert.deepEqual([status.headAccepted, status.headVerdict], [true, 'passing'], `${label}: ${JSON.stringify(status.problems)}`);
+  assert.equal(status.headBase, readAccepted(repo.root, gitIn(repo.root, ['rev-parse', 'HEAD']).stdout.trim()).base, label);
+  const verified = ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(verified.status, 0, `${label}: ${verified.stdout}`);
+  assert.ok(lines(verified.stdout).includes(TEXT.headRecorded), label);
+}
+
+test('I2: a merge of main concluded on a feature branch, an amend on main, and a branch main was fast-forwarded to are each found accepted', () => {
+  const repo = installed();
+  assert.equal(approveAnswer(repo.root).status, 0);
+  gated(repo, 'install');
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'feature']).status, 0);
+  gated(repo, 'f1', 'f1.txt');
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'main']).status, 0);
+  gated(repo, 'm2', 'm2.txt');
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'feature']).status, 0);
+  assert.equal(gitIn(repo.root, ['merge', '-q', '--no-commit', 'main']).status, 0);
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  assert.equal(gitIn(repo.root, ['commit', '-q', '--no-edit']).status, 0);
+  assert.notEqual(headBaseOf(repo.root, 'main'), readAccepted(repo.root, head(repo.root)).base, 'the computed base is not the one the gate used');
+  assertAccepted(repo, 'merge of main concluded on feature');
+
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'main']).status, 0);
+  repo.write('m3.txt', 'm3\n');
+  stage(repo);
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  assert.equal(gitIn(repo.root, ['commit', '-q', '--amend', '--no-edit']).status, 0);
+  assertAccepted(repo, 'amend on main');
+
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'am']).status, 0);
+  gated(repo, 'a1', 'a1.txt');
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'main']).status, 0);
+  assert.equal(gitIn(repo.root, ['merge', '-q', '--ff-only', 'am']).status, 0);
+  assertAccepted(repo, 'main fast-forwarded to am');
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'am']).status, 0);
+  assertAccepted(repo, 'am after main was fast-forwarded to it');
+});
+
+test('I2: a commit git never hooked has no record: status and verify-branch say so, judging it against the computed base, never asserting it bypassed the gate', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  repo.write('b.txt', 'b\n');
+  stage(repo);
+  assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'unhooked']).status, 0);
+  const tree = gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
+  const base = headBaseOf(repo.root, 'main');
+  const status = statusJson(repo.root);
+  assert.deepEqual([status.headAccepted, status.headBase, status.headVerdict], [false, base, 'none']);
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.headNoRecord(tree, base) && problem.next === COMMANDS.verifyBranch));
+  assert.equal(
+    TEXT.headNoRecord('a'.repeat(40), 'b'.repeat(40)),
+    'There is no record of HEAD\'s commit passing the gate and no passing verdict for its tree (aaaaaaaaaaaa) against its base (bbbbbbbbbbbb): it predates the install, or git never ran the hooks for it (a rebase, a cherry-pick or the like). Run verify-branch before merging.',
+  );
+  assert.equal(JSON.stringify(status).includes('committed without'), false);
+  const verified = ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(verified.status, 1);
+  assert.ok(lines(verified.stdout).includes(TEXT.headNotRecorded));
+  assert.equal(lines(verified.stdout).at(-2), TEXT.notVerified(REASONS.noVerdict(tree, base)));
+});
+
+test('I3: status reports a bin/ file that differs from the last approved tree, one too many, a missing gate.mjs and a missing bin/, naming the baseline and apply as the repair', () => {
+  const repo = installed();
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const tree = indexTree(repo.root);
+  const bin = join(stateDir(repo.root), 'bin');
+  const binProblems = (status) => status.problems.filter((problem) => problem.text.includes('bin/'));
+  assert.deepEqual(binProblems(statusJson(repo.root)), []);
+  writeFileSync(join(bin, 'ko-gate.mjs'), `${readFileSync(join(bin, 'ko-gate.mjs'), 'utf8')}// changed\n`);
+  writeFileSync(join(bin, 'stray.mjs'), 'export {};\n');
+  const approve = `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
+  const changed = statusJson(repo.root);
+  assert.deepEqual(changed.bin, { present: true, gate: true, baseline: { kind: 'approved', tree }, differs: ['ko-gate.mjs'], missing: [], extra: ['stray.mjs'] });
+  assert.deepEqual(binProblems(changed), [{ text: TEXT.binDiffers(bin, TEXT.binBaselineApproved(tree), ['ko-gate.mjs', 'stray.mjs']), next: approve }]);
+  rmSync(join(bin, 'gate.mjs'));
+  assert.deepEqual(binProblems(statusJson(repo.root))[0], { text: TEXT.binNoGate(bin), next: approve });
+  rmSync(bin, { recursive: true });
+  const gone = statusJson(repo.root);
+  assert.deepEqual([gone.bin.present, binProblems(gone)], [false, [{ text: TEXT.binMissing(bin), next: approve }]]);
+});
+
+test('I3: before any approval bin/ is compared with the working copy\'s installed scripts, and status says so', () => {
+  const repo = installed();
+  const script = join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs');
+  writeFileSync(script, `${readFileSync(script, 'utf8')}// unstaged\n`);
+  const bin = join(stateDir(repo.root), 'bin');
+  const status = statusJson(repo.root);
+  assert.deepEqual(status.bin, { present: true, gate: true, baseline: { kind: 'working', tree: null }, differs: ['ko-git.mjs'], missing: [], extra: [] });
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.binDiffers(bin, TEXT.binBaselineWorking, ['ko-git.mjs'])));
+});
+
+test('I4: approve on a new branch diffs against the approved tree whose digest is the merge base\'s, and says which baseline it used', () => {
+  const repo = installed();
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const approvedTree = indexTree(repo.root);
+  const at = readApprovals(repo.root)[0].approvedAt;
+  gated(repo, 'install');
+  const fork = head(repo.root);
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'feature']).status, 0);
+  repo.write('tools/check.mjs', `${readFileSync(join(repo.root, 'tools/check.mjs'), 'utf8')}// on the feature branch\n`);
+  stage(repo);
+  const result = approveAnswer(repo.root, { input: 'no\n' });
+  assert.ok(result.stdout.includes(`${TEXT.baselineMergeBase(approvedTree, at, fork)}\n`), result.stdout);
+  assert.ok(result.stdout.includes('+// on the feature branch'));
+});
+
+test('I4: approve falls back to the most recent approved tree of any branch, and lists files newly covered though unchanged', () => {
+  const repo = installed();
+  repo.write('docs/x.txt', 'unchanged doc\n');
+  stage(repo);
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const approvedTree = indexTree(repo.root);
+  const at = readApprovals(repo.root)[0].approvedAt;
+  assert.equal(gitIn(repo.root, ['switch', '-q', '-c', 'other']).status, 0);
+  const officers = JSON.parse(readFileSync(join(repo.root, '.claude/kh-orchestration/officers.json'), 'utf8'));
+  repo.write('.claude/kh-orchestration/officers.json', `${JSON.stringify({ ...officers, protected: ['docs/x.txt'] }, null, 2)}\n`);
+  stage(repo);
+  const result = approveAnswer(repo.root, { input: 'no\n' });
+  assert.ok(result.stdout.includes(`${TEXT.baselineAny(approvedTree, at, 'main')}\n`), result.stdout);
+  assert.ok(result.stdout.includes(`${TEXT.newlyCovered(['docs/x.txt'])}\n`));
+  assert.ok(result.stdout.includes('+  "protected": ['), 'the officers file\'s own change is in the diff');
+  assert.equal(TEXT.newlyCovered(['a', 'b']), 'Newly covered, their content unchanged since that tree: a, b.');
+});
+
+test('approving a digest again moves its record to the end, with this tree: the last record is what bin/ holds', () => {
+  const repo = installed();
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const first = readApprovals(repo.root)[0];
+  const original = readFileSync(join(repo.root, 'tools/check.mjs'), 'utf8');
+  repo.write('tools/check.mjs', `${original}// second\n`);
+  stage(repo);
+  assert.equal(approveAnswer(repo.root).status, 0);
+  repo.write('tools/check.mjs', original);
+  stage(repo);
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const records = readApprovals(repo.root);
+  assert.deepEqual(records.map((record) => record.digest), [records[0].digest, first.digest]);
+  assert.equal(records.at(-1).tree, indexTree(repo.root));
+  assert.deepEqual(statusJson(repo.root).bin.differs, []);
+});
+
+test('M1: status and verify-branch --no-run execute nothing from the repository: checkContract1 alone', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  const marker = join(repo.root, '..', 'dispatcher-ran');
+  const dispatcher = join(repo.root, '.claude/scripts/dispatch-pre-tool.mjs');
+  const text = `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'x');\n`;
+  writeFileSync(dispatcher, text);
+  const contractPath = join(repo.root, '.claude/kh-harness/contract.json');
+  const contract = JSON.parse(readFileSync(contractPath, 'utf8'));
+  contract.files['.claude/scripts/dispatch-pre-tool.mjs'] = lfSha256(Buffer.from(text));
+  writeFileSync(contractPath, `${JSON.stringify(contract, null, 2)}\n`);
+  assert.equal(statusJson(repo.root).contract.ok, true, 'the files agree with each other');
+  ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(existsSync(marker), false);
+});
+
+test('M3: names are shown with invisible characters made visible; exempt refuses refs/heads/ forms and @', () => {
+  const repo = installed();
+  const result = owner(repo.root, ['exempt', '‮main', '--reason', 'r']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(lines(result.stdout)[0], 'The branch \\u{202e}main is exempt: the commit gate lets its commits through unchecked.');
+  for (const name of ['refs/heads/main', '@']) {
+    const refused = owner(repo.root, ['exempt', name, '--reason', 'r']);
+    assert.deepEqual([refused.status, refused.stderr], [2, usageText(TEXT.badBranch(name))], name);
+  }
+});
+
+test('M4: a verdict file that exists but is not a usable record is reported as damaged, naming it, not as none', () => {
+  const repo = installed();
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  const name = `verdicts/${indexTree(repo.root)}-${baseOf(repo.root, 'main')}.json`;
+  writeFileSync(join(stateDir(repo.root), name), '{"schema": 2}\n');
+  const status = statusJson(repo.root);
+  assert.equal(status.verdict, 'damaged');
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.verdictDamaged(name) && problem.next === COMMANDS.run));
+});
+
+test('M5: status lists an exemption of the current branch and a failing verdict for the staged tree among its problems', () => {
+  const repo = installed();
+  repo.write('fail.txt', 'x\n');
+  stage(repo);
+  assert.equal(ko(repo.root, ['run']).status, 1);
+  assert.equal(owner(repo.root, ['exempt', 'main', '--reason', 'trial']).status, 0);
+  const status = statusJson(repo.root);
+  assert.equal(status.verdict, 'failing');
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.indexFailing(['check']) && problem.next === COMMANDS.run));
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.exemptHere('main', 'trial') && problem.next === `${COMMANDS.unexempt} main`));
+});
+
+test('a run killed while its officers run leaves no verdict', async () => {
+  const repo = installed({
+    officers: `${JSON.stringify({ schema: 1, baseBranch: 'main', protected: [], officers: [{ id: 'slow', rule: null, argv: ['node', 'tools/slow.mjs'], appliesTo: ['**'] }] })}\n`,
+  });
+  const ready = join(repo.root, '..', 'slow-ready');
+  repo.write('tools/slow.mjs', `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(ready)}, String(process.pid));\nsetTimeout(() => {}, 30000);\n`);
+  stage(repo);
+  const child = spawn(process.execPath, [join(repo.root, '.claude/kh-orchestration/scripts/ko.mjs'), 'run'], { cwd: repo.root, env: testEnv(), stdio: 'ignore' });
+  while (!existsSync(ready)) await new Promise((resolve) => setTimeout(resolve, 20));
+  child.kill('SIGKILL');
+  await new Promise((resolve) => child.once('exit', resolve));
+  try {
+    process.kill(-Number(readFileSync(ready, 'utf8')), 'SIGKILL');
+  } catch {
+    // the officer's group is gone
+  }
+  assert.equal(existsSync(join(stateDir(repo.root), 'verdicts')), false);
+});
+
+test('status says when the staged tree\'s verdict records other protected files, and when an accepted HEAD\'s verdict is gone', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  const headTreeId = gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
+  const accepted = readAccepted(repo.root, head(repo.root));
+  rmSync(join(stateDir(repo.root), `verdicts/${headTreeId}-${accepted.base}.json`));
+  const gone = statusJson(repo.root);
+  assert.deepEqual([gone.headAccepted, gone.headVerdict], [true, 'none']);
+  assert.ok(gone.problems.some((problem) => problem.text === TEXT.headAcceptedUnverdicted(headTreeId, accepted.base)));
+
+  repo.write('b.txt', 'b\n');
+  stage(repo);
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  const name = `verdicts/${indexTree(repo.root)}-${baseOf(repo.root, 'main')}.json`;
+  const verdict = JSON.parse(readFileSync(join(stateDir(repo.root), name), 'utf8'));
+  writeFileSync(join(stateDir(repo.root), name), JSON.stringify({ ...verdict, digest: 'f'.repeat(64) }));
+  const stale = statusJson(repo.root);
+  assert.equal(stale.verdict, 'failing');
+  assert.ok(stale.problems.some((problem) => problem.text === TEXT.indexStale && problem.next === COMMANDS.run));
 });
