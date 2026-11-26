@@ -23,18 +23,28 @@ What the whole-branch review of stage 1 found, fixed.
 
 ### Changed
 
-- Approvals are ordered. A tree's digest counts when it is approved and
-  either equals its base tree's digest or was last approved after it (a
-  base of `none`, from before the install, or never approved imposes no
-  order). Going back to an older approved version of the rules, the
-  officers file or an officer script needs the owner's approval again;
-  approving a digest again records a new approval at the end of
-  `approvals.json`, and `approve` says when the staged files are such an
-  earlier state. The gate, `verify-branch`, `status` and `run` apply one
-  rule.
+- Approvals are ordered. A tree whose protected files are an older
+  approved version than its base's, or than the commit it is made on, is
+  refused until the owner approves them again: against each of those two
+  digests it must be equal or approved later (one that is `none`, from
+  before the install, or never approved sets no order). Approving a
+  digest again records a new approval at the end of `approvals.json`, and
+  `approve` says when the staged files are such an older version. The
+  gate, `verify-branch` (measuring from `HEAD`'s first parent), `status`
+  and `run` apply one rule. Not caught: a commit git never hooks on the
+  base branch (a revert) moves the point the order is measured from, and
+  a stale branch approved after the base tightened can replace the base's
+  checks through a merge that takes its side (see the README).
 - The gate's next lines name the working copy's `ko.mjs` by its absolute,
   shell-quoted path, so they run pasted from a subdirectory; the
   extension's messages say to run it from the repository's top directory.
+- `verify-branch`, `run` and `status` run from `bin/` name `bin/`'s
+  `ko.mjs` in their next lines; an owner command refused inside a session
+  names the command as typed (`propose --close` keeps `--close`); in a
+  sparse checkout `run` names `git sparse-checkout disable`. While the
+  extension module and its entry disagree, the gate's refusal and
+  `status` name the two-file repair, and apply says the extension is off
+  until it is made.
 - `exempt`, and `status` on a branch without the install, name `unexempt`
   through the approved copy in `bin/`, the one that runs there.
 - `du` is a reading command for the extension (`du -sh .git`).
@@ -52,8 +62,9 @@ What the whole-branch review of stage 1 found, fixed.
   autofixing lint) got a passing verdict for a tree it never passed on.
   `run` and `verify-branch` now check, after the officers, that the tree
   is still tidy and the index still holds the tree judged, and record no
-  verdict otherwise, naming the changed paths. A change made and put back
-  during the run is a stated limit.
+  verdict otherwise, naming the changed paths; and that no officer flagged
+  an index entry assume-unchanged or skip-worktree. A change made and put
+  back during the run is a stated limit.
 - Any earlier approval stayed valid for ever, so restoring an older
   officers file (`git checkout HEAD~1 -- …/officers.json`) passed the
   gate with checks the owner had since made stricter.
