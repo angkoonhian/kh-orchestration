@@ -419,7 +419,8 @@ test('an install whose scripts carry an older version stamp is updated in place,
 
   const planned = plan(repo.root);
   assert.deepEqual(planned.conflicts, []);
-  assert.deepEqual(planned.actions.filter((action) => action.kind === 'file').map((action) => action.detail), SCRIPT_NAMES.map((name) => TEXT.updateScript(`${SCRIPTS_DIR}/${name}`, '0.0.9')));
+  assert.deepEqual(planned.actions.filter((action) => action.kind === 'file').map((action) => action.detail), SCRIPT_NAMES.filter((name) => name !== 'extension.mjs').map((name) => TEXT.updateScript(`${SCRIPTS_DIR}/${name}`, '0.0.9')));
+  assert.deepEqual(planned.actions.filter((action) => action.kind === 'extension-swap').map((action) => action.detail), [TEXT.swapExtension('0.0.9')]);
   applyPlan(repo.root, planned);
   for (const { name, bytes } of shippedScripts()) assert.deepEqual(readFileSync(join(repo.root, SCRIPTS_DIR, name)), bytes, name);
   assert.deepEqual(JSON.parse(read(repo.root, EXTENSIONS_PATH)), [entryOf()]);
@@ -679,7 +680,8 @@ test('an install of a newer kit is a downgrade: refused unless asked for with --
   assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.downgrade('9.9.9'), next: TEXT.askOwner(`${applyCommand(repo.root)} --downgrade`) }]);
   const planned = plan(repo.root, { downgrade: true });
   assert.deepEqual(planned.refusals, []);
-  assert.deepEqual(planned.actions.filter((action) => action.kind === 'file').map((action) => action.detail), SCRIPT_NAMES.map((name) => TEXT.downgradeScript(`${SCRIPTS_DIR}/${name}`, '9.9.9')));
+  assert.deepEqual(planned.actions.filter((action) => action.kind === 'file').map((action) => action.detail), SCRIPT_NAMES.filter((name) => name !== 'extension.mjs').map((name) => TEXT.downgradeScript(`${SCRIPTS_DIR}/${name}`, '9.9.9')));
+  assert.ok(planned.actions.find((action) => action.kind === 'extension-swap').detail.includes('(a downgrade, from kh-orchestration 9.9.9 to'));
   assert.equal(TEXT.downgrade('9.9.9'), `The install here is kh-orchestration 9.9.9, newer than this plugin's ${KIT_VERSION}: applying would replace it with an older kit. Run apply from kh-orchestration 9.9.9 or later, or give --downgrade to mean it.`);
 });
 
@@ -732,4 +734,31 @@ test('a foreign hook hosts the gate only when the line is its first command unde
   }
   assert.equal(TEXT.hostedMisplaced('pre-commit', '/h', 'L'), 'The pre-commit hook at /h holds kh-orchestration\'s line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between:\n    L');
   assert.equal(TEXT.hookConflict('pre-commit', '/h', 'L'), 'The pre-commit hook at /h is not kh-orchestration\'s, so it is not written over. To run the commit gate from it, make its first line #!/bin/sh and put this line directly after it, with only blank or comment lines between:\n    L');
+});
+
+test('an upgrade takes kh-orchestration\'s entry out for one write only: extension.mjs is written between the entry\'s removal and its return (after Task 9\'s re-review)', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  ageInstall(repo.root);
+  const module = join(repo.root, SCRIPTS_DIR, 'extension.mjs');
+  const listed = () => existsSync(join(repo.root, EXTENSIONS_PATH)) && JSON.parse(read(repo.root, EXTENSIONS_PATH)).some((entry) => entry.id === 'kh-orchestration');
+  const absent = [];
+  let writes = 0;
+  applyPlan(repo.root, plan(repo.root), {
+    onWrite: () => {
+      writes += 1;
+      if (!listed()) absent.push({ write: writes, module: sha256(readFileSync(module)) });
+    },
+  });
+  const shipped = sha256(shippedScripts().find((script) => script.name === 'extension.mjs').bytes);
+  assert.equal(absent.length, 2, JSON.stringify(absent));
+  assert.notEqual(absent[0].module, shipped, 'the removal, with the old module');
+  assert.deepEqual(absent[1], { write: absent[0].write + 1, module: shipped }, 'then the new module, and the next write puts the entry back');
+  assert.ok(listed());
+});
+
+test('the text left after uninstall for a hosted line says what that line does for each hook', () => {
+  assert.equal(TEXT.hostedRemains('pre-commit', '/h'), 'The pre-commit hook at /h is not kh-orchestration\'s and is left as it is, but it still holds kh-orchestration\'s line, which refuses every commit once kh-orchestration is gone: remove that line from it by hand.');
+  assert.ok(TEXT.hostedRemains('pre-merge-commit', '/h').includes('refuses every merge commit'));
+  assert.ok(TEXT.hostedRemains('reference-transaction', '/h').includes('starts nothing once no commit is gated'));
 });

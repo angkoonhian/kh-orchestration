@@ -1,38 +1,44 @@
-// The installer (Task 9): what `apply`, `detect` and `uninstall` do, as functions the three
-// commands in scripts/ call. It runs from the PLUGIN and imports only the plugin's own shipped
-// copies in assets/scripts/, never a target's installed copies, which may be damaged or hostile.
-// It executes nothing from the target repository: git reads it, and the only programs started are
-// the plugin's own scripts (bin/'s pre-flight, the hooks' self-test) and /bin/sh.
+// The installer (Task 9, with its review and re-review): what `apply`, `detect` and `uninstall` do,
+// as functions the three commands in scripts/ call. It runs from the PLUGIN and imports only the
+// plugin's own shipped copies in assets/scripts/, never a target's installed copies, which may be
+// damaged or hostile. git reads the target; the programs started are /bin/sh, the plugin's own
+// scripts (the hooks' self-test, bin/'s pre-flight) and, only when bin/ must be restored from an
+// approved tree, that tree's approved scripts, loaded by the same pre-flight in a temporary
+// directory before anything is written.
 //
-// `plan(dir)` is the dry run, as data: `{ root, env, node, refusals, actions, conflicts, notes }`.
-// Refusals and conflicts are `{ text, next }`, fixed text and the command to run next; an action is
-// `{ kind, path, detail, ... }`, `detail` the line printed for it. It writes nothing (it copies what
-// the contract check and the self-test need into temporary directories outside the repository).
-// `applyPlan(root, planned)` performs the actions in order: (a) the fourteen scripts into
-// .claude/kh-orchestration/scripts/; (b) officers.json when there is none; (c) the line
+// `plan(dir, { downgrade, binFromPlugin })` is the dry run, as data: `{ root, env, node, refusals,
+// actions, conflicts, notes }`. Refusals and conflicts are `{ text, next }`, fixed text and the
+// command to run next; an action is `{ kind, path, detail, ... }`, `detail` the line printed for it.
+// It writes nothing (what the contract check, the self-test and the pre-flight need is copied into
+// temporary directories outside the repository). `applyPlan(root, planned)` refuses inside a Claude
+// Code session, then performs the actions in order: bin/ restored from an approved tree, when it
+// must be, first of all; (a) the fourteen scripts into .claude/kh-orchestration/scripts/ — when
+// extension.mjs is replaced while its entry is registered, one action takes the entry out, writes
+// the module and puts the entry back, adjacent; (b) officers.json when there is none; (c) the line
 // `.claude/** -text` in .gitattributes; (d) the entry in kh-harness's extensions file; (e) the
-// shared state directory and bin/, from the plugin's shipped scripts through ko-state's pre-flight;
-// (f) the three git hooks into <git-common-dir>/hooks/, then the self-test; (g) stale in-flight
-// records removed. The manifest is written after each write: before a file that did not exist is
-// created (so a kill leaves it recorded), and after a file that existed is replaced (so a kill
-// never makes an untouched old file look edited). Every write is whole, by temporary file and
-// rename. A kill after any write leaves a state the next apply completes and uninstall cleans.
+// shared state directory and bin/ before any approval, from the plugin's shipped scripts through
+// ko-state's pre-flight; (f) the git hooks that are not someone else's into <git-common-dir>/hooks/,
+// then the self-test; (g) stale in-flight records removed. The manifest is written after each
+// write: before a file that did not exist is created (so a kill leaves it recorded), and after a
+// file that existed is replaced (so a kill never makes an untouched old file look edited). Every
+// write is whole, by temporary file and rename. A kill after any write leaves a state the next
+// apply completes and uninstall cleans, and in which kh-harness lets tool calls through.
 //
 // What counts as kh-orchestration's own, and is therefore updated or removed: an installed script
 // whose bytes are the ones this kit ships, or that carries the stamp line and either is not
 // recorded or still hashes to what the manifest records (line endings aside); a git hook whose
 // header names kh-orchestration and that hook (for uninstall: one byte for byte as recorded or as
 // this kit writes it); the extensions entry whose id is kh-orchestration's. Anything else is the
-// owner's, kept and reported.
+// owner's, kept and reported. A foreign hook whose first command, under #!/bin/sh, is the line
+// apply prints for it hosts the gate.
 //
-// bin/ (amended decision 5 and the ledger's carry to Task 9). apply leaves bin/ as it is when it
-// holds exactly the plugin's shipped scripts, or exactly the scripts of the last approval that
-// records a tree (an intact approved copy, so an owner's approval is never undone by a re-run).
-// Otherwise — no bin/, a file missing, damaged or extra — it replaces bin/ with the plugin's
-// shipped scripts, through the same pre-flight approve uses; when an approval records a tree whose
-// scripts are not the shipped ones, it says that the approved copy was replaced by the plugin's
-// own, and that the owner approves again (after staging the installed scripts) to make bin/ the
-// approved tree's.
+// bin/ should hold the approved scripts: those of the last approval's tree (approve pins it with a
+// ref under refs/kh-orchestration/), else of HEAD's or the base branch's tree when its protected-
+// files digest is the last approved digest; before any approval, the plugin's shipped scripts.
+// apply leaves bin/ as it is when it holds them and restores it from that same source otherwise.
+// When approvals exist but no such tree is reachable, or its scripts do not load, apply refuses
+// before writing; only the owner's explicit --bin-from-plugin puts the plugin's scripts in bin/,
+// keeping every approval, and says that the owner must approve again.
 import { spawnSync } from 'node:child_process';
 import { accessSync, constants, cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -180,7 +186,7 @@ export const TEXT = Object.freeze({
   appendAttributes: `add the line ${ATTRIBUTES_LINE} to ${ATTRIBUTES_FILE}`,
   addEntry: (created) => `add kh-orchestration's entry to ${EXTENSIONS_PATH}${created ? ' (new)' : ''}`,
   updateEntry: `update kh-orchestration's entry in ${EXTENSIONS_PATH}`,
-  unregisterEntry: `remove kh-orchestration's entry from ${EXTENSIONS_PATH} while its extension.mjs is replaced, so kh-harness never runs a module whose hash the entry does not name (until it is written again, tool calls run unchecked by kh-orchestration and the gate refuses commits)`,
+  swapExtension: (version) => `replace ${MODULE} (${compareVersions(version, KIT_VERSION) > 0 ? 'a downgrade, ' : ''}from kh-orchestration ${version} to ${KIT_VERSION}) with kh-orchestration's entry taken out of ${EXTENSIONS_PATH} for that one write and put back after it, so kh-harness never runs a module whose hash the entry does not name`,
   createBin: (path) => `create ${path}/ from kh-orchestration ${KIT_VERSION}'s scripts`,
   replaceBin: (path, names) => `replace ${path}/ with kh-orchestration ${KIT_VERSION}'s scripts (it differs: ${names.join(', ')})`,
   writeHook: (path) => `write the git hook ${path} (new)`,
@@ -196,7 +202,7 @@ export const TEXT = Object.freeze({
   hostedMisplaced: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between:\n    ${line}`,
   hostedStale: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line for another env or Node, so the commit gate may not start from it. Replace that line with this one:\n    ${line}`,
   hostedNotExecutable: (name, path) => `The ${name} hook at ${path} holds kh-orchestration's line but is not executable, so git skips it.`,
-  hostedRemains: (name, path) => `The ${name} hook at ${path} is not kh-orchestration's and is left as it is, but it still holds kh-orchestration's line, which refuses every commit once kh-orchestration is gone: remove that line from it by hand.`,
+  hostedRemains: (name, path) => `The ${name} hook at ${path} is not kh-orchestration's and is left as it is, but it still holds kh-orchestration's line, which ${name === 'reference-transaction' ? 'starts nothing once no commit is gated, but is no longer kh-orchestration\'s to keep' : `refuses every ${name === 'pre-commit' ? 'commit' : 'merge commit'} once kh-orchestration is gone`}: remove that line from it by hand.`,
 
   baseBranchMain: 'officers.json names main as the base branch: the repository has a branch main.',
   baseBranchMaster: 'officers.json names master as the base branch: the repository has a branch master and no main.',
@@ -841,19 +847,22 @@ export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
     .filter((version) => typeof version === 'string' && compareVersions(version, KIT_VERSION) > 0).sort(compareVersions).at(-1);
   if (newer !== undefined && !downgrade) return stop(TEXT.downgrade(newer), askOwner(`${applyCommand(root)} --downgrade`));
 
-  // An extension.mjs about to be replaced while its entry is registered: the entry goes first and
-  // comes back after the scripts (after Task 9's review), so a kill in between leaves the extension
-  // off (the gate's contract check refuses commits) and never a registered module that does not
-  // hash to its entry, which would block every tool call.
+  // An extension.mjs about to be replaced while its entry is registered (after Task 9's review and
+  // re-review): one action takes the entry out, writes extension.mjs, and puts the entry back, three
+  // adjacent writes, so a kill leaves either the old pair, the extension off for an instant (the
+  // gate's contract check refuses commits; tool calls go on), or the new pair — never a registered
+  // module that does not hash to its entry, which would block every tool call. The module imports
+  // only node: built-ins, so it needs none of its siblings' new versions.
   const listedFirst = extensions.state === 'ok' ? extensions.entries.find((candidate) => candidate.id === EXTENSION_ID) : undefined;
-  const unregister = listedFirst !== undefined && scriptState(root, 'extension.mjs', recordedFile(`${SCRIPTS_DIR}/extension.mjs`)).state === 'older';
-  if (unregister) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.unregisterEntry, text: extensionsTextWith(extensions, null), entry: null, create: false });
+  const moduleState = scriptState(root, 'extension.mjs', recordedFile(MODULE));
+  const swap = listedFirst !== undefined && moduleState.state === 'older';
 
   // (a) the scripts
   const kept = [];
   for (const { name, bytes } of shippedScripts()) {
     const path = `${SCRIPTS_DIR}/${name}`;
     const found = scriptState(root, name, recordedFile(path));
+    if (swap && name === 'extension.mjs') continue;
     if (found.state === 'missing') actions.push({ kind: 'file', path, detail: TEXT.createScript(path), bytes, create: true });
     else if (found.state === 'older') actions.push({ kind: 'file', path, detail: compareVersions(found.version, KIT_VERSION) > 0 ? TEXT.downgradeScript(path, found.version) : TEXT.updateScript(path, found.version), bytes, create: false });
     else if (found.state === 'current' && recordedFile(path) !== sha256(bytes)) actions.push({ kind: 'record', path, detail: TEXT.record(path), file: { path, sha256: sha256(bytes) } });
@@ -877,10 +886,14 @@ export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
   // (d) the extension entry
   const entry = ownEntryShipped();
   const plannedText = extensionsTextWith(extensions, entry);
-  if (kept.includes('extension.mjs')) {
+  if (swap) {
+    const firstScript = actions.findIndex((action) => action.kind === 'file' || action.kind === 'record');
+    const action = { kind: 'extension-swap', path: EXTENSIONS_PATH, detail: TEXT.swapExtension(moduleState.version), without: extensionsTextWith(extensions, null), bytes: shippedBytes('extension.mjs'), text: plannedText, entry };
+    actions.splice(firstScript === -1 ? actions.length : firstScript, 0, action);
+  } else if (kept.includes('extension.mjs')) {
     conflicts.push({ text: TEXT.extensionSkipped, next });
   } else {
-    const listed = unregister ? undefined : listedFirst;
+    const listed = listedFirst;
     if (listed === undefined) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.addEntry(extensions.state === 'absent'), text: plannedText, entry, create: true });
     else if (!sameEntry(listed, entry)) actions.push({ kind: 'extension-entry', path: EXTENSIONS_PATH, detail: TEXT.updateEntry, text: plannedText, entry, create: false });
     else if (manifest?.extensionEntry?.sha256 !== entry.sha256) actions.push({ kind: 'record', path: EXTENSIONS_PATH, detail: TEXT.record('kh-orchestration\'s extension entry'), extensionEntry: { id: EXTENSION_ID, sha256: entry.sha256 } });
@@ -1014,7 +1027,7 @@ export function applyPlan(root, planned, { onWrite } = {}) {
       const record = () => {
         if (action.kind === 'file') recordFile(manifest, { path: action.path, sha256: sha256(action.bytes) });
         else if (action.kind === 'patch') manifest.patches = [{ file: ATTRIBUTES_FILE, kind: action.patch, detail: ATTRIBUTES_LINE }];
-        else if (action.kind === 'extension-entry') manifest.extensionEntry = action.entry === null ? null : { id: EXTENSION_ID, sha256: action.entry.sha256 };
+        else if (action.kind === 'extension-entry') manifest.extensionEntry = { id: EXTENSION_ID, sha256: action.entry.sha256 };
         else if (action.kind === 'state-copy') manifest.stateDir = true;
         else if (action.kind === 'git-hook') recordHook(manifest, { name: action.name, sha256: sha256(Buffer.from(hookText(action.name, { env: planned.env, node: planned.node, version: KIT_VERSION }))) });
         else if (action.kind === 'record') {
@@ -1036,7 +1049,7 @@ export function applyPlan(root, planned, { onWrite } = {}) {
       } else if (action.kind === 'patch') {
         write(ATTRIBUTES_FILE, () => writeWhole(join(root, ATTRIBUTES_FILE), action.bytes, readRegular(join(root, ATTRIBUTES_FILE), MAX_SMALL_FILE_BYTES).mode ?? 0o644));
       } else if (action.kind === 'extension-entry') {
-        write(EXTENSIONS_PATH, () => (action.text === null ? rmSync(join(root, EXTENSIONS_PATH), { force: true }) : writeWhole(join(root, EXTENSIONS_PATH), action.text, 0o644)));
+        write(EXTENSIONS_PATH, () => writeWhole(join(root, EXTENSIONS_PATH), action.text, 0o644));
       } else if (action.kind === 'state-copy') {
         if (action.tree === null) {
           write(action.path, () => replaceBin(root, shippedScripts(), TEXT.binShippedPreflight));
@@ -1055,6 +1068,14 @@ export function applyPlan(root, planned, { onWrite } = {}) {
           writeWhole(action.path, hookText(action.name, { env: planned.env, node: planned.node, version: KIT_VERSION }), 0o755);
         });
         hooksWritten.push(action);
+      } else if (action.kind === 'extension-swap') {
+        const extensions = join(root, EXTENSIONS_PATH);
+        write(EXTENSIONS_PATH, () => (action.without === null ? rmSync(extensions, { force: true }) : writeWhole(extensions, action.without, 0o644)));
+        write(MODULE, () => writeWhole(join(root, MODULE), action.bytes, 0o644));
+        write(EXTENSIONS_PATH, () => writeWhole(extensions, action.text, 0o644));
+        recordFile(manifest, { path: MODULE, sha256: sha256(action.bytes) });
+        manifest.extensionEntry = { id: EXTENSION_ID, sha256: action.entry.sha256 };
+        save();
       } else if (action.kind === 'inflight') {
         write(action.path, () => removeStaleInflight(root));
       }
