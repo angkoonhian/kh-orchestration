@@ -994,3 +994,25 @@ test('git restore or checkout of kh-orchestration\'s extension entry or module o
   ];
   assert.deepEqual(mismatches(rows), []);
 });
+
+// A cleared environment the table of wrappers does not know (after Task 9's second re-review): an
+// env word with -i, - or --ignore-environment anywhere in the command clears it, and the command a
+// find action runs is judged as a command of its own.
+test('a cleared environment behind find -exec, an unknown runner or any wrapper is seen in front of an installer\'s --yes; harmless find and runners stay open', () => {
+  const K = '/p/kh-orchestration';
+  const rows = [
+    [`find . -maxdepth 0 -exec env -i node ${K}/scripts/uninstall.mjs . --yes --state \;`, blocked(MESSAGES.sessionEnv)],
+    [`find . -maxdepth 0 -execdir env -i node ${K}/scripts/uninstall.mjs . --yes --state \;`, blocked(MESSAGES.sessionEnv)],
+    [`find ${K} -name uninstall.mjs -exec env -i PATH="$PATH" node {} "$PWD" --yes --state \;`, blocked(MESSAGES.sessionEnv)],
+    [`prlimit --nofile=1024 env -i node $(echo ${K}/scripts/uninstall.mjs) . --yes --state`, blocked(MESSAGES.sessionEnv)],
+    [`setpriv env -i node $(echo ${K}/scripts/uninstall.mjs) . --yes --state`, blocked(MESSAGES.sessionEnv)],
+    [`parallel env -i node {} . --yes --state ::: $(ls ${K}/scripts/unins*)`, blocked(MESSAGES.sessionEnv)],
+    [`nice -n 5 env -i node ${K}/scripts/apply.mjs . --yes`, blocked(MESSAGES.sessionEnv)],
+    [`unknownrunner --opt env --ignore-environment node ${K}/scripts/uninstall.mjs . --yes`, blocked(MESSAGES.sessionEnv)],
+    ["find . -name '*.mjs' -exec grep -l apply {} +", ALLOW],
+    ['find . -maxdepth 0 -exec env -i PATH="$PATH" npm test \;', ALLOW],
+    ['env -i PATH="$PATH" npm test', ALLOW],
+    ['prlimit --nofile=1024 node build.mjs', ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+});

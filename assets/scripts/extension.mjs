@@ -1713,7 +1713,15 @@ const isInstaller = (word) => /kh-orchestration/i.test(word.text) && isInstaller
 // command whose command word is not read-only, a word that is not a text value and whose
 // basename could be ko.mjs, followed by an owner-only subcommand; and kh-orchestration's
 // installer with --yes among the command's words.
-function judgeOwner(command, resolved, values, loose) {
+// Whether `env` clears the environment anywhere in the command's words (after Task 9's second
+// re-review): an env word, by basename, with -i, - or --ignore-environment among its options,
+// whatever stands in front of it, so a runner no table knows (prlimit, setpriv, parallel) cannot
+// hide it. The wrapper resolution sees the same for the env it resolves.
+const clearsEnvironment = (resolved) => resolved.cleared
+  || resolved.words.some((word, index) => !word.expands && commandName(word) === 'env' && readEnv(resolved.words, index + 1).cleared);
+
+function judgeOwner(command, given, values, loose) {
+  const resolved = { ...given, cleared: clearsEnvironment(given) };
   const unsets = [...resolved.unsets, ...(resolved.name === 'unset' ? resolved.words.slice(resolved.index + 1).map((word) => word.text) : [])];
   if ([...command.assignments, ...resolved.envAssignments].some((word) => SESSION_EMPTIED.test(word.text)) || unsets.some((name) => SESSION_NAMES.has(name))) refuse(MESSAGES.sessionEnv);
   if (resolved.word === undefined || READ_ONLY.has(resolved.name)) return;
@@ -2002,8 +2010,29 @@ function judgeScript(text, context, depth) {
   else judgeCommands(commands, context, depth + 1);
 }
 
+// find's actions that run a command (after Task 9's second re-review): -exec, -execdir, -ok and
+// -okdir, each up to its `;` or `+`. find stays read-only for what it reads; the command each action
+// runs is judged as a command of its own, through the same resolution, so its wrappers and a
+// cleared environment are seen.
+const FIND_RUNS = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+function judgeFindActions(command, resolved, context, depth) {
+  if (resolved.name !== 'find') return;
+  const words = resolved.words;
+  for (let at = resolved.index + 1; at < words.length; at++) {
+    if (!FIND_RUNS.has(words[at].text)) continue;
+    let end = at + 1;
+    while (end < words.length && words[end].text !== ';' && words[end].text !== '+') end++;
+    if (end > at + 1) {
+      if (depth + 1 > MAX_DEPTH) scanned(MESSAGES.unsplittable, words.slice(at + 1, end).map((word) => word.text).join(' '));
+      else judgeCommand({ ...command, assignments: [], words: words.slice(at + 1, end), redirects: [] }, context, depth + 1);
+    }
+    at = end;
+  }
+}
+
 function judgeCommand(command, context, depth) {
   const resolved = resolveCommand(command);
+  judgeFindActions(command, resolved, context, depth);
   const git = gitInvocation(resolved);
   noteLineEnvironment(command, resolved, git, context.line);
   const outputReadOnly = command.pipedTo === null || pipelineReadsOnly(command.pipedTo);
