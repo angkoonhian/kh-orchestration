@@ -1156,10 +1156,43 @@ test('approve pins the approved tree with a ref that git prune keeps, and refuse
   const other = installed();
   rmSync(join(other.root, '.git', 'refs', 'kh-orchestration'), { recursive: true, force: true });
   writeFileSync(join(other.root, '.git', 'refs', 'kh-orchestration'), 'not a directory\n');
-  const before = stateSnapshot(other.root);
   const refused = approveAnswer(other.root);
   assert.equal(refused.status, 1);
   assert.ok(refused.stderr.startsWith(`kh-orchestration: ${TEXT.pinFailed}\n`), refused.stderr);
-  assert.deepEqual(stateSnapshot(other.root), before, 'nothing is recorded and bin/ is as it was');
-  assert.equal(TEXT.pinFailed, 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved. Check that the git directory can be written, then approve again.');
+  // The pin comes after bin/'s refresh (after Task 9's second re-review): nothing is approved.
+  assert.equal(existsSync(join(stateDir(other.root), 'approvals.json')), false, 'nothing is recorded');
+  assert.equal(TEXT.pinFailed, 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved (bin/ already holds its scripts; the gate refuses them until approved). Check that the git directory can be written, then approve again.');
+});
+
+// A ref names only what was approved (after Task 9's second re-review): pinned after bin/ was
+// refreshed, and taken out again when the approval cannot then be recorded.
+test('an approval refused at the pre-flight, or one whose record cannot be written, leaves no approved/ ref', () => {
+  const repo = installed();
+  const refs = (root) => gitIn(root, ['for-each-ref', '--format=%(refname)', 'refs/kh-orchestration/']).stdout;
+  const cli = join(repo.root, '.claude/kh-orchestration/scripts/ko-cli.mjs');
+  const good = readFileSync(cli, 'utf8');
+  writeFileSync(cli, `${good}\nthis is not javascript(\n`);
+  stage(repo);
+  assert.equal(approveAnswer(repo.root).status, 1);
+  assert.equal(refs(repo.root), '', 'refused at the pre-flight');
+  writeFileSync(cli, good);
+  stage(repo);
+
+  // approvals.json cannot be replaced: a directory stands where it goes.
+  mkdirSync(join(stateDir(repo.root), 'approvals.json'), { recursive: true });
+  assert.notEqual(approveAnswer(repo.root).status, 0);
+  assert.equal(refs(repo.root), '', 'the record could not be written');
+  rmSync(join(stateDir(repo.root), 'approvals.json'), { recursive: true });
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const digest = digestOfTree(repo.root, indexTree(repo.root)).digest;
+  assert.equal(refs(repo.root), `refs/kh-orchestration/approved/${digest}\n`);
+
+  // Approving the same digest again and failing to record it keeps the earlier pin.
+  const approvals = readFileSync(join(stateDir(repo.root), 'approvals.json'));
+  rmSync(join(stateDir(repo.root), 'approvals.json'));
+  mkdirSync(join(stateDir(repo.root), 'approvals.json'));
+  assert.notEqual(approveAnswer(repo.root).status, 0);
+  assert.equal(refs(repo.root), `refs/kh-orchestration/approved/${digest}\n`, 'a pin that was there stays');
+  rmSync(join(stateDir(repo.root), 'approvals.json'), { recursive: true });
+  writeFileSync(join(stateDir(repo.root), 'approvals.json'), approvals);
 });

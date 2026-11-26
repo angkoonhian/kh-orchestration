@@ -30,7 +30,7 @@ import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
 import { REASONS, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
-  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, listEntries, pinTree, repoRoot, tidy, treeOfCommit,
+  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
 } from './ko-git.mjs';
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
@@ -174,7 +174,7 @@ export const TEXT = Object.freeze({
   alreadyApproved: 'This digest is approved already; approving again refreshes bin/ from this tree and closes this worktree for proposals.',
   prompt: 'Type approve and press Enter to approve; anything else cancels: ',
   notApproved: 'Nothing was approved: the answer was not the word approve.',
-  pinFailed: 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved. Check that the git directory can be written, then approve again.',
+  pinFailed: 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved (bin/ already holds its scripts; the gate refuses them until approved). Check that the git directory can be written, then approve again.',
   noAnswer: 'Nothing was approved: no answer could be read (standard input is closed or empty).',
   approved: (digest, tree) => `Approved: digest ${short(digest)} of tree ${short(tree)}. bin/ now holds this tree's scripts, and this worktree is closed for proposals.`,
   approvedNext: (runCommand) => `${runCommand}, then git commit`,
@@ -897,23 +897,37 @@ function approve(root) {
   if (answer === null) return refusal(TEXT.noAnswer, ownerCommand(root, 'approve'));
   if (answer !== 'approve') return refusal(TEXT.notApproved, ownerCommand(root, 'approve'));
   try {
-    // First, before anything is recorded: the tree is pinned, so it cannot be pruned.
+    // First: a tree whose scripts cannot make a working bin/ records nothing.
+    refreshBin(root, tree);
+  } catch (error) {
+    if (error instanceof StateError) return refusal(error.message, ownerCommand(root, 'approve'));
+    throw error;
+  }
+  // Then the tree is pinned, so it cannot be pruned (after Task 9's re-reviews): only once bin/ was
+  // refreshed, and taken out again if the approval cannot then be recorded, unless an earlier
+  // approval of the same digest had pinned it already.
+  const pinnedBefore = isPinned(root, digest.digest);
+  try {
     pinTree(root, digest.digest, tree);
   } catch (error) {
     if (error instanceof GitError) return refusal(TEXT.pinFailed, ownerCommand(root, 'approve'));
     throw error;
   }
   try {
-    // Then: a tree whose scripts cannot make a working bin/ records nothing.
-    refreshBin(root, tree);
+    // Read and written together; no lock (see the header). A digest approved again moves to the end
+    // with this tree, so the last record is always the tree bin/ was refreshed from.
+    const others = readApprovals(root).filter((entry) => entry.digest !== digest.digest);
+    writeState(root, 'approvals.json', { digests: [...others, { digest: digest.digest, tree, approvedAt: new Date().toISOString(), branch }] });
   } catch (error) {
-    if (error instanceof StateError) return refusal(error.message, ownerCommand(root, 'approve'));
+    if (!pinnedBefore) {
+      try {
+        unpinTree(root, digest.digest);
+      } catch {
+        // the approval's own failure is the one reported
+      }
+    }
     throw error;
   }
-  // Read and written together; no lock (see the header). A digest approved again moves to the end
-  // with this tree, so the last record is always the tree bin/ was refreshed from.
-  const others = readApprovals(root).filter((entry) => entry.digest !== digest.digest);
-  writeState(root, 'approvals.json', { digests: [...others, { digest: digest.digest, tree, approvedAt: new Date().toISOString(), branch }] });
   closeProposal(root, realpathSync(root));
   removeStaleInflight(root);
   print([TEXT.approved(digest.digest, tree), nextLine(TEXT.approvedNext(agentCommand(root, 'run')))]);

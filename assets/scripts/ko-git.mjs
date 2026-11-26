@@ -77,9 +77,20 @@ export const APPROVED_REFS = 'refs/kh-orchestration/';
  * cannot be written. The reference-transaction hook sees it as an update of a process with no
  * in-flight record and lets it through without starting node.
  */
-export function pinTree(root, digest, tree) {
+const pinRef = (digest) => {
   if (!/^[0-9a-f]{64}$/.test(digest)) throw new GitError(gitFailedMessage('pin the approved tree'));
-  mustSucceed(exec(root, ['update-ref', '--no-deref', '--end-of-options', `${APPROVED_REFS}approved/${digest}`, tree]), 'pin the approved tree');
+  return `${APPROVED_REFS}approved/${digest}`;
+};
+export function pinTree(root, digest, tree) {
+  mustSucceed(exec(root, ['update-ref', '--no-deref', '--end-of-options', pinRef(digest), tree]), 'pin the approved tree');
+}
+
+// Whether the digest's pin exists already (an earlier approval of it), so a failed approval must leave it.
+export const isPinned = (root, digest) => git(root, ['show-ref', '--verify', '-q', pinRef(digest)]).status === 0;
+
+// Takes out the digest's pin. Throws a GitError when it cannot.
+export function unpinTree(root, digest) {
+  mustSucceed(exec(root, ['update-ref', '-d', '--no-deref', '--end-of-options', pinRef(digest)]), 'remove the pin of an approved tree');
 }
 
 // Writes tree objects for the index; with pinTree, the only calls that are not read-only.
