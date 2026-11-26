@@ -452,7 +452,7 @@ test('exempt needs a branch name git accepts and a reason; unexempt is not owner
   assert.equal(result.status, 0, result.stderr);
   const branches = JSON.parse(readFileSync(join(stateDir(repo.root), 'exemptions.json'), 'utf8')).branches;
   assert.deepEqual(branches.map((entry) => [entry.name, entry.reason]), [['old/feature', 'predates the install']]);
-  assert.equal(result.stdout, `${TEXT.exempted('old/feature')}\n${TEXT.exemptions(branches)}\nNext: ${agent(repo.root, 'unexempt old/feature')}\n`);
+  assert.equal(result.stdout, `${TEXT.exempted('old/feature')}\n${TEXT.exemptions(branches)}\nNext: ${ownerCommand(repo.root, 'unexempt old/feature')}\n`);
   const ended = ko(repo.root, ['unexempt', 'old/feature'], { env: { ...testEnv(), CLAUDECODE: '1' } });
   assert.deepEqual([ended.status, ended.stdout], [0, `${TEXT.unexempted('old/feature')}\n${TEXT.exemptions([])}\n`]);
   const none = ko(repo.root, ['unexempt', 'old/feature']);
@@ -1333,4 +1333,78 @@ test('I1: past ten flagged entries the refusal names ten and counts the rest, an
     `git -C ${shellWord(repo.root)} update-index --no-skip-worktree -- ${paths.slice(0, 10).join(' ')}, then ${agent(repo.root, 'run')}`,
   )]);
   assert.ok(TEXT.hiddenEntries(paths).includes('s/09.txt and 1 more.'));
+});
+
+test('I3: exempt names unexempt through the approved copy, and status does on a branch from before the install, so the line printed runs there', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  assert.equal(gitIn(repo.root, ['branch', 'old', 'HEAD~1']).status, 0);
+  const binLine = `node ${shellWord(join(stateDir(repo.root), 'bin', 'ko.mjs'))} unexempt old`;
+  const exempted = owner(repo.root, ['exempt', 'old', '--reason', 'predates the install']);
+  assert.equal(lines(exempted.stdout).at(-1), `Next: ${binLine}`);
+  const here = JSON.parse(ko(repo.root, ['status', '--json']).stdout);
+  assert.equal(here.problems.some((problem) => problem.next.includes('unexempt')), false, 'main is not the exempt branch');
+
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'old']).status, 0);
+  assert.equal(existsSync(join(repo.root, '.claude/kh-orchestration/scripts/ko.mjs')), false, 'fixture: no working copy of ko.mjs on this branch');
+  const status = JSON.parse(owner(repo.root, ['status', '--json']).stdout);
+  const exemption = status.problems.find((problem) => problem.text.startsWith('This branch, old, is exempt'));
+  assert.equal(exemption.next, binLine);
+  const ran = spawnSync('sh', ['-c', exemption.next], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
+  assert.equal(ran.status, 0, ran.stderr);
+  assert.ok(ran.stdout.includes(TEXT.unexempted('old')), ran.stdout);
+});
+
+test('I4: unwaive ends a waiver of the current branch, open to a session; with none it says so and changes nothing', () => {
+  const repo = installed();
+  assert.equal(owner(repo.root, ['waive', 'V8', '--reason', 'docs follow']).status, 0);
+  assert.equal(gitIn(repo.root, ['branch', 'other']).status, 0);
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'other']).status, 0);
+  assert.equal(owner(repo.root, ['waive', 'V8', '--reason', 'here too']).status, 0);
+  assert.equal(gitIn(repo.root, ['switch', '-q', 'main']).status, 0);
+  const session = { env: { ...testEnv(), CLAUDECODE: '1' } };
+  const ended = ko(repo.root, ['unwaive', 'V8'], session);
+  assert.deepEqual([ended.status, ended.stdout, ended.stderr], [0, `${TEXT.unwaived('V8', 'main')}\n${TEXT.waivers('main', [])}\nNext: ${agent(repo.root, 'run')}\n`, '']);
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'waivers.json'), 'utf8')).waivers.map((entry) => entry.branch), ['other'], 'only this branch\'s waiver ends');
+  const before = stateSnapshot(repo.root);
+  const none = ko(repo.root, ['unwaive', 'V8']);
+  assert.deepEqual([none.status, none.stdout], [0, `${TEXT.notWaived('V8', 'main')}\n${TEXT.waivers('main', [])}\n`]);
+  assert.deepEqual(stateSnapshot(repo.root), before);
+  const bad = ko(repo.root, ['unwaive', '8V']);
+  assert.deepEqual([bad.status, bad.stderr], [2, usageText(TEXT.badRule('8V'))]);
+  assert.equal(gitIn(repo.root, ['checkout', '-q', '--detach']).status, 0);
+  const detached = ko(repo.root, ['unwaive', 'V8']);
+  assert.deepEqual([detached.status, detached.stderr], [1, refusalText(TEXT.waiveDetached, 'git switch <branch>')]);
+  assert.equal(TEXT.unwaived('V8', 'main'), 'Rule V8 is no longer waived on main; its officer sees no waiver of it from the next run.');
+  assert.equal(TEXT.notWaived('V8', 'main'), 'Rule V8 was not waived on main; nothing changed.');
+  assert.ok(USAGE.includes('  unwaive <rule>'));
+});
+
+test('I4: propose --close closes this worktree without approving, from the approved copy only; approve and propose drop worktrees that no longer exist', () => {
+  const repo = installed();
+  const side = repo.addWorktree('side');
+  assert.equal(owner(repo.root, ['propose']).status, 0);
+  assert.equal(owner(repo.root, ['propose'], { cwd: side }).status, 0);
+  const closed = owner(repo.root, ['propose', '--close']);
+  assert.deepEqual([closed.status, closed.stdout], [0, `${TEXT.proposalClosed(realpathSync(repo.root))}\nNext: ${agent(repo.root, 'status')}\n`]);
+  assert.deepEqual(readProposals(repo.root), [realpathSync(side)]);
+  assert.deepEqual(readApprovals(repo.root), [], 'nothing approved');
+  const again = owner(repo.root, ['propose', '--close']);
+  assert.deepEqual([again.status, again.stdout], [0, `${TEXT.notProposed(realpathSync(repo.root))}\nNext: ${agent(repo.root, 'status')}\n`]);
+  const fromWorkingCopy = ko(repo.root, ['propose', '--close']);
+  assert.deepEqual([fromWorkingCopy.status, fromWorkingCopy.stderr], [1, refusalText(TEXT.notFromBin('propose'), `${ownerCommand(repo.root, 'propose')} --close`)]);
+  const inSession = owner(repo.root, ['propose', '--close'], { env: { ...testEnv(), CLAUDECODE: '1' } });
+  assert.equal(inSession.status, 1);
+
+  // A worktree removed without closing its proposal is dropped by the next propose or approve.
+  assert.equal(gitIn(repo.root, ['worktree', 'remove', '--force', side]).status, 0);
+  writeState(repo.root, 'proposals.json', { worktrees: [realpathSync(repo.root), join(repo.root, '..', 'gone')] });
+  assert.equal(owner(repo.root, ['propose'], { cwd: join(repo.root, 'tools') }).status, 0);
+  assert.deepEqual(readProposals(repo.root), [realpathSync(repo.root)]);
+  writeState(repo.root, 'proposals.json', { worktrees: [join(repo.root, '..', 'gone'), realpathSync(repo.root)] });
+  assert.equal(approveAnswer(repo.root).status, 0);
+  assert.deepEqual(readProposals(repo.root), []);
+  assert.ok(USAGE.includes('  propose [--close]'));
+  assert.equal(TEXT.proposalClosed('/w'), 'This worktree (/w) is closed for proposals without an approval: a session here may no longer edit the protected files.');
+  assert.equal(TEXT.notProposed('/w'), 'This worktree (/w) was not open for proposals; nothing changed.');
 });

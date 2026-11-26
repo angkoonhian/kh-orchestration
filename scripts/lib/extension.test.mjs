@@ -1080,3 +1080,12 @@ test('git update-index --assume-unchanged and --skip-worktree, and their abbrevi
   assert.deepEqual(mismatches(rows), []);
   assert.ok(MESSAGES.indexFlags.length <= 300 && !/[<>]/.test(MESSAGES.indexFlags));
 });
+
+test('ko.mjs unwaive is open to a session, as unexempt is; propose --close is the owner\'s, as propose is', () => {
+  const rows = [
+    ['node .claude/kh-orchestration/scripts/ko.mjs unwaive V8', ALLOW],
+    ['node .claude/kh-orchestration/scripts/ko.mjs propose --close', blocked(MESSAGES.ownerOnly('propose'))],
+    ['node ko.mjs propose --close', blocked(MESSAGES.ownerOnly('propose'))],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+});

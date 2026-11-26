@@ -2,8 +2,8 @@
 // ko.mjs is the entry and calls `main`; this file runs nothing when imported, so tests and the
 // session brief (Task 10, which calls `statusOf`) can import it.
 //
-// Agents run `run`, `status`, `verify-branch` and `unexempt` (which only tightens), from the
-// working copy. The owner alone runs `approve`, `propose`, `waive`, `exempt`, `off` and `on`:
+// Agents run `run`, `status`, `verify-branch`, and `unexempt` and `unwaive` (which only tighten),
+// from the working copy. The owner alone runs `approve`, `propose`, `waive`, `exempt`, `off` and `on`:
 // - each refuses, before doing anything else, when CLAUDECODE or CLAUDE_CODE_SESSION_ID is set in
 //   this process's environment (decision 13); no argument can say otherwise;
 // - each acts only when this file is the copy in <git-common-dir>/kh-orchestration/bin/, the one
@@ -104,10 +104,11 @@ export const USAGE = `usage: ${KO} <command>
   status [--json]                  what the commit gate sees in this worktree
   verify-branch [--no-run]         whether HEAD's tree passed the gate's checks (runs the officers first unless --no-run)
   unexempt <branch>                end a branch's exemption
+  unwaive <rule>                   end the waiver of a rule on the current branch
 The owner's commands, run in their own terminal outside Claude Code, from the approved copy:
 node <git-common-dir>/kh-orchestration/bin/ko.mjs <command>
   approve                          approve the protected files of the staged tree (asks for the word approve)
-  propose                          open this worktree for edits to the protected files until the next approve
+  propose [--close]                open this worktree for edits to the protected files until the next approve; --close closes it without approving
   waive <rule> --reason <text>     waive an officer's rule on the current branch
   exempt <branch> --reason <text>  let a branch's commits through the gate unchecked
   off | on                         switch the commit gate off or on for this repository
@@ -189,6 +190,10 @@ export const TEXT = Object.freeze({
   proposed: (path) => `This worktree (${shownName(path)}) is open for proposals: a session here may edit the protected files, though never .claude/settings.local.json or the git directory. The next approve closes it.`,
   alreadyProposed: (path) => `This worktree (${shownName(path)}) is open for proposals already. The next approve closes it.`,
   waiveDetached: 'HEAD is detached; a waiver applies to a branch. Switch to the branch first.',
+  unwaived: (rule, branch) => `Rule ${rule} is no longer waived on ${shownName(branch)}; its officer sees no waiver of it from the next run.`,
+  notWaived: (rule, branch) => `Rule ${rule} was not waived on ${shownName(branch)}; nothing changed.`,
+  proposalClosed: (path) => `This worktree (${shownName(path)}) is closed for proposals without an approval: a session here may no longer edit the protected files.`,
+  notProposed: (path) => `This worktree (${shownName(path)}) was not open for proposals; nothing changed.`,
   waived: (rule, branch) => `Rule ${rule} is waived on ${shownName(branch)}; its officer sees the waiver in KO_WAIVERS from the next run.`,
   exempted: (branch) => `The branch ${shownName(branch)} is exempt: the commit gate lets its commits through unchecked.`,
   exemptions: (list) => `Exempt branches: ${list.length === 0 ? 'none' : withReason(list, 'name')}.`,
@@ -722,7 +727,11 @@ export function statusOf(root) {
   const proposals = attempt(problems, root, () => readProposals(root), null);
   const exemptions = attempt(problems, root, () => readExemptions(root), null);
   const exemptionHere = exemptions?.find((entry) => entry.name === branch);
-  if (exemptionHere !== undefined) problems.push({ text: TEXT.exemptHere(branch, exemptionHere.reason), next: commandLine(agentCommand(root, 'unexempt'), [branch]) });
+  if (exemptionHere !== undefined) {
+    // A branch from before the install has no working copy of ko.mjs: the approved copy's then.
+    const fromWorkingCopy = statOrNull(join(root, SCRIPTS, 'ko.mjs'))?.isFile() === true;
+    problems.push({ text: TEXT.exemptHere(branch, exemptionHere.reason), next: fromWorkingCopy ? commandLine(agentCommand(root, 'unexempt'), [branch]) : ownerLine(root, ['unexempt', branch]) });
+  }
   const waivers = attempt(problems, root, () => waiversOf(root, branch), null);
   const records = attempt(problems, root, () => listInflight(root), []);
   const inflight = { live: records.filter((record) => record.live).map((record) => record.pid), stale: records.filter((record) => !record.live).map((record) => record.pid) };
@@ -935,9 +944,17 @@ function approvalPreview(root, { tree, digest, branch }) {
   return lines;
 }
 
+// Of the worktrees open for proposals, those that still exist (after the whole-branch review): a
+// worktree removed without its proposal being closed is dropped from what is written back.
+const existing = (worktrees) => worktrees.filter((path) => statOrNull(path)?.isDirectory() === true);
+
+// Closes `path`'s proposal, and drops those of worktrees that no longer exist; writes only on a change.
 function closeProposal(root, path) {
-  const open = readProposals(root);
-  if (open.includes(path)) writeState(root, 'proposals.json', { worktrees: open.filter((entry) => entry !== path) });
+  // Read and written together; no lock (see the header).
+  const before = readProposals(root);
+  const after = existing(before).filter((entry) => entry !== path);
+  if (after.length !== before.length) writeState(root, 'proposals.json', { worktrees: after });
+  return before.includes(path);
 }
 
 function approve(root) {
@@ -989,17 +1006,40 @@ function approve(root) {
   return 0;
 }
 
-function propose(root) {
+function propose(root, { close }) {
   const path = realpathSync(root);
+  if (close) {
+    print([closeProposal(root, path) ? TEXT.proposalClosed(path) : TEXT.notProposed(path), nextLine(agentCommand(root, 'status'))]);
+    return 0;
+  }
   const next = nextLine(ownerCommand(root, 'approve'));
   // Read and written together; no lock (see the header).
-  const open = readProposals(root);
+  const before = readProposals(root);
+  const open = existing(before);
   if (open.includes(path)) {
+    if (open.length !== before.length) writeState(root, 'proposals.json', { worktrees: open });
     print([TEXT.alreadyProposed(path), next]);
     return 0;
   }
   writeState(root, 'proposals.json', { worktrees: [...open, path] });
   print([TEXT.proposed(path), next]);
+  return 0;
+}
+
+// Not the owner's: ending a waiver only tightens, as unexempt does.
+function unwaive(root, { rule }) {
+  const branch = currentBranch(root);
+  if (branch === null) return refusal(TEXT.waiveDetached, 'git switch <branch>');
+  // Read and written together; no lock (see the header).
+  const before = readWaivers(root);
+  const waivers = before.filter((entry) => !(entry.rule === rule && entry.branch === branch));
+  const here = waivers.filter((entry) => entry.branch === branch);
+  if (waivers.length === before.length) {
+    print([TEXT.notWaived(rule, branch), TEXT.waivers(branch, here)]);
+    return 0;
+  }
+  writeState(root, 'waivers.json', { waivers });
+  print([TEXT.unwaived(rule, branch), TEXT.waivers(branch, here), nextLine(agentCommand(root, 'run'))]);
   return 0;
 }
 
@@ -1028,7 +1068,9 @@ function exempt(root, { branch, reason }) {
   // Read and written together; no lock (see the header).
   const branches = [...readExemptions(root).filter((entry) => entry.name !== name), { name, reason, at: new Date().toISOString() }];
   writeState(root, 'exemptions.json', { branches });
-  print([TEXT.exempted(name), TEXT.exemptions(branches), nextLine(commandLine(agentCommand(root, 'unexempt'), [name]))]);
+  // The approved copy's unexempt, as the owner runs exempt: the working copy has no ko.mjs on a
+  // branch from before the install, often the one being exempted.
+  print([TEXT.exempted(name), TEXT.exemptions(branches), nextLine(ownerLine(root, ['unexempt', name]))]);
   return 0;
 }
 
@@ -1067,8 +1109,9 @@ const SPECS = {
   status: { operands: [], flags: ['--json'] },
   'verify-branch': { operands: [], flags: ['--no-run'] },
   unexempt: { operands: ['a branch name'], flags: [] },
+  unwaive: { operands: ['a rule id'], flags: [] },
   approve: { owner: true, operands: [], flags: [] },
-  propose: { owner: true, operands: [], flags: [] },
+  propose: { owner: true, operands: [], flags: ['--close'] },
   waive: { owner: true, operands: ['a rule id'], flags: [], reason: true },
   exempt: { owner: true, operands: ['a branch name'], flags: [], reason: true },
   off: { owner: true, operands: [], flags: [] },
@@ -1122,7 +1165,7 @@ async function dispatch(argv) {
     if (variable !== undefined) return refusal(TEXT.ownerOnly(command, variable), ownerNext(command));
   }
   const { operands, flags, reason } = parse(command, words);
-  if (command === 'waive' && !RULE_ID.test(operands[0])) throw new UsageError(TEXT.badRule(operands[0]));
+  if ((command === 'waive' || command === 'unwaive') && !RULE_ID.test(operands[0])) throw new UsageError(TEXT.badRule(operands[0]));
   const root = repoRoot(process.cwd());
   if (root === null) return refusal(TEXT.notARepository, `cd <the repository> && ${KO} ${command}`);
   if (isOwners && !fromApprovedCopy(root)) return refusal(TEXT.notFromBin(command), ownerLine(root, argv));
@@ -1131,8 +1174,9 @@ async function dispatch(argv) {
     case 'status': return status(root, { json: flags.has('--json') });
     case 'verify-branch': return verifyBranch(root, { noRun: flags.has('--no-run') });
     case 'unexempt': return unexempt(root, { branch: operands[0] });
+    case 'unwaive': return unwaive(root, { rule: operands[0] });
     case 'approve': return approve(root);
-    case 'propose': return propose(root);
+    case 'propose': return propose(root, { close: flags.has('--close') });
     case 'waive': return waive(root, { rule: operands[0], reason });
     case 'exempt': return exempt(root, { branch: operands[0], reason });
     case 'off': return off(root);
