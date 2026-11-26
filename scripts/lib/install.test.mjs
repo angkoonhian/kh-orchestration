@@ -20,7 +20,7 @@ import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mj
 import { TEXT as KO_TEXT } from '../../assets/scripts/ko-cli.mjs';
 import { checkContract1, lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
-import { stateDir, writeInflight } from '../../assets/scripts/ko-state.mjs';
+import { refreshBin, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { shellWord } from '../../assets/scripts/extension.mjs';
 
 const OTHER = { id: 'other-plugin', version: '2.0.0', module: '.claude/other/ext.mjs', sha256: 'a'.repeat(64), onFailure: 'block' };
@@ -531,4 +531,50 @@ test('uninstall removes kh-orchestration\'s entry by its id whatever it names, b
   assert.ok(kinds.indexOf('extension-entry') < kinds.indexOf('file'), 'the entry goes before the scripts');
   applyUninstall(repo.root, uninstalled);
   assert.equal(readFileSync(extensions, 'utf8'), `${JSON.stringify([OTHER], null, 2)}\n`);
+});
+
+// An approval that records a tree whose scripts are not the plugin's shipped ones: an older kit's
+// install, staged and approved, with bin/ refreshed from it as approve does.
+function approvedOlderInstall() {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  ageInstall(repo.root);
+  assert.equal(repo.git('add', '-A').status, 0);
+  const tree = repo.git('write-tree').stdout.trim();
+  writeState(repo.root, 'approvals.json', { digests: [{ digest: 'a'.repeat(64), tree, approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }] });
+  refreshBin(repo.root, tree);
+  return { repo, tree, bin: join(stateDir(repo.root), 'bin') };
+}
+const binMatchesTree = (repo, bin, tree) => readdirSync(bin).every((name) => {
+  const oid = repo.git('rev-parse', `${tree}:${SCRIPTS_DIR}/${name}`).stdout.trim();
+  return repo.git('hash-object', join(bin, name)).stdout.trim() === oid;
+});
+
+test('bin/ holding the last approved tree\'s scripts is left as it is, even when they are not the plugin\'s (after Task 9\'s review)', () => {
+  const { repo } = approvedOlderInstall();
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.refusals, []);
+  assert.equal(planned.actions.some((action) => action.kind === 'state-copy'), false);
+});
+
+test('a missing or damaged bin/ is restored from the last approved tree, never from the plugin\'s scripts, once an approval records a tree (after Task 9\'s review)', () => {
+  const { repo, tree, bin } = approvedOlderInstall();
+  for (const damage of [() => rmSync(bin, { recursive: true }), () => writeFileSync(join(bin, 'ko-gate.mjs'), 'export const runGate = () => ({ allow: true });\n')]) {
+    damage();
+    const planned = plan(repo.root);
+    assert.deepEqual(planned.actions.filter((action) => action.kind === 'state-copy').map((action) => action.detail), [TEXT.restoreBin(bin, tree)]);
+    assert.equal(applyPlan(repo.root, planned).refusal, null);
+    assert.ok(binMatchesTree(repo, bin, tree), 'bin/ holds the approved tree\'s scripts');
+    assert.ok(!readFileSync(join(bin, 'ko-gate.mjs')).equals(shippedScripts().find((script) => script.name === 'ko-gate.mjs').bytes), 'not the plugin\'s');
+  }
+});
+
+test('bin/ is not replaced when the approved tree is gone, and apply says how to start again (after Task 9\'s review)', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const gone = 'f'.repeat(40);
+  writeState(repo.root, 'approvals.json', { digests: [{ digest: 'a'.repeat(64), tree: gone, approvedAt: '2026-11-26T00:00:00.000Z', branch: 'main' }] });
+  rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
+  assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.approvedTreeGone(gone), next: TEXT.askOwner(TEXT.startAgain(repo.root)) }]);
+  assert.equal(existsSync(join(stateDir(repo.root), 'bin')), false);
 });

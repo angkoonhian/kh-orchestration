@@ -49,7 +49,7 @@ import { hashesTo } from '../../assets/scripts/ko-digest.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { GitError, commonDir, currentBranch, git, repoRoot } from '../../assets/scripts/ko-git.mjs';
 import { HOOK_NAMES, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
-import { StateError, binEntriesOf, listInflight, ownerCommand, readApprovals, removeStaleInflight, replaceBin, stateDir } from '../../assets/scripts/ko-state.mjs';
+import { StateError, binEntriesOf, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stateDir } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1, lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 
 export { ATTRIBUTES_LINE, OFFICERS_PATH, SCRIPTS_DIR, SCRIPT_NAMES };
@@ -193,7 +193,11 @@ export const TEXT = Object.freeze({
   noOfficerScripts: `officers.json holds no officer: the root package.json has none of the scripts ${PACKAGE_OFFICERS.join(', ')}. Add officers before relying on the gate.`,
   noPackageJson: 'officers.json holds no officer: there is no root package.json. Add officers before relying on the gate.',
   packageJsonUnreadable: 'officers.json holds no officer: the root package.json could not be read as JSON. Add officers before relying on the gate.',
-  binReplacesApproved: (tree, approve) => `bin/ is replaced by kh-orchestration ${KIT_VERSION}'s own scripts, which are not those of the last approved tree (${tree.slice(0, 12)}): the hooks and the owner's commands run the plugin's copy until the owner approves again. Stage the installed scripts, then: ${approve}`,
+  restoreBin: (path, tree) => `restore ${path}/ from the scripts of the last approved tree (${tree.slice(0, 12)})`,
+  approvedTreeGone: (tree) => `The last approval records the tree ${tree.slice(0, 12)}, which is no longer in the object store, so bin/ cannot be restored from the approved scripts, and kh-orchestration does not put scripts nobody approved there.`,
+  approvedBinFails: (tree, reason) => `bin/ could not be restored from the last approved tree (${tree.slice(0, 12)}): ${reason} kh-orchestration does not put scripts nobody approved there instead.`,
+  approvalsUnreadable: (reason) => `The approvals cannot be read (${reason.replace(/\.$/, '')}), so it is not known which scripts bin/ should hold; nothing is written.`,
+  startAgain: (root) => `${commandOf('uninstall', root, ' --yes --state')} && ${commandOf('apply', root, ' --yes')}, then approve again`,
 
   header: (root, dryRun) => `kh-orchestration ${KIT_VERSION} apply for ${root}${dryRun ? ' (dry run: nothing is written)' : ''}`,
   actionsHeader: 'Actions:',
@@ -518,16 +522,20 @@ const treeExists = (root, tree) => {
   return type.status === 0 && type.stdout.trim() === 'tree';
 };
 
-// The last approval that records a tree, and that tree's bin/ entries, or null.
-function approvedCopy(root) {
+// What bin/ should hold (amended, after Task 9's review): the scripts of the last approval that
+// records a tree, `{ tree, entries }` (Map name → object id); `{ tree: null }` when no approval
+// records one, so the plugin's shipped scripts; `{ gone }` when that tree is not in the object
+// store; `{ unreadable }` (fixed text) when the approvals cannot be read.
+function binSource(root) {
   let approvals;
   try {
     approvals = readApprovals(root);
-  } catch {
-    return null;
+  } catch (error) {
+    return { unreadable: error instanceof StateError ? error.message : TEXT.statusUnreadable };
   }
   const last = approvals.filter((entry) => entry.tree !== undefined).at(-1);
-  if (last === undefined || !treeExists(root, last.tree)) return null;
+  if (last === undefined) return { tree: null };
+  if (!treeExists(root, last.tree)) return { gone: last.tree };
   return { tree: last.tree, entries: new Map(binEntriesOf(root, last.tree).map((entry) => [entry.path.slice(SCRIPTS_DIR.length + 1), entry.oid])) };
 }
 
@@ -796,18 +804,21 @@ export function plan(dir) {
     else if (manifest?.extensionEntry?.sha256 !== entry.sha256) actions.push({ kind: 'record', path: EXTENSIONS_PATH, detail: TEXT.record('kh-orchestration\'s extension entry'), extensionEntry: { id: EXTENSION_ID, sha256: entry.sha256 } });
   }
 
-  // (e) the shared state directory and bin/
+  // (e) the shared state directory and bin/: left as it is when it holds what it should (the last
+  // approved tree's scripts, or before any approval records a tree the plugin's), else restored
+  // from that same source, so a plugin copy never replaces what the owner approved
   const binPath = join(stateDir(root), 'bin');
   const bin = readBin(root);
-  const shippedExpected = new Map(shippedScripts().map((script) => [script.name, (bytes) => sameBytes(bytes, script.bytes)]));
-  const approved = approvedCopy(root);
-  const approvedExpected = approved === null ? null : new Map([...approved.entries].map(([name, oid]) => [name, (bytes) => bytes !== undefined && hashesTo(oid, bytes)]));
-  const shippedDiffers = bin === null ? null : binDifference(bin, shippedExpected);
-  const intactApproved = bin !== null && approvedExpected !== null && binDifference(bin, approvedExpected).length === 0;
-  if (bin === null || (shippedDiffers.length > 0 && !intactApproved)) {
-    actions.push({ kind: 'state-copy', path: binPath, detail: bin === null ? TEXT.createBin(binPath) : TEXT.replaceBin(binPath, shippedDiffers) });
-    const approvedIsShipped = approvedExpected !== null && binDifference(new Map(shippedScripts().map((script) => [script.name, script.bytes])), approvedExpected).length === 0;
-    if (approved !== null && !approvedIsShipped) notes.push(TEXT.binReplacesApproved(approved.tree, ownerCommand(root, 'approve')));
+  const source = binSource(root);
+  if (source.unreadable !== undefined) return stop(TEXT.approvalsUnreadable(source.unreadable), agentCommand(root, 'status'));
+  const expected = source.tree === null || source.gone !== undefined
+    ? new Map(shippedScripts().map((script) => [script.name, (bytes) => sameBytes(bytes, script.bytes)]))
+    : new Map([...source.entries].map(([name, oid]) => [name, (bytes) => bytes !== undefined && hashesTo(oid, bytes)]));
+  const differs = bin === null ? null : binDifference(bin, expected);
+  if (bin === null || differs.length > 0) {
+    if (source.gone !== undefined) return stop(TEXT.approvedTreeGone(source.gone), askOwner(TEXT.startAgain(root)));
+    const detail = source.tree !== null ? TEXT.restoreBin(binPath, source.tree) : bin === null ? TEXT.createBin(binPath) : TEXT.replaceBin(binPath, differs);
+    actions.push({ kind: 'state-copy', path: binPath, detail, tree: source.tree });
   } else if (manifest?.stateDir !== true) {
     actions.push({ kind: 'record', path: stateDir(root), detail: TEXT.record(stateDir(root)), stateDir: true });
   }
@@ -928,7 +939,17 @@ export function applyPlan(root, planned, { onWrite } = {}) {
       } else if (action.kind === 'extension-entry') {
         write(EXTENSIONS_PATH, () => (action.text === null ? rmSync(join(root, EXTENSIONS_PATH), { force: true }) : writeWhole(join(root, EXTENSIONS_PATH), action.text, 0o644)));
       } else if (action.kind === 'state-copy') {
-        write(action.path, () => replaceBin(root, shippedScripts(), TEXT.binShippedPreflight));
+        if (action.tree === null) {
+          write(action.path, () => replaceBin(root, shippedScripts(), TEXT.binShippedPreflight));
+        } else {
+          try {
+            refreshBin(root, action.tree);
+          } catch (error) {
+            const reason = error instanceof StateError || error instanceof GitError ? error.message : TEXT.statusUnreadable;
+            return { manifest, refusal: { text: TEXT.approvedBinFails(action.tree, sentence(reason)), next: askOwner(TEXT.startAgain(root)) } };
+          }
+          wrote();
+        }
       } else if (action.kind === 'git-hook') {
         write(action.path, () => {
           mkdirSync(dirname(action.path), { recursive: true });
