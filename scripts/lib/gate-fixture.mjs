@@ -70,5 +70,12 @@ export async function runAndApprove(root, baseBranch = 'main') {
   return at;
 }
 
+export const KO_SCRIPT = '.claude/kh-orchestration/scripts/ko.mjs';
+// Runs the installed, stamped ko.mjs of `root` from `cwd` with `env` (by default without the
+// session variables) and `input` on standard input; `closedStdin` gives it none at all.
+export const ko = (root, args, { cwd = root, env = testEnv(), input, closedStdin = false } = {}) => spawnSync(
+  process.execPath, [join(root, KO_SCRIPT), ...args], { cwd, env, input, encoding: 'utf8', ...(closedStdin ? { stdio: ['ignore', 'pipe', 'pipe'] } : {}) },
+);
+
 export const gitIn = (root, argv, env = testEnv()) => spawnSync('git', argv, { cwd: root, env, encoding: 'utf8' });
 export const commit = (root, ...argv) => gitIn(root, ['commit', '-q', '-m', 'work', ...argv]);

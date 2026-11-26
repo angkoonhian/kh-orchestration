@@ -112,6 +112,25 @@ export function baseOf(root, baseBranch) {
   return mergeBase.status === 0 ? oneLine(mergeBase.stdout) : NO_BASE;
 }
 
+// The base HEAD's own tree was judged against when HEAD was committed: decision 7 read one commit
+// back. Off the base branch (a detached HEAD included) it is the merge base, as baseOf gives it,
+// unless that merge base is HEAD itself, which was then committed on the base branch. In every
+// other case (on the base branch, with no base branch, or that one) it is HEAD's first parent, or
+// none for a root commit. null when HEAD is unborn. verify-branch and status judge HEAD's tree
+// against it.
+export function headBaseOf(root, baseBranch) {
+  const head = headCommit(root);
+  if (head === null) return null;
+  if (currentBranch(root) !== baseBranch && refExists(root, `refs/heads/${baseBranch}`)) {
+    const base = baseOf(root, baseBranch);
+    if (base !== head) return base;
+  }
+  const parent = git(root, ['rev-parse', '--verify', '-q', 'HEAD^1']);
+  if (parent.status === 0) return oneLine(parent.stdout);
+  if (parent.status === 1) return NO_BASE;
+  throw new GitError(gitFailedMessage('read HEAD'));
+}
+
 // The tree of the commit `base` names, or null for the base `none`. Throws when the commit cannot be read.
 export function treeOfCommit(root, base) {
   if (base === NO_BASE) return null;

@@ -70,9 +70,13 @@ const REASON_SHOWN_AT_MOST = 200;
 // C0 and C1 controls, DEL, and the zero-width and bidi characters: what can make a terminal show
 // other text than the record holds.
 const UNSHOWABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
-// An exemption's recorded reason as it is printed: without what a terminal would act on, and cut.
-function shownReason(reason) {
-  const plain = reason.replace(UNSHOWABLE, '');
+// Text without what a terminal would act on: ko.mjs records a reason in this form.
+export const plainText = (text) => text.replace(UNSHOWABLE, '');
+// Recorded or repository text as it is printed (an exemption's reason, a path, an officer's
+// output line): without what a terminal would act on, and cut at 200 characters. ko.mjs prints
+// through it too.
+export function shownText(text) {
+  const plain = plainText(text);
   return plain.length > REASON_SHOWN_AT_MOST ? `${plain.slice(0, REASON_SHOWN_AT_MOST - 1)}…` : plain;
 }
 const shortId = (id) => (id === 'none' ? 'none' : id.slice(0, 12));
@@ -123,7 +127,7 @@ export const REASONS = Object.freeze({
 });
 
 // A word the shell reads as itself: as it is when it holds nothing the shell would act on, else in single quotes.
-const shellWord = (text) => (/^[A-Za-z0-9._/@+=,:-]+$/.test(text) ? text : `'${text.replaceAll("'", "'\\''")}'`);
+export const shellWord = (text) => (/^[A-Za-z0-9._/@+=,:-]+$/.test(text) ? text : `'${text.replaceAll("'", "'\\''")}'`);
 
 // The owner's command to exempt `branch`, run with the copy of ko.mjs in bin/: a tree without the
 // install has no .claude/kh-orchestration/scripts/ko.mjs to run.
@@ -145,9 +149,10 @@ function exemptionOf(root, branch) {
 // is a regular file there: the officers say what passing means, and the extension is what guards
 // the gate in the next session. The rest of the install is covered by the digest, which step 6
 // makes the owner's. An officers file that is there but unusable is a problem of that file, not a
-// missing install, so it is reported as such and no exemption is offered.
+// missing install, so it is reported as such and no exemption is offered. `{ officers }`,
+// `{ absent }` or `{ problem }`; status reports it.
 const isFile = (entry) => entry !== null && entry.type === 'blob' && FILE_MODES.includes(entry.mode);
-function installOf(root, tree) {
+export function installOf(root, tree) {
   if (!isFile(treeEntry(root, tree, OFFICERS))) return { absent: REASONS.officersAbsent };
   if (!isFile(treeEntry(root, tree, EXTENSION))) return { absent: REASONS.extensionAbsent };
   const read = officersOfTree(root, tree);
@@ -162,7 +167,9 @@ function installOf(root, tree) {
 // working file (lstat, never followed) whose bytes hash, as a git blob, to the tree's object id,
 // with the executable bit as the tree's mode says; every directory is listed directly, and a file
 // there the tree lacks is refused. Line endings count: a checkout that converts them differs.
-function readNoFollow(path) {
+// `{ bytes, executable }` of a regular file at `path`, never through a link at it; `{ differs }`
+// for anything else and `{ tooLarge }` past 4 MiB. ko.mjs reads kh-harness's contract file with it.
+export function readNoFollow(path) {
   let fd;
   try {
     fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
@@ -316,6 +323,13 @@ function contractOnPrivateCopy(root, live) {
 // record of where it was given, and a digest approved anywhere is approved on every branch.
 const approved = (root, digest) => readApprovals(root).some((entry) => entry.digest === digest);
 
+// The tree's entries under the live paths, sorted by path.
+const liveEntries = (root, tree) => listEntries(root, tree).filter((entry) => isLive(entry.path)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+// Step 4 alone, as status reports it: the gate's refusal for the first live file whose working
+// copy differs from `tree`, or null when they are equal.
+export const liveFilesRefusal = (root, tree) => liveRefusal(root, liveEntries(root, tree));
+
 // 8. The verdict's refusal, or null when it passes; `verdict` is the copy read before the probe. Named: the tree's officers the verdict shows
 // no pass or skip for. When there are none and it still does not pass, its list is in another
 // order or holds officers the tree does not name.
@@ -343,13 +357,16 @@ function verdictRefusal(verdict, { tree, base }, digest, officers) {
  * shared state may change the outcome.
  * `tree` is the tree being committed, `base` its base (decision 7) or null when the tree's
  * officers file cannot be read (step 3 then refuses), and `branch` the current branch or null for
- * a detached HEAD. Throws what the state and git helpers throw (a StateError for a damaged state
- * file): the caller refuses on a throw.
+ * a detached HEAD. With `honourSwitches` false, steps 1 and 2 decide nothing: verify-branch asks
+ * whether a tree passes, not whether a commit of it would be checked. Throws what the state and
+ * git helpers throw (a StateError for a damaged state file): the caller refuses on a throw.
  */
-export function judge(root, { tree, base, branch }) {
-  if (isOff(root)) return allow(REASONS.off);
-  const exemption = exemptionOf(root, branch);
-  if (exemption !== null) return allow(REASONS.exempt(branch, shownReason(exemption.reason)));
+export function judge(root, { tree, base, branch }, { honourSwitches = true } = {}) {
+  if (honourSwitches) {
+    if (isOff(root)) return allow(REASONS.off);
+    const exemption = exemptionOf(root, branch);
+    if (exemption !== null) return allow(REASONS.exempt(branch, shownText(exemption.reason)));
+  }
   const install = installOf(root, tree);
   if (install.absent !== undefined) {
     return branch === null
@@ -357,7 +374,7 @@ export function judge(root, { tree, base, branch }) {
       : refuse(REASONS.noInstall(install.absent), exemptCommand(root, branch));
   }
   if (install.problem !== undefined) return refuse(REASONS.officersProblem(install.problem), COMMANDS.status);
-  const live = listEntries(root, tree).filter((entry) => isLive(entry.path)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const live = liveEntries(root, tree);
   const liveProblem = liveRefusal(root, live);
   if (liveProblem !== null) return liveProblem;
   const digest = digestOfTree(root, tree);

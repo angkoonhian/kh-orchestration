@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
-  GitError, OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
+  GitError, OUTPUT_TOO_LARGE, SPAWN_FAILED, notBlobMessage, baseOf, changedPaths, headBaseOf, commonDir, currentBranch, git, gitFailedMessage, headTree, indexTree,
   listEntries, ownIndexEntry, readBlob, readBlobs, repoRoot, tidy, treeEntry, treeOfCommit,
 } from '../../assets/scripts/ko-git.mjs';
 
@@ -162,6 +162,44 @@ test('baseOf is none when the branch shares no history with the base branch', ()
     repo.commitAll('island');
     assert.equal(baseOf(repo.root, 'main'), 'none');
   });
+});
+
+test('headBaseOf is the base HEAD\'s own tree was committed against: one commit back from baseOf on the base branch', () => {
+  withRepo({ files: { 'a.txt': 'a\n' } }, (repo) => {
+    const first = head(repo);
+    assert.equal(headBaseOf(repo.root, 'main'), 'none', 'a root commit on the base branch had an unborn HEAD before it');
+    repo.write('m.txt', 'm\n');
+    repo.commitAll('second on main');
+    const second = head(repo);
+    assert.equal(headBaseOf(repo.root, 'main'), first, 'on the base branch: the first parent');
+    repo.git('checkout', '-q', '-b', 'feature');
+    assert.equal(headBaseOf(repo.root, 'main'), first, 'a branch with no commit of its own: HEAD was committed on the base branch');
+    repo.write('f.txt', 'f\n');
+    repo.commitAll('feature one');
+    repo.write('g.txt', 'g\n');
+    repo.commitAll('feature two');
+    assert.equal(headBaseOf(repo.root, 'main'), second, 'off the base branch: the merge base, as at each of its commits');
+    assert.equal(headBaseOf(repo.root, 'trunk'), repo.git('rev-parse', 'HEAD^1').stdout.trim(), 'no base branch: the first parent');
+    repo.git('checkout', '-q', '--detach');
+    assert.equal(headBaseOf(repo.root, 'main'), second, 'a detached HEAD is read like a branch other than the base branch');
+    repo.git('checkout', '-q', 'main');
+    repo.write('n.txt', 'n\n');
+    repo.commitAll('main moves on');
+    const moved = head(repo);
+    assert.equal(repo.git('merge', '-q', '--no-ff', '-m', 'merge', 'feature').status, 0);
+    assert.equal(headBaseOf(repo.root, 'main'), moved, 'a merge commit on the base branch: its first parent');
+    repo.git('checkout', '-q', '--orphan', 'island');
+    repo.write('i.txt', 'i\n');
+    repo.commitAll('island');
+    assert.equal(headBaseOf(repo.root, 'main'), 'none', 'no shared history: none');
+  });
+  const container = realpathSync(mkdtempSync(join(tmpdir(), 'ko-test-')));
+  try {
+    git(container, ['init', '-q', '-b', 'main']);
+    assert.equal(headBaseOf(container, 'main'), null, 'an unborn HEAD has no tree to have a base');
+  } finally {
+    rmSync(container, { recursive: true, force: true });
+  }
 });
 
 test('changedPaths lists both paths of a rename and the paths of an added and a deleted file', () => {

@@ -222,7 +222,15 @@ export function readOfficers(officersJsonText) {
 const KO = 'node .claude/kh-orchestration/scripts/ko.mjs';
 // The commands a refusal names, in one table: the gate and ko.mjs import it from here, so every
 // message names a command in the same words.
-export const COMMANDS = Object.freeze({ run: `${KO} run`, approve: `${KO} approve`, status: `${KO} status` });
+export const COMMANDS = Object.freeze({
+  run: `${KO} run`,
+  approve: `${KO} approve`,
+  status: `${KO} status`,
+  verifyBranch: `${KO} verify-branch`,
+  propose: `${KO} propose`,
+  on: `${KO} on`,
+  unexempt: `${KO} unexempt`,
+});
 const RUN = COMMANDS.run;
 const unseen = (reason) => `This command's structure cannot be seen (${reason}) and its text holds a way round the commit gate (no-verify, hooksPath, a .git path, an owner-only ko.mjs command), so it is blocked. Run it as plain commands.`;
 

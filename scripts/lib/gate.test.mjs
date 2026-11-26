@@ -9,16 +9,16 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXTENSION_MODULE, KIT_VERSION, installGate, makeRepo, testEnv } from './test-repo.mjs';
 import {
-  OFFICERS_PATH, approve, approveTree, commit, gitIn, head, headOrNull, installed, officersFile, repos, runAndApprove, stage, subject,
+  OFFICERS_PATH, approve, approveTree, commit, gitIn, head, headOrNull, installed, ko, officersFile, repos, runAndApprove, stage, subject,
 } from './gate-fixture.mjs';
-import { REASONS, exemptCommand, judge, runGate } from '../../assets/scripts/ko-gate.mjs';
+import { REASONS, exemptCommand, installOf, judge, liveFilesRefusal, runGate } from '../../assets/scripts/ko-gate.mjs';
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, currentBranch, gitFailedMessage, indexTree } from '../../assets/scripts/ko-git.mjs';
 import { corruptMessage, readInflight, shapeMessage, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
-import { produceVerdict, readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
+import { readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 // The git process id the tests stand in for: alive for as long as the test runs.
 const PID = String(process.pid);
@@ -49,6 +49,10 @@ test('the command table is the one ko.mjs and the extension name', () => {
     run: 'node .claude/kh-orchestration/scripts/ko.mjs run',
     approve: 'node .claude/kh-orchestration/scripts/ko.mjs approve',
     status: 'node .claude/kh-orchestration/scripts/ko.mjs status',
+    verifyBranch: 'node .claude/kh-orchestration/scripts/ko.mjs verify-branch',
+    propose: 'node .claude/kh-orchestration/scripts/ko.mjs propose',
+    on: 'node .claude/kh-orchestration/scripts/ko.mjs on',
+    unexempt: 'node .claude/kh-orchestration/scripts/ko.mjs unexempt',
   });
 });
 
@@ -296,6 +300,34 @@ test('live files: a mode change, and a file not in the tree (untracked or ignore
   );
 });
 
+test('verify-branch\'s reading: with honourSwitches false the off switch and an exemption decide nothing, and every other check is made', () => {
+  const repo = installed();
+  const at = subject(repo.root);
+  writeFileSync(join(stateDir(repo.root), 'off'), '');
+  writeState(repo.root, 'exemptions.json', { branches: [{ name: 'main', reason: 'r', at: 'x' }] });
+  assert.deepEqual(judge(repo.root, at, { honourSwitches: false }), refused(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  approveTree(repo.root, at.tree);
+  recordVerdict(repo.root, at, [result('check', 'pass')]);
+  assert.deepEqual(judge(repo.root, at, { honourSwitches: false }), allowed(REASONS.allowed));
+  assert.deepEqual(judge(repo.root, at), allowed(REASONS.off));
+});
+
+test('liveFilesRefusal is step 4 alone, for status: null while the live files equal the tree, else the gate\'s refusal', () => {
+  const repo = installed();
+  const { tree } = subject(repo.root);
+  assert.equal(liveFilesRefusal(repo.root, tree), null);
+  repo.write('.claude/scripts/extra.mjs', 'x\n');
+  assert.deepEqual(liveFilesRefusal(repo.root, tree), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'rm -- .claude/scripts/extra.mjs'));
+});
+
+test('installOf is step 3 alone, for status: the officers, the missing file, or the officers file\'s problem', () => {
+  const repo = installed();
+  assert.deepEqual(Object.keys(installOf(repo.root, subject(repo.root).tree)), ['officers']);
+  rmSync(join(repo.root, EXTENSION_MODULE));
+  stage(repo);
+  assert.deepEqual(installOf(repo.root, subject(repo.root).tree), { absent: REASONS.extensionAbsent });
+});
+
 test('live files: an unstaged edit to an ordinary file is no reason to refuse, and a staged, approved change to a live file passes', () => {
   const repo = installed();
   const at = subject(repo.root);
@@ -351,13 +383,14 @@ function assertRefused(root, outcome, before, stderr) {
   if (stderr !== undefined) assert.equal(outcome.stderr, stderr);
 }
 
-test('git commit is refused with the gate\'s text, then accepted after a run and an approval', async () => {
+test('git commit is refused with the gate\'s text, then accepted after ko.mjs approve and run', () => {
   const repo = installed();
   const before = head(repo.root);
   const at = subject(repo.root);
-  approveTree(repo.root, at.tree);
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
+  assert.equal(ko(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
-  await runAndApprove(repo.root);
+  assert.equal(ko(repo.root, ['run']).status, 0);
   const accepted = commit(repo.root);
   assert.deepEqual([accepted.status, accepted.stderr], [0, '']);
   assert.notEqual(head(repo.root), before);
@@ -1421,15 +1454,17 @@ test('rule 5 (L5): an env in settings.local.json or settings.json that sets NODE
   assert.equal(REASONS.projectEnv('f', 'K'), 'f sets K under env, which would load code into every hook process of the session. Remove it outside Claude Code, then commit again.');
 });
 
-test('the owner\'s flow still lands: edit a live file, stage, approve, run, commit', async () => {
+test('the owner\'s flow still lands: edit a live file, stage, approve, run, commit, with the real commands', () => {
   const repo = installed();
-  await runAndApprove(repo.root);
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  assert.equal(ko(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assert.equal(commit(repo.root).status, 0);
   const live = '.claude/kh-orchestration/scripts/ko-git.mjs';
   repo.write(live, `${readFileSync(join(repo.root, live), 'utf8')}// owner's change\n`);
   stage(repo);
   const at = subject(repo.root);
   assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), COMMANDS.approve));
-  await runAndApprove(repo.root);
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  assert.equal(ko(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assert.equal(commit(repo.root).status, 0);
 });
