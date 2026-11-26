@@ -933,6 +933,12 @@ test('apply --yes and uninstall --yes of kh-orchestration are blocked under any 
     [`bun ${plugin}/scripts/uninstall.mjs . --yes --state`, blocked(MESSAGES.installerOwnerOnly)],
     [`node -e "import('/home/o/.claude/plugins/cache/x/kh-orchestration/0.1.0/scripts/lib/install.mjs').then((m) => m.applyUninstall('.', {}))"`, blocked(MESSAGES.runsCode)],
     ['env -i PATH=$PATH node .claude/kh-orchestration/scripts/ko.mjs approve', blocked(MESSAGES.sessionEnv)],
+    // A cleared environment hides the session from the installer's own check, so it is blocked in
+    // front of any apply.mjs or uninstall.mjs with --yes, whatever path names it.
+    [`cd ${plugin} && env -i node scripts/apply.mjs . --yes`, blocked(MESSAGES.sessionEnv)],
+    ['env - node ./uninstall.mjs . --yes --state', blocked(MESSAGES.sessionEnv)],
+    ['env -i node /p/kh-harness/scripts/apply.mjs . --yes', blocked(MESSAGES.sessionEnv)],
+    [`cd ${plugin} && node scripts/apply.mjs . --yes`, ALLOW],
     [`node ${plugin}/scripts/apply.mjs .`, ALLOW],
     [`node ${plugin}/scripts/detect.mjs . --json`, ALLOW],
     [`node ${plugin}/scripts/uninstall.mjs .`, ALLOW],

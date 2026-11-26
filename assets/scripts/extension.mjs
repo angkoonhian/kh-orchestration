@@ -1693,7 +1693,8 @@ const basenameWord = (word) => (word.text.includes('/') ? { ...word, text: word.
 const refuseOwner = (resolved, message) => refuse(resolved.cleared ? MESSAGES.sessionEnv : message);
 // kh-orchestration's installer (after Task 9's review): a word whose basename could be apply.mjs or
 // uninstall.mjs on a path naming kh-orchestration. kh-harness's own apply.mjs is not one.
-const isInstaller = (word) => /kh-orchestration/i.test(word.text) && ['apply.mjs', 'uninstall.mjs'].some((name) => couldBe(basenameWord(word), name));
+const isInstallerName = (word) => ['apply.mjs', 'uninstall.mjs'].some((name) => couldBe(basenameWord(word), name));
+const isInstaller = (word) => /kh-orchestration/i.test(word.text) && isInstallerName(word);
 
 // Owner-only commands, whatever runs ko.mjs (node, bun, deno, tsx, npx, the file itself): in a
 // command whose command word is not read-only, a word that is not a text value and whose
@@ -1707,7 +1708,9 @@ function judgeOwner(command, resolved, values, loose) {
     const word = resolved.words[at];
     if (values.has(word) || loose.has(word)) continue;
     if (couldBe(basenameWord(word), 'ko.mjs')) judgeOwnerSubcommand(resolved, at);
-    if (isInstaller(word) && resolved.words.some((other) => other.text === '--yes')) refuseOwner(resolved, MESSAGES.installerOwnerOnly);
+    // Behind a cleared environment any installer's --yes is blocked, whatever its path says: the
+    // installer's own session check could not see the session (a cd can hide the plugin's path).
+    if ((isInstaller(word) || (resolved.cleared && isInstallerName(word))) && resolved.words.some((other) => other.text === '--yes')) refuseOwner(resolved, MESSAGES.installerOwnerOnly);
   }
 }
 
