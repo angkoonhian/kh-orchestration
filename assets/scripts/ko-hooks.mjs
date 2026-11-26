@@ -37,6 +37,12 @@ const HOOK_COMMENT = [
 // The line every hook prints when the gate did not allow; the installer's self-test expects it.
 export const REFUSED_TEXT = 'kh-orchestration: the commit gate did not allow this commit.';
 const REFUSED_LINE = `echo "${REFUSED_TEXT}" >&2`;
+// The line after it in the hooks this kit writes (after the whole-branch review): where to find the
+// cause when nothing before it said (bin/ missing, Node moved). It names no path, since the one it
+// could name may be what is missing. A hosting hook's single line (hookLine) does not carry it: the
+// owner pasted that line, and changing it would unhost every hook that holds it.
+export const REFUSED_HINT = 'kh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply.';
+const HINT_LINE = `echo "${REFUSED_HINT}" >&2`;
 const gateAt = (dir) => `"$${dir}/kh-orchestration/bin/gate.mjs"`;
 
 // A word sh reads as itself, in single quotes.
@@ -57,11 +63,12 @@ export function hookText(hook, { env, node, version }) {
   const gate = [
     '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
     '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
-    `${readGate('d')} || { ${REFUSED_LINE}; exit 1; }`,
+    `${readGate('d')} || { ${REFUSED_LINE}; ${HINT_LINE}; exit 1; }`,
     `if out=$(${startNode(hook, { env, node }, 'd')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
     REFUSED_LINE,
+    HINT_LINE,
     'exit 1',
     '',
   ];

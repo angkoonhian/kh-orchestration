@@ -19,13 +19,14 @@ import { fresh, listing, scratch, sha256 } from './install-fixture.mjs';
 import { OFFICERS_PATH, PLUGIN_DIR } from './install.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { TEXT as KO_TEXT, agentCommand } from '../../assets/scripts/ko-cli.mjs';
-import { COMMANDS, MESSAGES } from '../../assets/scripts/extension.mjs';
+import { MESSAGES } from '../../assets/scripts/extension.mjs';
 import { INSTALL_PATHS, ownerCommand } from '../../assets/scripts/ko-state.mjs';
 
 // kh-harness's own way of timing a hook (its latency budget tests use it): read from the sibling, never changed.
 const { addedLatency } = await import(pathToFileURL(join(KH_HARNESS_DIR, 'scripts', 'lib', 'latency-fixtures.mjs')).href);
 
-const REFUSED_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
+// The two lines a hook of this kit prints last when it refuses.
+const REFUSED_LINE = 'kh-orchestration: the commit gate did not allow this commit.\nkh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply.\n';
 const RULES_PATH = 'docs/harness/RULES.md';
 const ENTRY_SCRIPT = '.claude/scripts/dispatch-pre-tool.mjs';
 const SESSION_ID = 'ko-stage1-measures';
@@ -141,12 +142,12 @@ test('A commit with a failing officer is refused; the same tree after a fix is a
   assert.equal(failing.status, 1);
   assert.ok(failing.stdout.includes('    | src/app.txt holds the marker BROKEN\n'), failing.stdout);
   assert.ok(failing.stdout.endsWith(`${KO_TEXT.failing(['check'])}\nNext: ${agentCommand(root, 'run')}\n`), failing.stdout);
-  refused(root, REASONS.failing(['check']), COMMANDS.run);
+  refused(root, REASONS.failing(['check']), agentCommand(root, 'run'));
 
   write(root, 'src/app.txt', 'fixed\n');
   stage(root);
   const { tree, base } = status(root);
-  refused(root, REASONS.noVerdict(tree, base), COMMANDS.run);
+  refused(root, REASONS.noVerdict(tree, base), agentCommand(root, 'run'));
   assert.ok(runPasses(root).endsWith(`${KO_TEXT.passingApproved(tree)}\nNext: git commit\n`));
   lands(root);
 });
@@ -374,8 +375,8 @@ test('A fresh session\'s brief says commits are checked and gives a run command 
   write(root, 'src/one.txt', 'one\n');
   stage(root);
   const { tree, base } = status(root);
-  refused(root, REASONS.noVerdict(tree, base), COMMANDS.run);
-  assert.equal(shell(COMMANDS.run, { cwd: root, env: agentEnv() }).status, 0);
+  refused(root, REASONS.noVerdict(tree, base), agentCommand(root, 'run'));
+  assert.equal(shell(agentCommand(root, 'run'), { cwd: root, env: agentEnv() }).status, 0);
   lands(root);
 
   // The brief's own line, pasted, from a subdirectory of the worktree.

@@ -16,7 +16,7 @@ import {
   detect, plan, shippedScripts, stampScript, uninstallPlan,
 } from './install.mjs';
 import { MANIFEST_PATH, readManifest } from './manifest.mjs';
-import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
+import { HOOK_NAMES, REFUSED_HINT, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
 import { TEXT as KO_TEXT, statusOf } from '../../assets/scripts/ko-cli.mjs';
 import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
@@ -844,4 +844,20 @@ test('status checks bin/ against the same source apply restores it from: HEAD\'s
   assert.deepEqual(status.bin.baseline, { kind: 'head', tree: head });
   assert.ok(status.problems.some((problem) => problem.text === KO_TEXT.binDiffers(bin, KO_TEXT.binBaselineHead(head), ['ko-gate.mjs'])), JSON.stringify(status.problems));
   assert.equal(plan(repo.root).actions[0].detail, TEXT.restoreBinFromHead(bin, head));
+});
+
+test('hooks of the same version written before the hint line was added are rewritten by apply, and then hold it', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const hint = `echo "${REFUSED_HINT}" >&2`;
+  for (const name of HOOK_NAMES) {
+    const path = join(hooksDir(repo.root), name);
+    const current = readFileSync(path, 'utf8');
+    assert.ok(current.includes(`\n${hint}\nexit 1\n`), name);
+    writeFileSync(path, current.replace(`; ${hint}; exit 1; }`, '; exit 1; }').replace(`\n${hint}\n`, '\n'));
+  }
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.actions.map((action) => action.detail), HOOK_NAMES.map((name) => TEXT.rewriteHook(join(hooksDir(repo.root), name))));
+  applyPlan(repo.root, planned);
+  for (const name of HOOK_NAMES) assert.equal(readFileSync(join(hooksDir(repo.root), name), 'utf8'), hookText(name, { env: envPath(), node: process.execPath, version: KIT_VERSION }), name);
 });

@@ -15,7 +15,7 @@
 // checkContract1 alone, without the probe.
 //
 // Exit codes: 0 done, 1 refused or failing, 2 usage. Every message is fixed text with values
-// substituted (TEXT below), and names the next command: an agent's from the one COMMANDS table,
+// substituted (TEXT below), and names the next command: an agent's through ko-state's agentCommand,
 // an owner's through ko-state's ownerCommand. A refusal goes to standard error as
 // `kh-orchestration: <reason>` and `Next: <command>`; a report goes to standard output. Any throw
 // is caught in `main` and printed as fixed text.
@@ -35,7 +35,7 @@ import {
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
 import {
-  RULE_ID, StateError, appendJournal, approvalStanding, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
+  RULE_ID, StateError, agentCommand, appendJournal, approvalStanding, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
   refreshBin, removeStaleInflight, restoreExtensionPair, stateDir, switchOff, switchOn, verdictName, writeState,
 } from './ko-state.mjs';
 import { passing, produceVerdict, readVerdict, writeVerdict } from './ko-verdict.mjs';
@@ -82,14 +82,8 @@ export const askOwner = (command) => `ask the owner to run, in their own termina
 // a test holds the three texts to this one.
 export const repairCommand = (rootWord) => askOwner(`node <kh-orchestration>/scripts/apply.mjs ${rootWord} --yes`);
 const APPLY = (root) => repairCommand(shellWord(root));
-// The one rule for an agent's command ko.mjs prints: the working copy's ko.mjs by its absolute
-// path, quoted for a shell, so it runs from whatever directory the person is in (a subdirectory, a
-// linked worktree). COMMANDS stays root-relative for the gate's own texts, which a hook prints
-// with its working directory at the worktree's top, and for the extension's.
-export const agentCommand = (root, words) => `node ${shellWord(join(root, SCRIPTS, 'ko.mjs'))} ${words}`;
-const AGENT_WORDS = new Map(Object.values(COMMANDS).map((command) => [command, command.slice(KO.length + 1)]));
-// A next line from the gate's texts, in that rule when it is one of COMMANDS.
-const localNext = (root, next) => (AGENT_WORDS.has(next) ? agentCommand(root, AGENT_WORDS.get(next)) : next);
+// agentCommand is ko-state's, shared with the gate; the session brief imports it from here.
+export { agentCommand };
 // A command line holding words the person typed: pasteable when they hold no character a terminal
 // hides; otherwise shown with those characters written as \u{…}, to be typed, never pasted.
 function commandLine(prefix, words) {
@@ -703,7 +697,7 @@ export function statusOf(root) {
     }
     const differs = attempt(problems, root, () => liveFilesRefusal(root, tree), null);
     liveFiles = differs === null ? { equal: true, reason: null, next: null } : { equal: false, reason: differs.reason, next: differs.next };
-    if (differs !== null) problems.push({ text: differs.reason, next: localNext(root, differs.next) });
+    if (differs !== null) problems.push({ text: differs.reason, next: differs.next });
     const digested = digestOfTree(root, tree);
     if (digested.problem !== undefined) {
       problems.push({ text: TEXT.undigestable(digested.problem), next: agentCommand(root, 'status') });
@@ -876,7 +870,7 @@ async function verifyBranch(root, { noRun }) {
   }
   // The gate's `run` judges the index against the next commit's base, not HEAD's tree against its
   // own, so following it would loop: verify-branch without --no-run runs the officers on HEAD's tree.
-  const next = decision.next === COMMANDS.run ? agentCommand(root, 'verify-branch') : localNext(root, decision.next);
+  const next = decision.next === agentCommand(root, 'run') ? agentCommand(root, 'verify-branch') : decision.next;
   print([...lines, TEXT.notVerified(decision.reason), nextLine(next)]);
   return 1;
 }

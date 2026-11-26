@@ -57,7 +57,7 @@ import { EXTENSION_ID, MODULE, STAMP, entryOf } from '../../assets/scripts/ko-co
 import { hashesTo } from '../../assets/scripts/ko-digest.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { APPROVED_REFS, GitError, commonDir, currentBranch, git, repoRoot } from '../../assets/scripts/ko-git.mjs';
-import { HOOK_NAMES, REFUSED_TEXT, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
+import { HOOK_NAMES, REFUSED_HINT, REFUSED_TEXT, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
 import {
   INSTALL_PATHS, SCRATCH_MESSAGES, STAGE_INSTALL_NOTE, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, restoreExtensionPair, stageInstall, stateDir, treeScripts,
 } from '../../assets/scripts/ko-state.mjs';
@@ -79,7 +79,8 @@ const MAX_HOOK_BYTES = 64 * 1024;
 const MAX_SMALL_FILE_BYTES = 1024 * 1024;
 const SELF_TEST_TIMEOUT_MS = 30_000;
 const SELF_TEST_HOOK = 'self-test';
-const REFUSED_LINE = `${REFUSED_TEXT}\n`;
+// What a hook this kit writes prints last when it refuses: the fixed line and the hint after it.
+const REFUSED_LINE = `${REFUSED_TEXT}\n${REFUSED_HINT}\n`;
 // The package scripts that become tool officers, in this order (amended decision 6).
 const PACKAGE_OFFICERS = ['lint', 'typecheck', 'test'];
 // The commands whose officers read package.json, which their argv does not name.

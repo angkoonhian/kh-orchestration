@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXTENSION_MODULE, KIT_VERSION, installGate, makeRepo, testEnv } from './test-repo.mjs';
+import { REFUSED_HINT, REFUSED_TEXT } from '../../assets/scripts/ko-hooks.mjs';
 import { envPath } from './install.mjs';
 import {
   OFFICERS_PATH, approve, approveTree, commit, gitIn, head, headOrNull, installed, ko, officersFile, owner, repos, runAndApprove, stage, subject,
@@ -16,7 +17,7 @@ import { REASONS, exemptCommand, installOf, judge, liveFilesRefusal, runGate } f
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, currentBranch, gitFailedMessage, indexTree } from '../../assets/scripts/ko-git.mjs';
-import { corruptMessage, ownerCommand, readAccepted, readInflight, shapeMessage, stateDir, writeFailedMessage, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
+import { agentCommand, corruptMessage, ownerCommand, readAccepted, readInflight, shapeMessage, stateDir, writeFailedMessage, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 import { readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
@@ -46,13 +47,12 @@ const allowed = (reason) => ({ allow: true, reason, next: '' });
 
 // ---- judge, one check of decision 17 at a time (step 2) ----
 
-test('the command table is the one ko.mjs and the extension name', () => {
+test('the command table is the root-relative form the extension names; agentCommand names the same ko.mjs by its absolute path', () => {
   assert.deepEqual({ ...COMMANDS }, {
     run: 'node .claude/kh-orchestration/scripts/ko.mjs run',
     status: 'node .claude/kh-orchestration/scripts/ko.mjs status',
-    verifyBranch: 'node .claude/kh-orchestration/scripts/ko.mjs verify-branch',
-    unexempt: 'node .claude/kh-orchestration/scripts/ko.mjs unexempt',
   }, 'the agents\' commands only: the owner\'s are built by ownerCommand, naming the copy in bin/');
+  assert.equal(agentCommand('/r/my repo', 'run'), "node '/r/my repo/.claude/kh-orchestration/scripts/ko.mjs' run");
 });
 
 test('1. the off switch allows, saying kh-orchestration is switched off, before anything else is read', () => {
@@ -114,7 +114,7 @@ test('7. a contract problem in the working directory is refused, naming the firs
   assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digest), ownerCommand(repo.root, 'approve')), 'not approved is reported first');
   approveTree(repo.root, at.tree);
   assert.deepEqual(judge(repo.root, at), refused(
-    REASONS.contract('.claude/settings.local.json sets disableAllHooks to a value other than false'), COMMANDS.status,
+    REASONS.contract('.claude/settings.local.json sets disableAllHooks to a value other than false'), agentCommand(repo.root, 'status'),
   ));
   assert.equal(
     REASONS.contract('x is wrong'),
@@ -129,7 +129,7 @@ test('5. an unparseable RULES.md is refused with the digest\'s problem', () => {
   const at = subject(repo.root);
   const problem = digestOfTree(repo.root, at.tree).problem;
   assert.match(problem, /^docs\/harness\/RULES\.md line 5: /);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.undigestable(problem), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.undigestable(problem), agentCommand(repo.root, 'run')));
 });
 
 test('6. a digest that is not approved is refused with next naming approve', () => {
@@ -146,9 +146,9 @@ test('7. no verdict for this tree and base is refused with next naming run; a ve
   const repo = installed();
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   recordVerdict(repo.root, { ...at, base: 'none' }, [result('check', 'pass')]);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   assert.equal(REASONS.noVerdict('a'.repeat(40), 'none'), 'No verdict is recorded for this tree (aaaaaaaaaaaa) against its base (none). Run the officers on the staged tree.');
 });
 
@@ -157,7 +157,7 @@ test('7. a verdict whose recorded digest differs from the tree\'s is not accepte
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('check', 'pass')], 'e'.repeat(64));
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.digestDiffers, COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.digestDiffers, agentCommand(repo.root, 'run')));
 });
 
 test('7. an approved digest with a failing verdict names the officers that did not pass', () => {
@@ -165,7 +165,7 @@ test('7. an approved digest with a failing verdict names the officers that did n
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('lint', 'fail'), result('types', 'pass'), result('test', 'timeout')]);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.failing(['lint', 'test']), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.failing(['lint', 'test']), agentCommand(repo.root, 'run')));
   assert.equal(REASONS.failing(['lint', 'test']), 'These officers did not pass on this tree: lint, test. Fix what they report, stage the fix, and run the officers again.');
 });
 
@@ -175,7 +175,7 @@ test('7. at most ten failed officers are named, then how many more', () => {
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, ids.map((id) => result(id, 'error')));
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.failing(ids), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.failing(ids), agentCommand(repo.root, 'run')));
   assert.equal(REASONS.failing(ids), 'These officers did not pass on this tree: o1, o2, o3, o4, o5, o6, o7, o8, o9, o10 and 3 more. Fix what they report, stage the fix, and run the officers again.');
 });
 
@@ -184,9 +184,9 @@ test('7. a verdict whose officers are not the tree\'s, though none failed, is no
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('types', 'pass'), result('lint', 'pass')]);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.otherOfficers, COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.otherOfficers, agentCommand(repo.root, 'run')));
   recordVerdict(repo.root, at, [result('lint', 'pass')]);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.failing(['types']), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.failing(['types']), agentCommand(repo.root, 'run')));
 });
 
 test('a passing verdict for this tree and base with an approved digest is allowed', () => {
@@ -211,7 +211,7 @@ test('3. an officers.json that is present but invalid is an officers-file proble
   repo.write(OFFICERS_PATH, officersFile().replace('"schema": 1', '"schema": 2'));
   stage(repo);
   assert.deepEqual(judge(repo.root, subject(repo.root)), refused(
-    REASONS.officersProblem('.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.'), COMMANDS.status,
+    REASONS.officersProblem('.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.'), agentCommand(repo.root, 'status'),
   ));
   assert.equal(
     REASONS.officersProblem('x is wrong.'),
@@ -393,7 +393,7 @@ test('Critical 2: an index changed after the tree was judged is refused before t
     }
     return tree;
   };
-  assert.deepEqual(runGate(['pre-commit', PID], repo.root, { readTree: changingTree }), refused(REASONS.indexChanged, COMMANDS.run));
+  assert.deepEqual(runGate(['pre-commit', PID], repo.root, { readTree: changingTree }), refused(REASONS.indexChanged, agentCommand(repo.root, 'run')));
   assert.equal(readInflight(repo.root, PID), null, 'a refusal leaves no in-flight record');
   assert.equal(reads, 2);
   assert.equal(REASONS.indexChanged, 'The index changed while the gate ran, so the tree git would commit is not the one judged. Run the officers again on the staged tree.');
@@ -403,7 +403,8 @@ test('Critical 2: an index changed after the tree was judged is refused before t
 
 // What the gate prints on a refusal, and what the hook adds after it (decision 18, amended).
 const gateText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
-const HOOK_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
+// The two lines a hook of this kit prints last when it refuses.
+const HOOK_LINE = 'kh-orchestration: the commit gate did not allow this commit.\nkh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply.\n';
 // The gate's next step for an installer's file that differs (after Task 9's re-review).
 // It stages the whole install in one command (after Task 9's second re-review).
 const keptNext = () => 'git add -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes, or ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes';
@@ -428,7 +429,7 @@ test('git commit is refused with the gate\'s text, then accepted after ko.mjs ap
   const at = subject(repo.root);
   assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
   assert.equal(owner(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   assert.equal(ko(repo.root, ['run']).status, 0);
   const accepted = commit(repo.root);
   assert.deepEqual([accepted.status, accepted.stderr], [0, '']);
@@ -462,7 +463,7 @@ test('pre-merge-commit: a --no-ff merge into an unmoved main is accepted on the 
   const refusedMerge = gitIn(repo.root, ['merge', '-q', '--no-ff', '-m', 'merge feature', 'feature']);
   assertRefused(repo.root, refusedMerge, moved);
   const tree = gitIn(repo.root, ['write-tree']).stdout.trim();
-  assert.ok(refusedMerge.stderr.includes(refusalText(REASONS.noVerdict(tree, moved), COMMANDS.run)), refusedMerge.stderr);
+  assert.ok(refusedMerge.stderr.includes(refusalText(REASONS.noVerdict(tree, moved), agentCommand(repo.root, 'run'))), refusedMerge.stderr);
 });
 
 test('Review Focus 1: a corrupt approvals.json or exemptions.json refuses the commit with fixed text', async () => {
@@ -470,10 +471,10 @@ test('Review Focus 1: a corrupt approvals.json or exemptions.json refuses the co
   await runAndApprove(repo.root);
   const before = head(repo.root);
   writeFileSync(join(stateDir(repo.root), 'approvals.json'), '{"digests": [');
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.couldNotDecide(corruptMessage('approvals.json')), COMMANDS.status));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.couldNotDecide(corruptMessage('approvals.json')), agentCommand(repo.root, 'status')));
   await runAndApprove(repo.root);
   writeState(repo.root, 'exemptions.json', { branches: [{ name: 'main', reason: '' }] });
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.couldNotDecide(shapeMessage('exemptions.json')), COMMANDS.status));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.couldNotDecide(shapeMessage('exemptions.json')), agentCommand(repo.root, 'status')));
 });
 
 test('Important 1 through git: a neutered live extension, unstaged, with an ordinary file staged and run, does not land', async () => {
@@ -539,7 +540,7 @@ test('Critical 1: reached through a symlink (bin/gate.mjs, the state directory, 
     link(repo);
     const at = subject(repo.root);
     approveTree(repo.root, at.tree);
-    assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+    assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   }
 });
 
@@ -563,7 +564,7 @@ test('Review Focus 1 and Important 3: the hook runs the node recorded at install
   const shim = join(tools, 'node');
   writeFileSync(shim, '#!/bin/sh\necho "kh-orchestration: allowed"\nexit 0\n');
   chmodSync(shim, 0o755);
-  const refusal = refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run);
+  const refusal = refusalText(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run'));
   assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '-m', 'work'], { ...testEnv(), PATH: `${tools}:${process.env.PATH}` }), before, refusal);
   const gitOnly = join(repo.root, '..', 'git-only');
   mkdirSync(gitOnly);
@@ -606,11 +607,12 @@ test('installGate writes the three hooks in decision 18\'s final form: sh -p, no
     'd=${0%/hooks/*}',
     '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
     '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
-    '{ read -r _ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
+    '{ read -r _ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; echo "kh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply." >&2; exit 1; }',
     `if out=$(${startNode('pre-merge-commit')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
     'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
+    'echo "kh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply." >&2',
     'exit 1',
     '',
   ].join('\n'));
@@ -627,11 +629,12 @@ test('installGate writes the three hooks in decision 18\'s final form: sh -p, no
     'done',
     '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
     '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
-    '{ read -r _ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
+    '{ read -r _ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; echo "kh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply." >&2; exit 1; }',
     `if out=$(${startNode('reference-transaction')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
     'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
+    'echo "kh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply." >&2',
     'exit 1',
     '',
   ].join('\n'));
@@ -660,7 +663,7 @@ test('an in-flight record that cannot be written refuses the commit', async () =
   await runAndApprove(repo.root);
   chmodSync(stateDir(repo.root), 0o555);
   try {
-    assert.deepEqual(runGate(['pre-commit', PID], repo.root), refused(REASONS.couldNotDecide(`The shared state file inflight-${PID}.json could not be written.`), COMMANDS.status));
+    assert.deepEqual(runGate(['pre-commit', PID], repo.root), refused(REASONS.couldNotDecide(`The shared state file inflight-${PID}.json could not be written.`), agentCommand(repo.root, 'status')));
   } finally {
     chmodSync(stateDir(repo.root), 0o755);
   }
@@ -701,7 +704,7 @@ test('Review Focus 2: from a linked worktree the hooks, verdicts and approvals o
   assert.equal(gitIn(worktree, ['add', 'b.txt']).status, 0);
   const before = head(worktree);
   const at = subject(worktree);
-  assertRefused(worktree, commit(worktree), before, refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assertRefused(worktree, commit(worktree), before, refusalText(REASONS.noVerdict(at.tree, at.base), agentCommand(worktree, 'run')));
   await runAndApprove(worktree);
   assert.equal(commit(worktree).status, 0);
   assert.notEqual(head(worktree), before);
@@ -714,7 +717,7 @@ test('Review Focus 3: the first commit on an unborn HEAD is judged against the b
   const at = subject(repo.root);
   assert.equal(at.base, 'none');
   approveTree(repo.root, at.tree);
-  assertRefused(repo.root, commit(repo.root), null, refusalText(REASONS.noVerdict(at.tree, 'none'), COMMANDS.run));
+  assertRefused(repo.root, commit(repo.root), null, refusalText(REASONS.noVerdict(at.tree, 'none'), agentCommand(repo.root, 'run')));
   await runAndApprove(repo.root);
   assert.equal(commit(repo.root).status, 0);
   assert.notEqual(headOrNull(repo.root), null);
@@ -738,7 +741,7 @@ test('Review Focus 3: a commit directly on the base branch is judged against HEA
   assert.equal(at.base, head(repo.root));
   recordVerdict(repo.root, { ...at, base: gitIn(repo.root, ['rev-parse', 'HEAD~1']).stdout.trim() }, [result('check', 'pass')]);
   const before = head(repo.root);
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   await runAndApprove(repo.root);
   assert.equal(commit(repo.root).status, 0);
 });
@@ -782,7 +785,7 @@ test('an amended commit on the base branch needs a fresh run even with its tree 
   assert.equal(commit(repo.root).status, 0);
   const before = head(repo.root);
   const tree = indexTree(repo.root);
-  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '--amend', '-m', 'reworded']), before, refusalText(REASONS.noVerdict(tree, before), COMMANDS.run));
+  assertRefused(repo.root, gitIn(repo.root, ['commit', '-q', '--amend', '-m', 'reworded']), before, refusalText(REASONS.noVerdict(tree, before), agentCommand(repo.root, 'run')));
   await runAndApprove(repo.root);
   assert.equal(gitIn(repo.root, ['commit', '-q', '--amend', '-m', 'reworded']).status, 0);
 });
@@ -810,7 +813,7 @@ test('a failing verdict refuses the commit naming the officer; the same tree aft
   stage(repo);
   await runAndApprove(repo.root);
   const before = head(repo.root);
-  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.failing(['check']), COMMANDS.run));
+  assertRefused(repo.root, commit(repo.root), before, refusalText(REASONS.failing(['check']), agentCommand(repo.root, 'run')));
   rmSync(join(repo.root, 'fail.txt'));
   stage(repo);
   await runAndApprove(repo.root);
@@ -862,7 +865,7 @@ test('reference-transaction: an accepted record that cannot be written refuses t
   assert.notEqual(refusedCommit.status, 0);
   assert.equal(head(repo.root), before);
   const name = refusedCommit.stderr.match(/accepted\/[0-9a-f]{40}\.json/)?.[0];
-  assert.ok(refusedCommit.stderr.includes(gateText(REASONS.couldNotDecide(writeFailedMessage(name)), COMMANDS.status)), refusedCommit.stderr);
+  assert.ok(refusedCommit.stderr.includes(gateText(REASONS.couldNotDecide(writeFailedMessage(name)), agentCommand(repo.root, 'status'))), refusedCommit.stderr);
   rmSync(join(stateDir(repo.root), 'accepted'));
   assert.equal(commit(repo.root).status, 0);
   assert.deepEqual(readAccepted(repo.root, head(repo.root)), { tree: gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim(), base: before });
@@ -874,19 +877,19 @@ test('reference-transaction: a commit of another tree, a non-commit, a symbolic 
   const head = gitIn(repo.root, ['rev-parse', 'HEAD']).stdout.trim();
   const other = gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
   assert.notEqual(other, tree);
-  const swapped = refused(REASONS.treeSwapped, COMMANDS.run);
+  const swapped = refused(REASONS.treeSwapped, agentCommand(repo.root, 'run'));
   for (const [line, expected] of [
     [`${head} ${commitOf(repo.root, other)} refs/heads/main`, swapped],
     [`${head} ${tree} refs/heads/main`, swapped],
     [`${NULL_ID} ref:refs/heads/x HEAD`, swapped],
     [`${head} ${'f'.repeat(40)} HEAD`, swapped],
-    ['not an update', refused(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)],
+    ['not an update', refused(REASONS.couldNotDecide(REASONS.unreadableUpdates), agentCommand(repo.root, 'status'))],
   ]) {
     writeInflight(repo.root, PID, { tree, base: 'none' });
     assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${line}\n` }), expected, line);
     assert.equal(readInflight(repo.root, PID), null, line);
   }
-  assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: '' }), refused(REASONS.noRecord, COMMANDS.run));
+  assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: '' }), refused(REASONS.noRecord, agentCommand(repo.root, 'run')));
   assert.equal(REASONS.treeSwapped, 'The tree being committed is not the tree the gate allowed for this git process. Run the command again; if this was a commit, stage what you mean to commit and run the officers first.');
 });
 
@@ -911,7 +914,7 @@ test('an index changed after the gate allowed it is caught at the ref update: HE
   const before = head(repo.root);
   const outcome = commit(repo.root);
   assertRefused(repo.root, outcome, before);
-  assert.ok(outcome.stderr.includes(gateText(REASONS.treeSwapped, COMMANDS.run)), outcome.stderr);
+  assert.ok(outcome.stderr.includes(gateText(REASONS.treeSwapped, agentCommand(repo.root, 'run'))), outcome.stderr);
   assert.ok(outcome.stderr.includes("update aborted by the reference-transaction hook"), outcome.stderr);
   assert.deepEqual(readdirSync(stateDir(repo.root)).filter((name) => name.startsWith('inflight-')), []);
 });
@@ -1050,7 +1053,7 @@ test('no check that runs repository code comes before the approval check: an una
   assert.deepEqual(judge(repo.root, at), refused(REASONS.unapproved(digestOfTree(repo.root, at.tree).digest), ownerCommand(repo.root, 'approve')));
   assert.equal(existsSync(marker), false, 'the dispatcher ran before the approval check');
   approveTree(repo.root, at.tree);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   assert.equal(existsSync(marker), true, 'once approved, the probe runs it');
 });
 
@@ -1061,7 +1064,7 @@ test('the verdict is read before the probe runs: an approved dispatcher that wri
   stage(repo);
   const at = subject(repo.root);
   approveTree(repo.root, at.tree);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), COMMANDS.run));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run')));
   assert.notEqual(readVerdict(repo.root, at.tree, at.base), null, 'the forger did write a verdict while probed');
 });
 
@@ -1217,7 +1220,7 @@ test('rule 1: the same environment changes no outcome of the real gate: an appro
   // The gate's own text is followed by the dynamic loader's complaints about LD_PRELOAD for git.
   const failing = gitIn(repo.root, ['commit', '-q', '-m', 'failing'], hostileEnv(marker));
   assertRefused(repo.root, failing, before);
-  assert.ok(failing.stderr.includes(refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run)), failing.stderr);
+  assert.ok(failing.stderr.includes(refusalText(REASONS.noVerdict(at.tree, at.base), agentCommand(repo.root, 'run'))), failing.stderr);
   rmSync(join(repo.root, 'fail.txt'));
   repo.write('b.txt', 'b\n');
   stage(repo);
@@ -1430,7 +1433,7 @@ test('rule 3: bytes are compared, so a CRLF working copy of a live file differs;
   renameSync(`${scripts}-real`, scripts);
   writeFileSync(join(repo.root, '.claude/scripts/big.mjs'), Buffer.alloc(4 * 1024 * 1024 + 1));
   stage(repo);
-  assert.deepEqual(judge(repo.root, subject(repo.root)), refused(REASONS.liveTooLarge('.claude/scripts/big.mjs'), COMMANDS.status));
+  assert.deepEqual(judge(repo.root, subject(repo.root)), refused(REASONS.liveTooLarge('.claude/scripts/big.mjs'), agentCommand(repo.root, 'status')));
   assert.equal(REASONS.liveTooLarge('x'), 'x is larger than 4 MiB, more than the gate compares; a live file of that size is not part of an install. Remove it from the tree, then commit again.');
 });
 
@@ -1477,7 +1480,7 @@ test('rule 4: a temporary directory inside the repository is refused for the pri
   writeFileSync(join(repo.root, '.git', 'info', 'exclude'), 'tmp-inside/\n');
   const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
   const outcome = spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: { ...testEnv(), TMPDIR: inside }, encoding: 'utf8' });
-  assert.deepEqual([outcome.status, outcome.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirInside), COMMANDS.status)]);
+  assert.deepEqual([outcome.status, outcome.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirInside), agentCommand(repo.root, 'status'))]);
   assert.deepEqual(readdirSync(inside), []);
 });
 
@@ -1487,9 +1490,9 @@ test('rule 4: a relative or missing temporary directory is refused with what to 
   const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
   const runWith = (tmp) => spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: { ...testEnv(), TMPDIR: tmp }, encoding: 'utf8' });
   const relative = runWith('tmp-relative');
-  assert.deepEqual([relative.status, relative.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirRelative), COMMANDS.status)]);
+  assert.deepEqual([relative.status, relative.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirRelative), agentCommand(repo.root, 'status'))]);
   const missing = runWith('/nonexistent/ko-tmp');
-  assert.deepEqual([missing.status, missing.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirUnusable), COMMANDS.status)]);
+  assert.deepEqual([missing.status, missing.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirUnusable), agentCommand(repo.root, 'status'))]);
   assert.equal(REASONS.probeDirRelative, 'TMPDIR names a relative path, so the place of the private copy of the approved tree depends on the directory git runs in; set TMPDIR to an absolute directory outside the repository');
   assert.equal(REASONS.probeDirUnusable, 'the temporary directory for the private copy of the approved tree (TMPDIR, or /tmp when it is not set) does not exist or cannot be written; set TMPDIR to a directory outside the repository that can');
   // The loose object of a live file goes: the copy cannot be read from the object store.
@@ -1498,7 +1501,7 @@ test('rule 4: a relative or missing temporary directory is refused with what to 
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'ko-gate-tmp-')));
   try {
     const unreadable = runWith(scratch);
-    assert.deepEqual([unreadable.status, unreadable.stderr], [1, gateText(REASONS.couldNotDecide(gitFailedMessage('read the file')), COMMANDS.status)]);
+    assert.deepEqual([unreadable.status, unreadable.stderr], [1, gateText(REASONS.couldNotDecide(gitFailedMessage('read the file')), agentCommand(repo.root, 'status'))]);
     assert.deepEqual(readdirSync(scratch), [], 'the private copy is removed');
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -1511,9 +1514,9 @@ test('rule 5 (L5): an env in settings.local.json or settings.json that sets NODE
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('check', 'pass')]);
   writeFileSync(join(repo.root, '.claude/settings.local.json'), '{ "env": { "LD_PRELOAD": "/x/evil.so" } }\n');
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.projectEnv('.claude/settings.local.json', 'LD_PRELOAD'), COMMANDS.status));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.projectEnv('.claude/settings.local.json', 'LD_PRELOAD'), agentCommand(repo.root, 'status')));
   writeFileSync(join(repo.root, '.claude/settings.local.json'), '{ "env": { "dyld_x": "1" } }\n');
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.projectEnv('.claude/settings.local.json', 'dyld_x'), COMMANDS.status));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.projectEnv('.claude/settings.local.json', 'dyld_x'), agentCommand(repo.root, 'status')));
   rmSync(join(repo.root, '.claude/settings.local.json'));
   const settings = JSON.parse(readFileSync(join(repo.root, '.claude/settings.json'), 'utf8'));
   settings.env = { NODE_PATH: '/x' };
@@ -1521,7 +1524,7 @@ test('rule 5 (L5): an env in settings.local.json or settings.json that sets NODE
   stage(repo);
   const changed = subject(repo.root);
   approveTree(repo.root, changed.tree);
-  assert.deepEqual(judge(repo.root, changed), refused(REASONS.projectEnv('.claude/settings.json', 'NODE_PATH'), COMMANDS.status));
+  assert.deepEqual(judge(repo.root, changed), refused(REASONS.projectEnv('.claude/settings.json', 'NODE_PATH'), agentCommand(repo.root, 'status')));
   assert.equal(REASONS.projectEnv('f', 'K'), 'f sets K under env, which would load code into every hook process of the session. Remove it outside Claude Code, then commit again.');
 });
 
@@ -1538,4 +1541,31 @@ test('the owner\'s flow still lands: edit a live file, stage, approve, run, comm
   assert.equal(ko(repo.root, ['run']).status, 0);
   assert.equal(owner(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
   assert.equal(commit(repo.root).status, 0);
+});
+
+// After the whole-branch review: every next line the gate prints runs where the person is.
+test('the gate\'s run and status lines name the working copy\'s ko.mjs by its absolute path, so they run pasted from a subdirectory', () => {
+  const repo = installed();
+  assert.equal(owner(repo.root, ['approve'], { input: 'approve\n' }).status, 0);
+  const result = commit(repo.root);
+  assert.equal(result.status, 1);
+  const next = result.stderr.split('\n').find((line) => line.startsWith('Next: ')).slice('Next: '.length);
+  assert.equal(next, agentCommand(repo.root, 'run'));
+  assert.equal(judge(repo.root, subject(repo.root)).next, agentCommand(repo.root, 'run'));
+  mkdirSync(join(repo.root, 'deep'), { recursive: true });
+  const ran = spawnSync('sh', ['-c', next], { cwd: join(repo.root, 'deep'), env: testEnv(), encoding: 'utf8' });
+  assert.equal(ran.status, 0, ran.stderr);
+  assert.ok(ran.stdout.startsWith('Officers on the staged tree '), ran.stdout);
+});
+
+test('a refused commit\'s hook ends with the fixed line and one more that says how to find the cause, when the gate answers and when there is no gate', () => {
+  const repo = installed();
+  const tail = `${REFUSED_TEXT}\n${REFUSED_HINT}\n`;
+  const refusedHere = commit(repo.root);
+  assert.equal(refusedHere.status, 1);
+  assert.ok(refusedHere.stderr.endsWith(tail), refusedHere.stderr);
+  rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
+  const noGate = commit(repo.root);
+  assert.deepEqual([noGate.status, noGate.stderr], [1, tail]);
+  assert.equal(REFUSED_HINT, 'kh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply.');
 });

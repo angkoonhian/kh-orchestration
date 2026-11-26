@@ -36,7 +36,8 @@ after(() => {
   for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
 });
 
-const REFUSED_LINE = 'kh-orchestration: the commit gate did not allow this commit.\n';
+// The two lines a hook of this kit prints last when it refuses.
+const REFUSED_LINE = 'kh-orchestration: the commit gate did not allow this commit.\nkh-orchestration: for the cause, run kh-orchestration\'s status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration\'s apply.\n';
 const TEXT_UNTIDY_START = 'The working tree differs from the index';
 const command = (name) => join(PLUGIN_DIR, 'scripts', `${name}.mjs`);
 const env = () => ({ ...testEnv(), KH_DATA_DIR: process.env.KH_DATA_DIR, HK_MARKER_DIR: process.env.HK_MARKER_DIR });

@@ -223,18 +223,18 @@ export function readOfficers(officersJsonText) {
 export const shellWord = (text) => (/^[A-Za-z0-9._/@+=,:-]+$/.test(text) ? text : `'${text.replaceAll("'", "'\\''")}'`);
 
 const KO = 'node .claude/kh-orchestration/scripts/ko.mjs';
-// The agents' commands a refusal names, in one table: the gate and ko.mjs import it from here, so
-// every message names a command in the same words. The owner's commands act only from the
-// approved copy in <git-common-dir>/kh-orchestration/bin/, a path of each repository: ko-state's
+// The agents' commands as this file's messages name them, root-relative (the extension cannot know
+// the root cheaply), and as the gate and ko.mjs name them where the root is not known. Where it is
+// known, ko-state's agentCommand names the same ko.mjs by its absolute path. The owner's commands
+// act only from the approved copy in <git-common-dir>/kh-orchestration/bin/: ko-state's
 // ownerCommand builds them, and this file's own messages name that copy through git.
 export const COMMANDS = Object.freeze({
   run: `${KO} run`,
   status: `${KO} status`,
-  verifyBranch: `${KO} verify-branch`,
-  unexempt: `${KO} unexempt`,
 });
 const OWNER_KO = 'node "$(git rev-parse --git-common-dir)/kh-orchestration/bin/ko.mjs"';
-const RUN = COMMANDS.run;
+// Said where a message names it: the path is root-relative.
+const RUN = `${COMMANDS.run} from the repository's top directory`;
 const unseen = (reason) => `This command's structure cannot be seen (${reason}) and its text holds a way round the commit gate (no-verify, hooksPath, a .git path, an owner-only ko.mjs command), so it is blocked. Run it as plain commands.`;
 
 // Every text the hook returns. Each is one line of at most 300 characters with no `<` or `>`,

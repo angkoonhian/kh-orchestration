@@ -327,6 +327,13 @@ export function switchOn(root) {
 // unstaged edit to the working copy never runs with the owner's authority.
 export const ownerCommand = (root, words) => `node ${shellWord(join(stateDir(root), BIN, 'ko.mjs'))} ${words}`;
 
+// The one rule for an agent's command a refusal or report prints (after the whole-branch review,
+// the gate's too): the working copy's ko.mjs of the worktree `root` by its absolute path, quoted
+// for a shell, so it runs from whatever directory the person is in (a subdirectory, a linked
+// worktree). The extension cannot know the root cheaply, so its texts name the root-relative path
+// and say to run it from the repository's top directory.
+export const agentCommand = (root, words) => `node ${shellWord(join(root, '.claude/kh-orchestration/scripts/ko.mjs'))} ${words}`;
+
 // What kh-orchestration's installer writes in the working tree, staged in one command (after Task
 // 9's second re-review): staged one file at a time, an extension entry and its module could be
 // split by an ordinary git restore, and kh-harness would then block every tool call. apply's

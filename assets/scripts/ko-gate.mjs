@@ -37,7 +37,7 @@ import { contractHolds } from './ko-contract.mjs';
 import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommit, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { FILE_MODES, StateError, approvalStanding, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, STAGE_INSTALL_NOTE, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
+import { FILE_MODES, StateError, agentCommand, approvalStanding, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, STAGE_INSTALL_NOTE, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
@@ -277,7 +277,7 @@ function liveRefusal(root, live) {
   const inTree = new Map(live.map((entry) => [entry.path, entry]));
   for (const entry of live) {
     const read = entry.type === 'blob' && FILE_MODES.includes(entry.mode) ? readNoFollow(join(root, entry.path)) : { differs: true };
-    if (read.tooLarge) return refuse(REASONS.liveTooLarge(entry.path), COMMANDS.status);
+    if (read.tooLarge) return refuse(REASONS.liveTooLarge(entry.path), agentCommand(root, 'status'));
     if (read.differs) return differsRefusal(root, entry.path, entry);
     if (!hashesTo(entry.oid, read.bytes)) return differsRefusal(root, entry.path, entry, convertedFrom(entry.oid, read.bytes) ? 'lineEndings' : undefined);
     if (read.executable !== (entry.mode === '100755')) return differsRefusal(root, entry.path, entry, 'mode');
@@ -305,7 +305,7 @@ function projectEnvRefusal(root) {
     const env = value !== null && typeof value === 'object' ? value.env : undefined;
     if (env === null || typeof env !== 'object') continue;
     const key = Object.keys(env).find((name) => LOADER_ENV.test(name));
-    if (key !== undefined) return refuse(REASONS.projectEnv(file, key), COMMANDS.status);
+    if (key !== undefined) return refuse(REASONS.projectEnv(file, key), agentCommand(root, 'status'));
   }
   return null;
 }
@@ -360,13 +360,14 @@ export const liveFilesRefusal = (root, tree) => liveRefusal(root, liveEntries(ro
 // 8. The verdict's refusal, or null when it passes; `verdict` is the copy read before the probe. Named: the tree's officers the verdict shows
 // no pass or skip for. When there are none and it still does not pass, its list is in another
 // order or holds officers the tree does not name.
-function verdictRefusal(verdict, { tree, base }, digest, officers) {
-  if (verdict === null) return refuse(REASONS.noVerdict(tree, base), COMMANDS.run);
-  if (verdict.digest !== digest) return refuse(REASONS.digestDiffers, COMMANDS.run);
+function verdictRefusal(root, verdict, { tree, base }, digest, officers) {
+  const run = agentCommand(root, 'run');
+  if (verdict === null) return refuse(REASONS.noVerdict(tree, base), run);
+  if (verdict.digest !== digest) return refuse(REASONS.digestDiffers, run);
   if (passing(verdict, officers)) return null;
   const passed = new Set(verdict.officers.filter((entry) => entry.result === 'pass' || entry.result === 'skipped').map((entry) => entry.id));
   const failed = officers.map((officer) => officer.id).filter((id) => !passed.has(id));
-  return refuse(failed.length > 0 ? REASONS.failing(failed) : REASONS.otherOfficers, COMMANDS.run);
+  return refuse(failed.length > 0 ? REASONS.failing(failed) : REASONS.otherOfficers, run);
 }
 
 /**
@@ -402,21 +403,21 @@ export function judge(root, { tree, base, branch }, { honourSwitches = true, pro
       ? refuse(REASONS.noInstallDetached(install.absent), 'git switch -c <branch>')
       : refuse(REASONS.noInstall(install.absent), exemptCommand(root, branch));
   }
-  if (install.problem !== undefined) return refuse(REASONS.officersProblem(install.problem), COMMANDS.status);
+  if (install.problem !== undefined) return refuse(REASONS.officersProblem(install.problem), agentCommand(root, 'status'));
   const live = liveEntries(root, tree);
   const liveProblem = liveRefusal(root, live);
   if (liveProblem !== null) return liveProblem;
   const digest = digestOfTree(root, tree);
-  if (digest.problem !== undefined) return refuse(REASONS.undigestable(digest.problem), COMMANDS.run);
+  if (digest.problem !== undefined) return refuse(REASONS.undigestable(digest.problem), agentCommand(root, 'run'));
   const standing = approvalStanding(readApprovals(root), digest.digest, () => baseDigestOf(root, base));
   if (standing !== 'approved') return refuse(standing === 'older' ? REASONS.olderApproval(digest.digest) : REASONS.unapproved(digest.digest), ownerCommand(root, 'approve'));
   const verdict = readVerdict(root, tree, base);
   const envProblem = projectEnvRefusal(root);
   if (envProblem !== null) return envProblem;
   const { holds, problem } = probe ? contractOnPrivateCopy(root, live) : { holds: contractHolds(root, { probe: false }) };
-  if (problem !== undefined) return refuse(REASONS.couldNotDecide(problem), COMMANDS.status);
-  if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), COMMANDS.status);
-  return verdictRefusal(verdict, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
+  if (problem !== undefined) return refuse(REASONS.couldNotDecide(problem), agentCommand(root, 'status'));
+  if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), agentCommand(root, 'status'));
+  return verdictRefusal(root, verdict, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
 }
 
 // The fixed text of a failure: the message of a StateError or a GitError, which is fixed text, and
@@ -438,7 +439,7 @@ function judgeIndex(root, pid, readTree) {
   const base = read.problem === undefined ? baseOf(root, read.baseBranch) : null;
   const decision = judge(root, { tree, base, branch });
   if (decision.reason !== REASONS.allowed) return decision;
-  if (readTree(root) !== tree) return refuse(REASONS.indexChanged, COMMANDS.run);
+  if (readTree(root) !== tree) return refuse(REASONS.indexChanged, agentCommand(root, 'run'));
   writeInflight(root, pid, { tree, base });
   return decision;
 }
@@ -483,11 +484,11 @@ function judgeUpdate(root, pid, input) {
     removeInflight(root, pid);
     throw error;
   }
-  if (judged === null) return refuse(REASONS.noRecord, COMMANDS.run);
+  if (judged === null) return refuse(REASONS.noRecord, agentCommand(root, 'run'));
   const updates = parseUpdates(input);
   const decision = updates === null
-    ? refuse(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)
-    : updates.every((update) => keepsTree(root, update, judged.tree)) ? allow(REASONS.updateAllowed) : refuse(REASONS.treeSwapped, COMMANDS.run);
+    ? refuse(REASONS.couldNotDecide(REASONS.unreadableUpdates), agentCommand(root, 'status'))
+    : updates.every((update) => keepsTree(root, update, judged.tree)) ? allow(REASONS.updateAllowed) : refuse(REASONS.treeSwapped, agentCommand(root, 'run'));
   const landing = decision.allow ? [...new Set(updates.filter((update) => movesBranch(update) && !NULL_ID.test(update.next)).map((update) => update.next))] : [];
   try {
     for (const commit of landing) writeAccepted(root, commit, judged);
@@ -505,12 +506,15 @@ function judgeUpdate(root, pid, input) {
  * throw is a refusal with fixed text.
  */
 export function runGate(args, cwd, { readTree = indexTree, input } = {}) {
+  let root = null;
   try {
     const [hook, pid] = args;
+    // Before the root is known, the status line is the root-relative one: a hook runs at the
+    // worktree's top, and only a gate started by hand gets here.
     if (args.length !== 2 || ![...COMMIT_HOOKS, REFERENCE_HOOK].includes(hook) || !PID.test(pid)) {
       return refuse(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status);
     }
-    const root = repoRoot(cwd);
+    root = repoRoot(cwd);
     if (root === null) return refuse(REASONS.couldNotDecide(REASONS.notARepository), COMMANDS.status);
     // Records left by git processes that ended before their branch update (a failing commit-msg
     // hook, an empty message, nothing to commit) are removed on every run.
@@ -518,6 +522,6 @@ export function runGate(args, cwd, { readTree = indexTree, input } = {}) {
     if (hook === REFERENCE_HOOK) return judgeUpdate(root, pid, input ?? readFileSync(0, 'utf8'));
     return judgeIndex(root, pid, readTree);
   } catch (error) {
-    return refuse(REASONS.couldNotDecide(failureReason(error)), COMMANDS.status);
+    return refuse(REASONS.couldNotDecide(failureReason(error)), root === null ? COMMANDS.status : agentCommand(root, 'status'));
   }
 }
