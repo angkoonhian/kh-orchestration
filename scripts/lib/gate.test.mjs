@@ -465,7 +465,7 @@ test('Important 1 through git: a neutered live extension, unstaged, with an ordi
   assertRefused(repo.root, commit(repo.root), head(repo.root), refusalText(REASONS.liveDiffers(first), `git restore -- ${first}`));
 });
 
-test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commit; a missing sibling with fixed text, a missing gate or bin/ with only the hook\'s line', async () => {
+test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commit; a missing sibling with fixed text, a missing gate, a gate that is a directory, or no bin/ with only the hook\'s line', async () => {
   const repo = installed();
   await runAndApprove(repo.root);
   const before = head(repo.root);
@@ -473,6 +473,8 @@ test('Review Focus 1: a deleted bin/gate.mjs or bin/ko-git.mjs refuses the commi
   rmSync(join(bin, 'ko-git.mjs'));
   assertRefused(repo.root, commit(repo.root), before, `${UNLOADABLE}${HOOK_LINE}`);
   rmSync(join(bin, 'gate.mjs'));
+  assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
+  mkdirSync(join(bin, 'gate.mjs'));
   assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
   rmSync(bin, { recursive: true });
   assertRefused(repo.root, commit(repo.root), before, HOOK_LINE);
@@ -584,8 +586,9 @@ test('installGate writes the three hooks in decision 18\'s final form: sh -p, no
     `# kh-orchestration ${KIT_VERSION} pre-merge-commit. Do not edit.`,
     ...HOOK_COMMENT,
     'd=${0%/hooks/*}',
-    '# A gate that cannot be opened refuses here, before node could print a trace.',
-    '{ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
+    '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
+    '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
+    '{ read -r _ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
     `if out=$(${startNode('pre-merge-commit')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
@@ -604,8 +607,9 @@ test('installGate writes the three hooks in decision 18\'s final form: sh -p, no
     'for f in "$d/kh-orchestration/inflight-$PPID".jso[n]; do',
     "  case $f in *'.jso[n]') exit 0 ;; esac",
     'done',
-    '# A gate that cannot be opened refuses here, before node could print a trace.',
-    '{ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
+    '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
+    '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
+    '{ read -r _ < "$d/kh-orchestration/bin/gate.mjs"; } 2>/dev/null || { echo "kh-orchestration: the commit gate did not allow this commit." >&2; exit 1; }',
     `if out=$(${startNode('reference-transaction')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',

@@ -1,5 +1,6 @@
 // The shared state directory: <git-common-dir>/kh-orchestration/, the same
 // directory from every linked worktree.
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -23,7 +24,8 @@ export const writeFailedMessage = (name) => `The shared state file ${name} could
 export const stateUnreadableMessage = 'The shared state directory could not be read; nothing proceeds on state that cannot be read.';
 export const invalidCommitMessage = 'An accepted record is named by a full hexadecimal commit id.';
 export const invalidPidMessage = 'An in-flight record is named by the process id of a git command: digits only, without a leading zero.';
-export const binIncompleteMessage = 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs, so bin/ is not refreshed from it: the hooks would find no gate. Stage the install\'s scripts first.';
+export const binIncompleteMessage = 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs or ko.mjs, so bin/ is not refreshed from it: the hooks or the owner\'s commands would find nothing to run. Stage the install\'s scripts first.';
+export const binPreflightMessage = (script) => `The staged tree's .claude/kh-orchestration/scripts/${script} does not load (a syntax error, a missing file, or a script it imports that is missing or damaged), so bin/ is not refreshed from it and nothing is approved: the hooks and the owner's commands would stop working. Fix it in the working copy, stage it, and approve again.`;
 export const binEntryMessage = (path) => `${path} is not a regular file in the tree, so bin/ is not refreshed from it.`;
 export const shapeMessage = (name) =>
   `The shared state file ${name} is not of the shape kh-orchestration writes. Restore it from a backup or ask the owner to remove it; nothing proceeds on a state file that cannot be read.`;
@@ -304,24 +306,68 @@ const BIN_LEFTOVER = /^bin\.[0-9]+\.[0-9a-f-]+\.(?:tmp|old)$/;
 // git file modes of a regular file; a link (120000) or a submodule (160000) is not one.
 export const FILE_MODES = ['100644', '100755'];
 
-/**
- * Replaces <state>/bin/ with the scripts of `tree` (decision 19): every `.mjs` file directly in
- * `.claude/kh-orchestration/scripts/`, each read from the object store and verified against its
- * object id. The new directory is written beside bin/ in full, then renamed into place, so a hook
- * never finds a bin/ holding some files of one tree and some of another: it finds the old bin/,
- * the new one, or (for the instant between the two renames, or after a kill there) none, which
- * the hooks refuse on. A tree without gate.mjs, an entry that is not a regular file, or a blob
- * that does not hash to its id leaves bin/ as it was and throws a StateError; a failed read throws
- * what ko-git throws. Called by `approve`, and by `apply` (Task 9).
- */
 // The entries bin/ is made of from `tree`: every `.mjs` directly in the installed scripts folder.
 // status compares bin/ with the same selection.
 export const binEntriesOf = (root, tree) => listEntries(root, tree)
   .filter((entry) => entry.path.startsWith(SCRIPTS_DIR) && entry.path.endsWith('.mjs') && !entry.path.slice(SCRIPTS_DIR.length).includes('/'));
 
+// The pre-flight's one child: it imports every module of the new copy but the two entries (which
+// would run), in name order, and reports the first that does not load by name (for a missing file,
+// the missing file's); then it prints the refusal the new copy's own gate gives an unknown hook
+// name, built from that copy's texts, so a reworded text never fails a good copy.
+const PREFLIGHT = `const { basename, join } = await import('node:path');
+const { pathToFileURL } = await import('node:url');
+const [dir, ...names] = process.argv.slice(1);
+const load = (name) => import(pathToFileURL(join(dir, name)).href);
+for (const name of names) {
+  try {
+    await load(name);
+  } catch (error) {
+    const missing = /Cannot find module '([^']+)'/.exec(String(error?.message))?.[1];
+    process.stdout.write(JSON.stringify({ failed: missing === undefined ? name : basename(missing) }));
+    process.exit(1);
+  }
+}
+const gate = await load('ko-gate.mjs');
+const extension = await load('extension.mjs');
+process.stdout.write(JSON.stringify({ gateText: 'kh-orchestration: ' + gate.REASONS.couldNotDecide(gate.REASONS.notAHook) + '\\nNext: ' + extension.COMMANDS.status + '\\n' }));`;
+const ENTRIES = ['gate.mjs', 'ko.mjs'];
+const PREFLIGHT_TIMEOUT_MS = 30_000;
+
+// Whether the copy in `dir` loads, before it becomes bin/ (after Task 7's second review): an
+// approved script that does not parse, or a missing sibling, would otherwise stop the hooks and the
+// owner's commands at once, with approve itself among them. Each check runs this process's Node, in
+// `dir`, with an empty environment. Throws binPreflightMessage(<the script>) on the first failure.
+function preflight(dir, names) {
+  const run = (argv) => spawnSync(process.execPath, argv, { cwd: dir, env: {}, encoding: 'utf8', timeout: PREFLIGHT_TIMEOUT_MS });
+  const loaded = run(['--input-type=module', '-e', PREFLIGHT, dir, ...names.filter((name) => !ENTRIES.includes(name))]);
+  let report;
+  try {
+    report = JSON.parse(loaded.stdout);
+  } catch {
+    report = {};
+  }
+  if (loaded.status !== 0 || typeof report.gateText !== 'string') throw new StateError(binPreflightMessage(report.failed ?? 'ko-gate.mjs'));
+  const help = run([join(dir, 'ko.mjs'), '--help']);
+  if (help.status !== 0 || !help.stdout.startsWith('usage: ') || help.stderr !== '') throw new StateError(binPreflightMessage('ko.mjs'));
+  const gate = run([join(dir, 'gate.mjs'), 'not-a-hook', '1']);
+  if (gate.status !== 1 || gate.stdout !== '' || gate.stderr !== report.gateText) throw new StateError(binPreflightMessage('gate.mjs'));
+}
+
+/**
+ * Replaces <state>/bin/ with the scripts of `tree` (decision 19): every `.mjs` file directly in
+ * `.claude/kh-orchestration/scripts/`, each read from the object store and verified against its
+ * object id. The new directory is written beside bin/ in full and checked to load (preflight),
+ * then renamed into place, so a hook never finds a bin/ holding some files of one tree and some
+ * of another, nor one that cannot start: it finds the old bin/, the new one, or (for the instant
+ * between the two renames, or after a kill there) none, which the hooks refuse on. A tree without
+ * gate.mjs or ko.mjs, an entry that is not a regular file, a blob that does not hash to its id, or
+ * a copy that does not load leaves bin/ as it was and throws a StateError; a failed read throws
+ * what ko-git throws. Called by `approve`, and by `apply` (Task 9), which so gets the same check.
+ */
 export function refreshBin(root, tree) {
   const scripts = binEntriesOf(root, tree);
-  if (!scripts.some((entry) => entry.path === `${SCRIPTS_DIR}gate.mjs`)) throw new StateError(binIncompleteMessage);
+  if (!ENTRIES.every((name) => scripts.some((entry) => entry.path === `${SCRIPTS_DIR}${name}`))) throw new StateError(binIncompleteMessage);
   const notFile = scripts.find((entry) => entry.type !== 'blob' || !FILE_MODES.includes(entry.mode));
   if (notFile !== undefined) throw new StateError(binEntryMessage(notFile.path));
   const blobs = readBlobs(root, scripts.map((entry) => entry.oid));
@@ -341,6 +387,12 @@ export function refreshBin(root, tree) {
   } catch {
     rmSync(fresh, { recursive: true, force: true });
     throw new StateError(writeFailedMessage(BIN));
+  }
+  try {
+    preflight(fresh, scripts.map((entry) => entry.path.slice(SCRIPTS_DIR.length)).sort());
+  } catch (error) {
+    rmSync(fresh, { recursive: true, force: true });
+    throw error;
   }
   try {
     try {

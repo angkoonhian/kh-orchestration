@@ -11,12 +11,12 @@ import { pathToFileURL } from 'node:url';
 import { KH_HARNESS_DIR, KIT_VERSION, installGate, testEnv } from './test-repo.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
 import { commit, gitIn, head, installed, ko, owner, stage } from './gate-fixture.mjs';
-import { TEXT, USAGE } from '../../assets/scripts/ko-cli.mjs';
+import { TEXT, USAGE, repairCommand } from '../../assets/scripts/ko-cli.mjs';
 import { COMMANDS, shellWord } from '../../assets/scripts/extension.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
 import { baseOf, headBaseOf, indexTree } from '../../assets/scripts/ko-git.mjs';
-import { corruptMessage, ownerCommand, readAccepted, readApprovals, readProposals, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
+import { binPreflightMessage, corruptMessage, ownerCommand, readAccepted, readApprovals, readProposals, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { readVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 const refusalText = (reason, next) => `kh-orchestration: ${reason}\nNext: ${next}\n`;
@@ -24,6 +24,8 @@ const usageText = (reason) => `kh-orchestration: ${reason}\n${USAGE}`;
 const lines = (text) => text.split('\n').filter((line) => line !== '');
 const OWNER_COMMANDS = [['approve'], ['propose'], ['waive', 'V8', '--reason', 'r'], ['exempt', 'old', '--reason', 'r'], ['off'], ['on']];
 const KO = COMMANDS.status.slice(0, -' status'.length);
+// An agent's command as ko.mjs prints it: the working copy's ko.mjs by its absolute path, quoted for a shell.
+const agent = (root, words) => `node ${shellWord(join(root, '.claude/kh-orchestration/scripts/ko.mjs'))} ${words}`;
 const FILTER_ORIGIN = 'git config --show-origin --get-regexp \'^filter\\.\'';
 
 // The state directory's names and each file's bytes, to show a refused command changed nothing.
@@ -95,7 +97,7 @@ test('run refuses an untidy tree, naming what to stage, at most ten paths, and r
   for (let index = 0; index < 11; index += 1) repo.write(`new-${String(index).padStart(2, '0')}.txt`, 'x\n');
   const result = ko(repo.root, ['run']);
   const paths = ['a.txt', ...Array.from({ length: 11 }, (_, index) => `new-${String(index).padStart(2, '0')}.txt`)];
-  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.untidy(paths), `git add -A && ${COMMANDS.run}`)]);
+  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.untidy(paths), `git add -A && ${agent(repo.root, 'run')}`)]);
   assert.equal(
     TEXT.untidy(['a', 'b']),
     'The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage or remove: a, b.',
@@ -149,7 +151,7 @@ test('run on a failing tree exits 1, names the officers and shows the first line
   assert.match(out[1], /^ {2}check {2}pass {2}/);
   assert.match(out[2], /^ {2}loud {2}fail {2}/);
   assert.deepEqual(out.slice(3, 13), Array.from({ length: 10 }, (_, index) => `    | line ${index + 1}[31m`), 'ten lines, the escape character removed');
-  assert.deepEqual(out.slice(13), [TEXT.agentChanges([]), TEXT.failing(['loud']), `Next: ${COMMANDS.run}`]);
+  assert.deepEqual(out.slice(13), [TEXT.agentChanges([]), TEXT.failing(['loud']), `Next: ${agent(repo.root, 'run')}`]);
   assert.equal(TEXT.failing(['loud']), 'Failing: these officers did not pass: loud. Fix what they report, stage the fix, and run the officers again.');
 });
 
@@ -222,7 +224,7 @@ test('run refuses a staged officers file it cannot use, naming the problem, and 
   const repo = installed({ officers: '{"schema": 1}\n' });
   const result = ko(repo.root, ['run']);
   const problem = '.claude/kh-orchestration/officers.json is absent from the tree or is not an officers file.';
-  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.cannotRun(problem), COMMANDS.status)]);
+  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.cannotRun(problem), agent(repo.root, 'status'))]);
   assert.equal(existsSync(join(stateDir(repo.root), 'verdicts')), false);
 });
 
@@ -231,7 +233,7 @@ test('run with no officers says so and passes; a state file that cannot be read 
   writeFileSync(join(stateDir(repo.root), 'approvals.json'), '{"digests": [');
   const result = ko(repo.root, ['run']);
   assert.deepEqual(lines(result.stdout).slice(1), [TEXT.noOfficers, TEXT.agentChanges([])]);
-  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.failed(corruptMessage('approvals.json')), COMMANDS.status)]);
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.failed(corruptMessage('approvals.json')), agent(repo.root, 'status'))]);
   assert.notEqual(readVerdict(repo.root, indexTree(repo.root), baseOf(repo.root, 'main')), null);
   assert.equal(TEXT.failed('x.'), 'ko.mjs could not finish: x.');
 });
@@ -274,7 +276,7 @@ test('with the log disabled, or the contract not listing the log, run records no
   assert.equal(logCommand(repo.root, 'enable').status, 0);
   writeFileSync(join(repo.root, '.claude/scripts/harness-log.mjs'), 'process.stdout.write("must not be imported");\n');
   const unchecked = ko(repo.root, ['run'], { env: { ...testEnv(), CLAUDE_CODE_SESSION_ID: 'ko-test-unhashed' } });
-  assert.deepEqual([unchecked.status, unchecked.stderr], [1, refusalText(TEXT.untidy(['.claude/scripts/harness-log.mjs']), `git add -A && ${COMMANDS.run}`)]);
+  assert.deepEqual([unchecked.status, unchecked.stderr], [1, refusalText(TEXT.untidy(['.claude/scripts/harness-log.mjs']), `git add -A && ${agent(repo.root, 'run')}`)]);
   stage(repo);
   const staged = ko(repo.root, ['run'], { env: { ...testEnv(), CLAUDE_CODE_SESSION_ID: 'ko-test-unhashed' } });
   assert.equal(staged.status, 0);
@@ -317,7 +319,7 @@ test('approve shows the covered files, reads the word approve, records the index
   const out = result.stdout.split('\n');
   assert.deepEqual(out.slice(0, 2), [TEXT.approveHeader(tree, digest.digest, 'main'), TEXT.coveredFiles(digest.paths.length)]);
   assert.deepEqual(out.slice(2, 2 + digest.paths.length), digest.paths.map((path) => `  ${path}`));
-  assert.deepEqual(out.slice(2 + digest.paths.length), [TEXT.noEarlierApproval, TEXT.prompt, TEXT.approved(digest.digest, tree), `Next: ${TEXT.approvedNext}`, '']);
+  assert.deepEqual(out.slice(2 + digest.paths.length), [TEXT.noEarlierApproval, TEXT.prompt, TEXT.approved(digest.digest, tree), `Next: ${TEXT.approvedNext(agent(repo.root, 'run'))}`, '']);
   const [record] = readApprovals(repo.root);
   assert.deepEqual({ ...record, approvedAt: 'x' }, { digest: digest.digest, tree, approvedAt: 'x', branch: 'main' });
   assert.deepEqual(readProposals(repo.root), [realpathSync(side)]);
@@ -326,7 +328,7 @@ test('approve shows the covered files, reads the word approve, records the index
   const scripts = join(repo.root, '.claude/kh-orchestration/scripts');
   assert.deepEqual(readdirSync(bin).sort(), readdirSync(scripts).sort(), 'the stale script is gone');
   for (const name of readdirSync(scripts)) assert.equal(readFileSync(join(bin, name), 'utf8'), readFileSync(join(scripts, name), 'utf8'));
-  assert.equal(TEXT.approvedNext, `${COMMANDS.run}, then git commit`);
+  assert.equal(TEXT.approvedNext('x'), 'x, then git commit');
 
   const again = approveAnswer(repo.root);
   assert.ok(again.stdout.includes(`${TEXT.alreadyApproved}\n`));
@@ -361,7 +363,7 @@ test('approve shows the diff of the covered files against the last approved tree
   repo.write('tools/check.mjs', 'an unstaged change approve must not show\n');
   const result = approveAnswer(repo.root);
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(result.stdout.includes(`${TEXT.baselineBranch(earlier, approvedAt)}\n`));
+  assert.ok(result.stdout.includes(`${TEXT.baselineBranch(earlier, approvedAt, 'main')}\n`));
   assert.ok(result.stdout.includes('+// hidden\\u{1b}[8m text'), result.stdout);
   assert.equal(result.stdout.includes('a.txt'), false);
   assert.equal(result.stdout.includes('an unstaged change'), false);
@@ -377,7 +379,7 @@ test('approve says when the tree of the last approval on this branch is no longe
   writeState(repo.root, 'approvals.json', { digests: [{ digest: 'f'.repeat(64), tree: gone, approvedAt: 'x', branch: 'main' }, { digest: 'd'.repeat(64), tree: gone, approvedAt: 'x', branch: 'other' }] });
   const result = approveAnswer(repo.root);
   assert.equal(result.status, 0);
-  assert.ok(result.stdout.includes(`${TEXT.earlierTreeGone(gone)}\n`));
+  assert.ok(result.stdout.includes(`${TEXT.earlierTreeGone(gone, 'main')}\n`));
 });
 
 test('approve refuses a staged tree whose protected files cannot be digested, naming the problem', () => {
@@ -386,7 +388,7 @@ test('approve refuses a staged tree whose protected files cannot be digested, na
   stage(repo);
   const problem = digestOfTree(repo.root, indexTree(repo.root)).problem;
   const result = owner(repo.root, ['approve'], { input: 'approve\n' });
-  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.approveUndigestable(problem), COMMANDS.status)]);
+  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.approveUndigestable(problem), agent(repo.root, 'status'))]);
   assert.deepEqual(readApprovals(repo.root), []);
 });
 
@@ -430,7 +432,7 @@ test('waive needs a rule id and a reason, applies to the current branch, strips 
   assert.equal(result.status, 0, result.stderr);
   const [waiver] = JSON.parse(readFileSync(join(stateDir(repo.root), 'waivers.json'), 'utf8')).waivers;
   assert.deepEqual({ ...waiver, at: 'x' }, { rule: 'V8', branch: 'main', reason: 'docs[2J follownext week', at: 'x' });
-  assert.equal(result.stdout, `${TEXT.waived('V8', 'main')}\n${TEXT.waivers('main', [waiver])}\nNext: ${COMMANDS.run}\n`);
+  assert.equal(result.stdout, `${TEXT.waived('V8', 'main')}\n${TEXT.waivers('main', [waiver])}\nNext: ${agent(repo.root, 'run')}\n`);
   assert.equal(owner(repo.root, ['waive', 'V8', '--reason=later']).status, 0);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir(repo.root), 'waivers.json'), 'utf8')).waivers.map((entry) => entry.reason), ['later']);
 
@@ -450,7 +452,7 @@ test('exempt needs a branch name git accepts and a reason; unexempt is not owner
   assert.equal(result.status, 0, result.stderr);
   const branches = JSON.parse(readFileSync(join(stateDir(repo.root), 'exemptions.json'), 'utf8')).branches;
   assert.deepEqual(branches.map((entry) => [entry.name, entry.reason]), [['old/feature', 'predates the install']]);
-  assert.equal(result.stdout, `${TEXT.exempted('old/feature')}\n${TEXT.exemptions(branches)}\nNext: ${COMMANDS.unexempt} old/feature\n`);
+  assert.equal(result.stdout, `${TEXT.exempted('old/feature')}\n${TEXT.exemptions(branches)}\nNext: ${agent(repo.root, 'unexempt old/feature')}\n`);
   const ended = ko(repo.root, ['unexempt', 'old/feature'], { env: { ...testEnv(), CLAUDECODE: '1' } });
   assert.deepEqual([ended.status, ended.stdout], [0, `${TEXT.unexempted('old/feature')}\n${TEXT.exemptions([])}\n`]);
   const none = ko(repo.root, ['unexempt', 'old/feature']);
@@ -466,7 +468,7 @@ test('off creates the switch and says no commit is checked until on; on removes 
   assert.equal(TEXT.off(onCommand), `kh-orchestration is switched off for this repository: no commit is checked until it is switched on with ${onCommand}.`);
   assert.equal(commit(repo.root).status, 0, 'with the switch off a commit goes through unchecked');
   const on = owner(repo.root, ['on']);
-  assert.deepEqual([on.status, on.stdout], [0, `${TEXT.on}\nNext: ${COMMANDS.status}\n`]);
+  assert.deepEqual([on.status, on.stdout], [0, `${TEXT.on}\nNext: ${agent(repo.root, 'status')}\n`]);
   assert.equal(existsSync(join(stateDir(repo.root), 'off')), false);
 });
 
@@ -506,7 +508,7 @@ test('status --json of a fresh install: the brief\'s fields and the rest, nothin
   assert.equal(status.git.supported, true);
   assert.deepEqual(status.problems, [
     { text: TEXT.unapproved(digest), next: ownerCommand(repo.root, 'approve') },
-    { text: TEXT.headNoRecord(status.headTree, null), next: COMMANDS.verifyBranch },
+    { text: TEXT.headNoRecord(status.headTree, null), next: agent(repo.root, 'verify-branch') },
   ]);
 });
 
@@ -696,7 +698,7 @@ test('verify-branch: a branch rebuilt by git rebase fails with --no-run until th
 
   const failing = ko(repo.root, ['verify-branch', '--no-run']);
   assert.equal(failing.status, 1);
-  assert.deepEqual(lines(failing.stdout).slice(-2), [TEXT.notVerified(REASONS.noVerdict(tree, base)), `Next: ${COMMANDS.run}`]);
+  assert.deepEqual(lines(failing.stdout).slice(-2), [TEXT.notVerified(REASONS.noVerdict(tree, base)), `Next: ${agent(repo.root, 'verify-branch')}`], 'run judges the index against another base, so verify-branch is the next step');
   assert.equal(lines(failing.stdout)[0], TEXT.verifyHeader('feature', tree, base));
 
   const ran = ko(repo.root, ['verify-branch']);
@@ -743,17 +745,17 @@ test('verify-branch without --no-run refuses an untidy tree or staged changes, s
   const repo = featureBranch();
   repo.write('loose.txt', 'x\n');
   const untidy = ko(repo.root, ['verify-branch']);
-  assert.deepEqual([untidy.status, untidy.stderr], [1, refusalText(TEXT.untidyHead(['loose.txt']), `git stash -u && ${COMMANDS.verifyBranch}`)]);
+  assert.deepEqual([untidy.status, untidy.stderr], [1, refusalText(TEXT.untidyHead(['loose.txt']), `git stash -u && ${agent(repo.root, 'verify-branch')}`)]);
   stage(repo);
   const staged = ko(repo.root, ['verify-branch']);
-  assert.deepEqual([staged.status, staged.stderr], [1, refusalText(TEXT.stagedChanges, `git stash && ${COMMANDS.verifyBranch}`)]);
+  assert.deepEqual([staged.status, staged.stderr], [1, refusalText(TEXT.stagedChanges, `git stash && ${agent(repo.root, 'verify-branch')}`)]);
 });
 
 test('verify-branch on an unborn HEAD has nothing to verify', () => {
   const repo = installed();
   assert.equal(gitIn(repo.root, ['checkout', '-q', '--orphan', 'fresh']).status, 0);
   const result = ko(repo.root, ['verify-branch', '--no-run']);
-  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.noHead, COMMANDS.run)]);
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.noHead, agent(repo.root, 'run'))]);
 });
 
 // ---- after Task 7's review ----
@@ -779,7 +781,7 @@ test('I1: an owner command run from the working copy refuses, naming the approve
   assert.deepEqual(stateSnapshot(repo.root), before);
   assert.equal(
     TEXT.notFromBin('approve'),
-    'ko.mjs approve acts only from the approved copy in the shared state, not from the working copy, whose scripts a session can change. Nothing was changed.',
+    'ko.mjs approve acts only from this repository\'s approved copy, the ko.mjs in its shared state\'s bin/ named below; this is another copy, whose scripts nobody approved here. Nothing was changed.',
   );
   assert.equal(owner(repo.root, ['off']).status, 0, 'from bin/ it acts');
 });
@@ -843,7 +845,7 @@ test('I2: a commit git never hooked has no record: status and verify-branch say 
   const base = headBaseOf(repo.root, 'main');
   const status = statusJson(repo.root);
   assert.deepEqual([status.headAccepted, status.headBase, status.headVerdict], [false, base, 'none']);
-  assert.ok(status.problems.some((problem) => problem.text === TEXT.headNoRecord(tree, base) && problem.next === COMMANDS.verifyBranch));
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.headNoRecord(tree, base) && problem.next === agent(repo.root, 'verify-branch')));
   assert.equal(
     TEXT.headNoRecord('a'.repeat(40), 'b'.repeat(40)),
     'There is no record of HEAD\'s commit passing the gate and no passing verdict for its tree (aaaaaaaaaaaa) against its base (bbbbbbbbbbbb): it predates the install, or git never ran the hooks for it (a rebase, a cherry-pick or the like). Run verify-branch before merging.',
@@ -896,7 +898,7 @@ test('I4: approve on a new branch diffs against the approved tree whose digest i
   repo.write('tools/check.mjs', `${readFileSync(join(repo.root, 'tools/check.mjs'), 'utf8')}// on the feature branch\n`);
   stage(repo);
   const result = approveAnswer(repo.root, { input: 'no\n' });
-  assert.ok(result.stdout.includes(`${TEXT.baselineMergeBase(approvedTree, at, fork)}\n`), result.stdout);
+  assert.ok(result.stdout.includes(`${TEXT.baselineMergeBase(approvedTree, at, fork, 'feature')}\n`), result.stdout);
   assert.ok(result.stdout.includes('+// on the feature branch'));
 });
 
@@ -912,7 +914,7 @@ test('I4: approve falls back to the most recent approved tree of any branch, and
   repo.write('.claude/kh-orchestration/officers.json', `${JSON.stringify({ ...officers, protected: ['docs/x.txt'] }, null, 2)}\n`);
   stage(repo);
   const result = approveAnswer(repo.root, { input: 'no\n' });
-  assert.ok(result.stdout.includes(`${TEXT.baselineAny(approvedTree, at, 'main')}\n`), result.stdout);
+  assert.ok(result.stdout.includes(`${TEXT.baselineAny(approvedTree, at, 'main', 'other')}\n`), result.stdout);
   assert.ok(result.stdout.includes(`${TEXT.newlyCovered(['docs/x.txt'])}\n`));
   assert.ok(result.stdout.includes('+  "protected": ['), 'the officers file\'s own change is in the diff');
   assert.equal(TEXT.newlyCovered(['a', 'b']), 'Newly covered, their content unchanged since that tree: a, b.');
@@ -953,7 +955,7 @@ test('M1: status and verify-branch --no-run execute nothing from the repository:
 
 test('M3: names are shown with invisible characters made visible; exempt refuses refs/heads/ forms and @', () => {
   const repo = installed();
-  const result = owner(repo.root, ['exempt', '‮main', '--reason', 'r']);
+  const result = owner(repo.root, ['exempt', '\u202emain', '--reason', 'r']);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(lines(result.stdout)[0], 'The branch \\u{202e}main is exempt: the commit gate lets its commits through unchecked.');
   for (const name of ['refs/heads/main', '@']) {
@@ -969,7 +971,7 @@ test('M4: a verdict file that exists but is not a usable record is reported as d
   writeFileSync(join(stateDir(repo.root), name), '{"schema": 2}\n');
   const status = statusJson(repo.root);
   assert.equal(status.verdict, 'damaged');
-  assert.ok(status.problems.some((problem) => problem.text === TEXT.verdictDamaged(name) && problem.next === COMMANDS.run));
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.verdictDamaged(name) && problem.next === agent(repo.root, 'run')));
 });
 
 test('M5: status lists an exemption of the current branch and a failing verdict for the staged tree among its problems', () => {
@@ -980,8 +982,8 @@ test('M5: status lists an exemption of the current branch and a failing verdict 
   assert.equal(owner(repo.root, ['exempt', 'main', '--reason', 'trial']).status, 0);
   const status = statusJson(repo.root);
   assert.equal(status.verdict, 'failing');
-  assert.ok(status.problems.some((problem) => problem.text === TEXT.indexFailing(['check']) && problem.next === COMMANDS.run));
-  assert.ok(status.problems.some((problem) => problem.text === TEXT.exemptHere('main', 'trial') && problem.next === `${COMMANDS.unexempt} main`));
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.indexFailing(['check']) && problem.next === agent(repo.root, 'run')));
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.exemptHere('main', 'trial') && problem.next === agent(repo.root, 'unexempt main')));
 });
 
 test('a run killed while its officers run leaves no verdict', async () => {
@@ -1021,5 +1023,115 @@ test('status says when the staged tree\'s verdict records other protected files,
   writeFileSync(join(stateDir(repo.root), name), JSON.stringify({ ...verdict, digest: 'f'.repeat(64) }));
   const stale = statusJson(repo.root);
   assert.equal(stale.verdict, 'failing');
-  assert.ok(stale.problems.some((problem) => problem.text === TEXT.indexStale && problem.next === COMMANDS.run));
+  assert.ok(stale.problems.some((problem) => problem.text === TEXT.indexStale && problem.next === agent(repo.root, 'run')));
+});
+
+// ---- after Task 7's second review ----
+
+test('approve refuses a staged ko-cli.mjs that does not parse, and a tree without ko-gate.mjs, with bin/ and the approvals as they were; a good tree still approves', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  assert.equal(owner(repo.root, ['propose']).status, 0);
+  const cli = join(repo.root, '.claude/kh-orchestration/scripts/ko-cli.mjs');
+  const text = readFileSync(cli, 'utf8');
+  const bin = () => Object.fromEntries(readdirSync(join(stateDir(repo.root), 'bin')).map((name) => [name, readFileSync(join(stateDir(repo.root), 'bin', name), 'utf8')]));
+  const before = [bin(), readApprovals(repo.root)];
+  for (const [script, breakIt] of [
+    ['ko-cli.mjs', () => writeFileSync(cli, text.replace('export async function main(argv) {', 'export async function main(argv) { syntax error here'))],
+    ['ko-gate.mjs', () => rmSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-gate.mjs'))],
+  ]) {
+    breakIt();
+    stage(repo);
+    const refused = approveAnswer(repo.root);
+    assert.equal(refused.status, 1, script);
+    assert.equal(refused.stderr, refusalText(binPreflightMessage(script), ownerCommand(repo.root, 'approve')), script);
+    assert.deepEqual([bin(), readApprovals(repo.root)], before, script);
+    assert.equal(owner(repo.root, ['status']).status, 0, `${script}: the owner's commands still work`);
+    assert.equal(gitIn(repo.root, ['checkout', '-q', 'HEAD', '--', '.claude/kh-orchestration/scripts']).status, 0);
+  }
+  writeFileSync(cli, text.replace("noCommand: 'No command was given.'", "noCommand: 'No command was given (edited).'"));
+  stage(repo);
+  assert.equal(approveAnswer(repo.root).status, 0, 'a good change still approves');
+  assert.ok(bin()['ko-cli.mjs'].includes('(edited)'));
+});
+
+test('ko.mjs that cannot start tells the approved copy from the working copy, and both texts and status name the one repair command', () => {
+  const repo = installed();
+  rmSync(join(stateDir(repo.root), 'bin', 'ko-cli.mjs'));
+  const result = owner(repo.root, ['status']);
+  assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', `kh-orchestration: ko.mjs could not start: the approved copy in <git-common-dir>/kh-orchestration/bin/ is missing a script, or one is damaged or of another version.\nNext: ${repairCommand('<repository>')}\n`]);
+  for (const entry of ['ko.mjs', 'gate.mjs']) {
+    assert.ok(readFileSync(join(repo.root, '.claude/kh-orchestration/scripts', entry), 'utf8').includes(`Next: ${repairCommand('<repository>')}\\n`), entry);
+  }
+  assert.equal(repairCommand(shellWord(repo.root)), `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`);
+});
+
+test('every ko.mjs command a refusal or report prints works where the person is: a subdirectory of a linked worktree whose path holds spaces', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  const side = join(repo.root, '..', 'a worktree with spaces');
+  assert.equal(gitIn(repo.root, ['worktree', 'add', '-q', '-b', 'side', side]).status, 0);
+  const deep = join(side, 'docs', 'deep');
+  mkdirSync(deep, { recursive: true });
+  writeFileSync(join(deep, 'n.txt'), 'n\n');
+  const fromDeep = (args) => ko(side, args, { cwd: deep });
+  const untidy = fromDeep(['run']);
+  const next = untidy.stderr.split('\n')[1].slice('Next: '.length);
+  assert.equal(next, `git add -A && ${agent(side, 'run')}`);
+  const followed = spawnSync('sh', ['-c', next], { cwd: deep, env: testEnv(), encoding: 'utf8' });
+  assert.equal(followed.status, 0, followed.stderr);
+  const approved = owner(repo.root, ['approve'], { cwd: deep, input: 'approve\n' });
+  assert.equal(approved.status, 0, approved.stderr);
+  const approvedNext = lines(approved.stdout).at(-1).slice('Next: '.length);
+  assert.equal(approvedNext, TEXT.approvedNext(agent(side, 'run')));
+  const run = spawnSync('sh', ['-c', approvedNext.replace(/, then git commit$/, '')], { cwd: deep, env: testEnv(), encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(lines(run.stdout).at(-1), 'Next: git commit');
+});
+
+test('verify-branch --no-run on the base branch for a HEAD with no record names verify-branch, which then passes', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  repo.write('b.txt', 'b\n');
+  stage(repo);
+  assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'unhooked']).status, 0);
+  const failing = ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(failing.status, 1);
+  assert.equal(lines(failing.stdout).at(-1), `Next: ${agent(repo.root, 'verify-branch')}`);
+  assert.equal(ko(repo.root, ['verify-branch']).status, 0);
+});
+
+test('an owner command run from another repository\'s approved copy refuses truthfully, naming this repository\'s', () => {
+  const repo = installed();
+  const other = installed();
+  const result = spawnSync(process.execPath, [join(stateDir(other.root), 'bin', 'ko.mjs'), 'off'], { cwd: repo.root, env: testEnv(), encoding: 'utf8' });
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.notFromBin('off'), ownerCommand(repo.root, 'off'))]);
+  assert.equal(
+    TEXT.notFromBin('off'),
+    'ko.mjs off acts only from this repository\'s approved copy, the ko.mjs in its shared state\'s bin/ named below; this is another copy, whose scripts nobody approved here. Nothing was changed.',
+  );
+});
+
+test('a next line whose words hold invisible characters is not printed for pasting: the words are shown visibly, with what to type', () => {
+  const repo = installed();
+  const result = ko(repo.root, ['exempt', '\u202emain', '--reason', 'r']);
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr.includes('\u202e'), false);
+  assert.equal(result.stderr, refusalText(TEXT.notFromBin('exempt'), TEXT.typeIt(ownerCommand(repo.root, 'exempt \\u{202e}main --reason r'))));
+  assert.equal(
+    TEXT.typeIt('node x exempt \\u{202e}main'),
+    'node x exempt \\u{202e}main (type it yourself, writing each \\u{…} as the character it names: a terminal does not show them, so a pasted line could differ from what you read)',
+  );
+});
+
+test('on a detached HEAD verify-branch and approve say "a detached HEAD", never "this branch"', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  assert.equal(gitIn(repo.root, ['switch', '-q', '--detach']).status, 0);
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const again = approveAnswer(repo.root, { input: 'no\n' });
+  assert.equal(again.stdout.includes('this branch'), false, again.stdout);
+  const verified = ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(verified.stdout.includes('this branch'), false, verified.stdout);
+  assert.ok(lines(verified.stdout)[0].includes('a detached HEAD'));
 });

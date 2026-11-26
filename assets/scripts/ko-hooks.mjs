@@ -6,8 +6,9 @@
 // `sh -p` imports no function and reads no ENV, SHELLOPTS or PS4. The common directory is the
 // hook's own path less /hooks/<name>: hooks live only in <common>/hooks, and a copy elsewhere finds
 // no gate and refuses. No command is called by name: env and node by the absolute paths recorded
-// at install, the token tested by a case statement. A gate that cannot be opened refuses with a
-// redirection alone, before node could print a trace. Allow only on the gate's exit 0 AND its
+// at install, the token tested by a case statement. A gate that cannot be read (missing, a
+// directory, empty or without a first line) refuses with the builtin read, before node could print
+// a trace. Allow only on the gate's exit 0 AND its
 // token on standard output; the git process id ($PPID) is passed on. reference-transaction starts
 // node only in the prepared state of a git process that has an in-flight record, found by a
 // pattern (a file, a directory or a dangling link all match), so every other ref update runs no
@@ -48,8 +49,9 @@ const QUOTED = "'[^']*'(?:\\\\''[^']*')*";
 export function hookText(hook, { env, node, version }) {
   const allowlist = HOOK_ENV.map((name) => `\${${name}+"${name}=$${name}"}`).join(' ');
   const gate = [
-    '# A gate that cannot be opened refuses here, before node could print a trace.',
-    `{ < ${GATE}; } 2>/dev/null || { ${REFUSED_LINE}; exit 1; }`,
+    '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
+    '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
+    `{ read -r _ < ${GATE}; } 2>/dev/null || { ${REFUSED_LINE}; exit 1; }`,
     `if out=$(${shQuote(env)} -i ${allowlist} ${shQuote(node)} ${GATE} ${hook} "$PPID"); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',

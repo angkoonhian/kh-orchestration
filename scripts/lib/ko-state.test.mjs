@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, symlinkSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, rmSync, symlinkSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
+import { installedScript, isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
 import {
   StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readInflight, readState, removeInflight, removeStaleInflight, shapeMessage, stateDir,
   invalidPidMessage, stateUnreadableMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
   binIncompleteMessage, binEntryMessage, listInflight, readProposals, readWaivers, refreshBin, switchOff, switchOn,
-  invalidCommitMessage, ownerCommand, readAccepted, writeAccepted,
+  invalidCommitMessage, ownerCommand, readAccepted, writeAccepted, binPreflightMessage,
 } from '../../assets/scripts/ko-state.mjs';
 import { objectMismatchMessage } from '../../assets/scripts/ko-digest.mjs';
 
@@ -383,10 +383,18 @@ const treeOfIndex = (repo) => {
   return repo.git('write-tree').stdout.trim();
 };
 
+// The real installed scripts, each ending in a line naming `version`, so two trees differ in every
+// file; refreshBin's pre-flight loads them, so they must be real.
+const ASSET_NAMES = readdirSync(new URL('../../assets/scripts/', import.meta.url)).filter((name) => name.endsWith('.mjs')).sort();
+const versionLine = (version, pad = '') => `// ${version}${pad}\n`;
+function writeScripts(repo, version, pad) {
+  for (const name of ASSET_NAMES) repo.write(`${SCRIPTS}/${name}`, `${installedScript(name)}${versionLine(version, pad)}`);
+}
+const versionOf = (text) => text.slice(text.lastIndexOf('\n', text.length - 2) + 1).match(/^\/\/ (\w+)/)?.[1];
+
 test('refreshBin replaces bin/ with the tree\'s scripts, the .mjs files directly under the scripts folder only', () => {
   withRepo((repo) => {
-    repo.write(`${SCRIPTS}/gate.mjs`, 'gate one\n');
-    repo.write(`${SCRIPTS}/ko-git.mjs`, 'git one\n');
+    writeScripts(repo, 'one');
     repo.write(`${SCRIPTS}/notes.txt`, 'not a script\n');
     repo.write(`${SCRIPTS}/deeper/x.mjs`, 'not directly under\n');
     repo.write('elsewhere.mjs', 'not installed\n');
@@ -394,24 +402,25 @@ test('refreshBin replaces bin/ with the tree\'s scripts, the .mjs files directly
     mkdirSync(binOf(repo.root), { recursive: true });
     writeFileSync(join(binOf(repo.root), 'stale.mjs'), 'from an older kit\n');
     refreshBin(repo.root, first);
-    assert.deepEqual(binFiles(repo.root), { 'gate.mjs': 'gate one\n', 'ko-git.mjs': 'git one\n' });
-    repo.write(`${SCRIPTS}/gate.mjs`, 'gate two\n');
+    assert.deepEqual(Object.keys(binFiles(repo.root)), ASSET_NAMES);
+    assert.ok(Object.values(binFiles(repo.root)).every((text) => versionOf(text) === 'one'));
+    writeScripts(repo, 'two');
     refreshBin(repo.root, treeOfIndex(repo));
-    assert.deepEqual(binFiles(repo.root), { 'gate.mjs': 'gate two\n', 'ko-git.mjs': 'git one\n' });
+    assert.ok(Object.values(binFiles(repo.root)).every((text) => versionOf(text) === 'two'));
     assert.deepEqual(readdirSync(stateDir(repo.root)), ['bin'], 'no temporary or old directory is left');
   });
 });
 
 test('refreshBin refuses a tree without gate.mjs, an entry that is not a regular file, and a blob that does not hash to its id, and leaves bin/ as it was', () => {
   withRepo((repo) => {
-    repo.write(`${SCRIPTS}/gate.mjs`, 'gate\n');
+    writeScripts(repo, 'one');
     refreshBin(repo.root, treeOfIndex(repo));
     const before = binFiles(repo.root);
 
     repo.git('rm', '-q', '--cached', `${SCRIPTS}/gate.mjs`);
     const noGate = repo.git('write-tree').stdout.trim();
     assert.throws(() => refreshBin(repo.root, noGate), { name: 'StateError', message: binIncompleteMessage });
-    assert.equal(binIncompleteMessage, 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs, so bin/ is not refreshed from it: the hooks would find no gate. Stage the install\'s scripts first.');
+    assert.equal(binIncompleteMessage, 'The tree holds no .claude/kh-orchestration/scripts/gate.mjs or ko.mjs, so bin/ is not refreshed from it: the hooks or the owner\'s commands would find nothing to run. Stage the install\'s scripts first.');
 
     symlinkSync('gate.mjs', join(repo.root, SCRIPTS, 'ko-link.mjs'));
     const withLink = treeOfIndex(repo);
@@ -420,7 +429,7 @@ test('refreshBin refuses a tree without gate.mjs, an entry that is not a regular
     assert.equal(repo.git('rm', '-q', '-f', `${SCRIPTS}/ko-link.mjs`).status, 0);
 
     // A loose object whose content no longer hashes to its name: git does not check on read.
-    repo.write(`${SCRIPTS}/gate.mjs`, 'gate forged later\n');
+    writeScripts(repo, 'forged');
     const forgedTree = treeOfIndex(repo);
     const objectPath = (oid) => join(repo.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2));
     const oid = repo.git('rev-parse', `${forgedTree}:${SCRIPTS}/gate.mjs`).stdout.trim();
@@ -432,11 +441,37 @@ test('refreshBin refuses a tree without gate.mjs, an entry that is not a regular
   });
 });
 
+test('refreshBin loads the new copy before it replaces bin/: a script that does not parse, or a sibling that is missing, refuses with bin/ as it was', () => {
+  withRepo((repo) => {
+    writeScripts(repo, 'one');
+    refreshBin(repo.root, treeOfIndex(repo));
+    const before = binFiles(repo.root);
+    const original = (name) => `${installedScript(name)}${versionLine('one')}`;
+    const cases = [
+      ['ko-cli.mjs', () => repo.write(`${SCRIPTS}/ko-cli.mjs`, original('ko-cli.mjs').replace('export async function main(argv) {', 'export async function main(argv) { syntax error here'))],
+      ['ko-gate.mjs', () => rmSync(join(repo.root, SCRIPTS, 'ko-gate.mjs'))],
+      ['gate.mjs', () => repo.write(`${SCRIPTS}/gate.mjs`, `${original('gate.mjs')}}}\n`)],
+      ['ko.mjs', () => repo.write(`${SCRIPTS}/ko.mjs`, `${original('ko.mjs')}process.exitCode = 3;\n`)],
+    ];
+    for (const [script, breakIt] of cases) {
+      breakIt();
+      assert.throws(() => refreshBin(repo.root, treeOfIndex(repo)), { name: 'StateError', message: binPreflightMessage(script) }, script);
+      assert.deepEqual(binFiles(repo.root), before, script);
+      assert.deepEqual(readdirSync(stateDir(repo.root)), ['bin'], `${script}: the new copy is removed`);
+      writeScripts(repo, 'one');
+    }
+    assert.equal(
+      binPreflightMessage('ko-cli.mjs'),
+      'The staged tree\'s .claude/kh-orchestration/scripts/ko-cli.mjs does not load (a syntax error, a missing file, or a script it imports that is missing or damaged), so bin/ is not refreshed from it and nothing is approved: the hooks and the owner\'s commands would stop working. Fix it in the working copy, stage it, and approve again.',
+    );
+  });
+});
+
 test('refreshBin killed at any moment leaves bin/ whole: one tree\'s scripts or the other\'s, or no bin/ at all, never a mix', async () => {
   const repo = makeRepo();
   try {
     const trees = ['one', 'two'].map((version) => {
-      for (let index = 0; index < 12; index += 1) repo.write(`${SCRIPTS}/${index === 0 ? 'gate' : `s${index}`}.mjs`, `${version} ${index}\n${'x'.repeat(200_000)}\n`);
+      writeScripts(repo, version, ` ${'x'.repeat(200_000)}`);
       return treeOfIndex(repo);
     });
     const module = new URL('../../assets/scripts/ko-state.mjs', import.meta.url).href;
@@ -446,15 +481,15 @@ test('refreshBin killed at any moment leaves bin/ whole: one tree\'s scripts or 
     for (let round = 0; round < 15; round += 1) {
       const child = spawn(process.execPath, ['--input-type=module', '-e', loop], { env: testEnv(), stdio: ['ignore', 'pipe', 'inherit'] });
       await new Promise((resolve) => child.stdout.once('data', resolve));
-      await new Promise((resolve) => setTimeout(resolve, 20 + Math.floor(Math.random() * 60)));
+      await new Promise((resolve) => setTimeout(resolve, 20 + Math.floor(Math.random() * 400)));
       child.kill('SIGKILL');
       await new Promise((resolve) => child.once('exit', resolve));
       if (!existsSync(binOf(repo.root))) continue;
       const files = binFiles(repo.root);
-      const version = files['gate.mjs'].split(' ')[0];
+      const version = versionOf(files['gate.mjs']);
       versions.add(version);
-      assert.equal(Object.keys(files).length, 12);
-      assert.ok(Object.values(files).every((text) => text.startsWith(`${version} `)), 'every file is of the same tree');
+      assert.deepEqual(Object.keys(files), ASSET_NAMES);
+      assert.ok(Object.values(files).every((text) => versionOf(text) === version), 'every file is of the same tree');
     }
     assert.ok(versions.size > 0);
     refreshBin(repo.root, trees[0]);
