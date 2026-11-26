@@ -251,6 +251,7 @@ export const MESSAGES = Object.freeze({
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
   ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code, from the approved copy. Ask the owner to run ${OWNER_KO} ${command}.`,
   sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session, nor the environment cleared in front of an owner command: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
+  installerHidden: 'This names kh-orchestration\'s apply.mjs or uninstall.mjs with a word the hook cannot read whole (a variable, a substitution, a brace or glob pattern, or xargs), which could hide --yes. Write the path and arguments out; --yes is the owner\'s to run in their own terminal.',
   installerOwnerOnly: 'kh-orchestration\'s apply --yes and uninstall --yes are the owner\'s to run in their own terminal, outside Claude Code: they change the hooks and the files the commit gate checks. Ask the owner to run it; without --yes it is a dry run, open here.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
   feedsScript: unseen('it feeds a script to a shell or an interpreter'),
@@ -1704,14 +1705,25 @@ function judgeOwner(command, resolved, values, loose) {
   const unsets = [...resolved.unsets, ...(resolved.name === 'unset' ? resolved.words.slice(resolved.index + 1).map((word) => word.text) : [])];
   if ([...command.assignments, ...resolved.envAssignments].some((word) => SESSION_EMPTIED.test(word.text)) || unsets.some((name) => SESSION_NAMES.has(name))) refuse(MESSAGES.sessionEnv);
   if (resolved.word === undefined || READ_ONLY.has(resolved.name)) return;
+  // After Task 9's re-review: --yes may hide in any word of the command that the hook cannot read
+  // whole (an expansion, a brace or glob pattern) or come from xargs; assignment values cannot
+  // become its arguments, so the words from the command word on are the ones read.
+  const literalYes = resolved.words.some((other) => other.text === '--yes');
+  const unreadable = resolved.wrappers.includes('xargs') || resolved.words.slice(resolved.index).some((other) => other.expands || other.special);
   for (let at = 0; at < resolved.words.length; at++) {
     const word = resolved.words[at];
     if (values.has(word) || loose.has(word)) continue;
     if (couldBe(basenameWord(word), 'ko.mjs')) judgeOwnerSubcommand(resolved, at);
     // Behind a cleared environment any installer's --yes is blocked, whatever its path says: the
     // installer's own session check could not see the session (a cd can hide the plugin's path).
-    if ((isInstaller(word) || (resolved.cleared && isInstallerName(word))) && resolved.words.some((other) => other.text === '--yes')) refuseOwner(resolved, MESSAGES.installerOwnerOnly);
+    if (isInstaller(word) || (resolved.cleared && isInstallerName(word))) {
+      if (literalYes) refuseOwner(resolved, MESSAGES.installerOwnerOnly);
+      if (unreadable) refuseOwner(resolved, MESSAGES.installerHidden);
+    }
   }
+  // A cleared environment in front of --yes with a word that could name an installer unseen
+  // (`xargs -I{} env -i node {} . --yes`).
+  if (resolved.cleared && literalYes && unreadable) refuseOwner(resolved, MESSAGES.installerHidden);
 }
 
 // The words after a ko.mjs at `at`. The subcommand is the first word that is not an option; a

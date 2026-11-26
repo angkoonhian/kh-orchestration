@@ -948,3 +948,28 @@ test('apply --yes and uninstall --yes of kh-orchestration are blocked under any 
   ];
   assert.deepEqual(mismatches(rows), []);
 });
+
+// A hidden --yes (after Task 9's re-review): a command naming kh-orchestration's installer (or any
+// installer behind a cleared environment) with a word the hook cannot read whole is blocked, and so
+// is a cleared environment fed by xargs or with such a word in front of --yes.
+test('an installer command whose --yes could hide in an expansion, a pattern or xargs is blocked; dry runs written out and detect stay open', () => {
+  const K = '/p/kh-orchestration';
+  const rows = [
+    [`env -i PATH="$PATH" node ${K}/scripts/uninstall.mjs . $(echo --yes) --state`, blocked(MESSAGES.sessionEnv)],
+    [`echo . --yes --state | xargs env -i PATH="$PATH" node ${K}/scripts/uninstall.mjs`, blocked(MESSAGES.sessionEnv)],
+    [`Y=--yes; env -i PATH="$PATH" node ${K}/scripts/uninstall.mjs . $Y --state`, blocked(MESSAGES.sessionEnv)],
+    [`env -i PATH="$PATH" node ${K}/scripts/uninstall.mjs . \${Y:---yes} --state`, blocked(MESSAGES.sessionEnv)],
+    [`env -i PATH="$PATH" node ${K}/scripts/apply.mjs . $(echo --yes)`, blocked(MESSAGES.sessionEnv)],
+    [`node ${K}/scripts/uninstall.mjs . --{yes,state}`, blocked(MESSAGES.installerHidden)],
+    ['xargs -I{} env -i node {} . --yes', blocked(MESSAGES.sessionEnv)],
+    [`node ${K}/scripts/apply.mjs "$PWD"`, blocked(MESSAGES.installerHidden)],
+    [`npx --yes node ${K}/scripts/apply.mjs .`, blocked(MESSAGES.installerOwnerOnly)],
+    [`node ${K}/scripts/apply.mjs .`, ALLOW],
+    [`node ${K}/scripts/uninstall.mjs .`, ALLOW],
+    [`node ${K}/scripts/detect.mjs . --json`, ALLOW],
+    [`node ${K}/scripts/detect.mjs "$PWD"`, ALLOW],
+    ['env -i PATH="$PATH" npm test', ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+  assert.match(MESSAGES.installerHidden, /Write the path and arguments out/);
+});
