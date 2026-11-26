@@ -30,7 +30,7 @@ import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
 import { REASONS, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
-  GitError, baseOf, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
+  GitError, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
 } from './ko-git.mjs';
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
@@ -96,6 +96,8 @@ function commandLine(prefix, words) {
   return TEXT.typeIt(`${prefix} ${words.map(visible).join(' ')}`);
 }
 const ownerLine = (root, words) => commandLine(ownerCommand(root, '').trimEnd(), words);
+// How officers change the tree they run on, said in both texts that refuse their verdict.
+const OFFICER_CHANGES = 'an officer that fixes files, a lint --fix say, does this, and so does one that writes a file git does not ignore';
 
 export const USAGE = `usage: ${KO} <command>
   run                              run the officers on the staged tree and record the verdict
@@ -132,6 +134,8 @@ export const TEXT = Object.freeze({
   filterDriver: (name, key) => `The git filter driver ${shownName(name)} is configured (${shownName(key)}). A clean filter can make a working tree that differs from the index look tidy, and the officers run on the working tree, so they are not run here. Remove the driver from the configuration file shown below; only lfs is allowed.`,
   untidy: (paths) => `The working tree differs from the index, so the officers would not run on the tree a commit would hold. Stage the files meant to be committed, and add the others (a .claude/settings.local.json, say) to .gitignore: ${named(paths)}.`,
   cannotRun: (problem) => `The officers cannot be run on this tree: ${sentence(problem)}`,
+  treeChanged: (paths) => `The working tree changed while the officers ran, so no verdict is recorded: they did not pass on the tree a commit would hold (${OFFICER_CHANGES}). Stage what they changed if it is wanted, add a file they write to .gitignore, restore the rest, then run the officers again. Changed: ${named(paths)}.`,
+  treeChangedHead: (paths) => `The working tree changed while the officers ran, so no verdict is recorded: they did not pass on HEAD's tree as it is (${OFFICER_CHANGES}). Commit what they changed if it is wanted, add a file they write to .gitignore, discard the rest, then verify again. Changed: ${named(paths)}.`,
 
   runHeader: (tree, base) => `Officers on the staged tree ${short(tree)} against the base ${short(base)}:`,
   verifyHeader: (where, tree, base) => `verify-branch on ${where}: HEAD's tree ${short(tree)} against the base ${short(base)}.`,
@@ -360,12 +364,24 @@ async function recordSessionEvent(root, data) {
   }
 }
 
+// The paths the officers changed (after the whole-branch review): the untidy paths, and those in
+// which the index tree now differs from `tree`, the tree they were run on; empty when neither
+// changed. A file changed and put back while they ran is not seen (a stated limit).
+function changedByOfficers(root, tree) {
+  const now = indexTree(root);
+  return [...new Set([...(now === tree ? [] : changedPaths(root, tree, now)), ...untidyPaths(root)])];
+}
+
 // Runs the officers on `tree` (the working tree equals it: the caller checked) and records the
-// verdict and the journal line. `{ verdict, isPassing }` or `{ problem }`.
+// verdict and the journal line, unless the officers changed the working tree or the index: a
+// verdict is for a tree the officers left as they found it, so then nothing is recorded.
+// `{ verdict, isPassing }`, `{ verdict, changed }` (the paths) or `{ problem }`.
 async function runAndRecord(root, { tree, base, branch, officers, command }) {
   const produced = await produceVerdict(root, { tree, base, branch, waivers: waiversOf(root, branch), kitVersion: kitVersion() });
   if (produced.problem !== undefined) return produced;
   const { verdict } = produced;
+  const changed = changedByOfficers(root, tree);
+  if (changed.length > 0) return { verdict, changed };
   writeVerdict(root, verdict);
   const isPassing = passing(verdict, officers);
   appendJournal(root, { at: verdict.finishedAt, command, ...verdictSummary(verdict, isPassing), waivers: verdict.waivers.map((entry) => entry.rule) });
@@ -399,6 +415,10 @@ async function run(root) {
   const base = baseOf(root, read.baseBranch);
   const recorded = await runAndRecord(root, { tree, base, branch, officers: read.officers, command: 'run' });
   if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), agentCommand(root, 'status'));
+  if (recorded.changed !== undefined) {
+    print([TEXT.runHeader(tree, base), ...officerLines(recorded.verdict)]);
+    return refusal(TEXT.treeChanged(recorded.changed), `git -C ${shellWord(root)} add -- <each changed path that is wanted>, then ${agentCommand(root, 'run')}`);
+  }
   const { verdict, isPassing } = recorded;
   await recordSessionEvent(root, verdictSummary(verdict, isPassing));
   const lines = [TEXT.runHeader(tree, base), ...officerLines(verdict), TEXT.agentChanges(verdict.agentRuleChanges)];
@@ -777,6 +797,11 @@ async function verifyBranch(root, { noRun }) {
     if (read.problem === undefined) {
       const recorded = await runAndRecord(root, { tree: head, base, branch, officers: read.officers, command: 'verify-branch' });
       if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), agentCommand(root, 'status'));
+      if (recorded.changed !== undefined) {
+        print([TEXT.verifyHeader(branchWords(branch), head, base), ...officerLines(recorded.verdict)]);
+        const rootWord = shellWord(root);
+        return refusal(TEXT.treeChangedHead(recorded.changed), `git -C ${rootWord} add -- <each changed path that is wanted> && git -C ${rootWord} commit, then ${agentCommand(root, 'verify-branch')}`);
+      }
     }
   }
   const decision = judge(root, { tree: head, base, branch }, { honourSwitches: false, probe: !noRun });

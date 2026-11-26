@@ -1196,3 +1196,90 @@ test('an approval refused at the pre-flight, or one whose record cannot be writt
   rmSync(join(stateDir(repo.root), 'approvals.json'), { recursive: true });
   writeFileSync(join(stateDir(repo.root), 'approvals.json'), approvals);
 });
+
+// ---- after the whole-branch review ----
+
+// An officers file of `[id, argv]` pairs, each applying to every path.
+const officersOf = (pairs) => `${JSON.stringify({
+  schema: 1, baseBranch: 'main', protected: [], officers: pairs.map(([id, argv]) => ({ id, rule: null, argv, appliesTo: ['**'] })),
+})}\n`;
+// An officer that rewrites src/a.js as an autofixing lint would.
+const FIXER = "import { writeFileSync } from 'node:fs';\nwriteFileSync('src/a.js', 'GOOD\\n');\n";
+const treeChangedNext = (root) => `git -C ${shellWord(root)} add -- <each changed path that is wanted>, then ${agent(root, 'run')}`;
+
+test('C1: an officer that rewrites a staged file records no verdict: run exits 1 naming the file, and the commit is refused', () => {
+  const repo = installed({ officers: officersOf([['lint', ['node', 'tools/fix.mjs']]]) });
+  repo.write('tools/fix.mjs', FIXER);
+  repo.write('src/a.js', 'BAD\n');
+  stage(repo);
+  const tree = indexTree(repo.root);
+  const base = baseOf(repo.root, 'main');
+  const result = ko(repo.root, ['run']);
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.treeChanged(['src/a.js']), treeChangedNext(repo.root))]);
+  assert.equal(lines(result.stdout)[0], TEXT.runHeader(tree, base));
+  assert.match(lines(result.stdout)[1], /^ {2}lint {2}pass {2}/);
+  assert.equal(readVerdict(repo.root, tree, base), null, 'no verdict, passing or not');
+  assert.equal(existsSync(join(stateDir(repo.root), 'journal.jsonl')), false, 'nothing is journaled for a run that records no verdict');
+  assert.equal(
+    TEXT.treeChanged(['src/a.js']),
+    'The working tree changed while the officers ran, so no verdict is recorded: they did not pass on the tree a commit would hold (an officer that fixes files, a lint --fix say, does this, and so does one that writes a file git does not ignore). Stage what they changed if it is wanted, add a file they write to .gitignore, restore the rest, then run the officers again. Changed: src/a.js.',
+  );
+  assert.equal(approveAnswer(repo.root).status, 0);
+  const committed = commit(repo.root);
+  assert.equal(committed.status, 1, 'the gate finds no verdict');
+  assert.ok(committed.stderr.includes(REASONS.noVerdict(tree, base)), committed.stderr);
+});
+
+test('C1: an officer that writes an untracked file, or stages a change itself, records no verdict and names the path', () => {
+  const writer = installed({ officers: officersOf([['cache', ['node', 'tools/cache.mjs']]]) });
+  writer.write('tools/cache.mjs', "import { writeFileSync } from 'node:fs';\nwriteFileSync('cache.txt', 'x\\n');\n");
+  stage(writer);
+  const written = ko(writer.root, ['run']);
+  assert.deepEqual([written.status, written.stderr], [1, refusalText(TEXT.treeChanged(['cache.txt']), treeChangedNext(writer.root))]);
+  assert.equal(readVerdict(writer.root, indexTree(writer.root), baseOf(writer.root, 'main')), null);
+
+  const stager = installed({ officers: officersOf([['lint', ['node', 'tools/fix-add.mjs']]]) });
+  stager.write('tools/fix-add.mjs', `${FIXER}import { spawnSync } from 'node:child_process';\nspawnSync('git', ['add', 'src/a.js']);\n`);
+  stager.write('src/a.js', 'BAD\n');
+  stage(stager);
+  const judged = indexTree(stager.root);
+  const staged = ko(stager.root, ['run']);
+  assert.deepEqual([staged.status, staged.stderr], [1, refusalText(TEXT.treeChanged(['src/a.js']), treeChangedNext(stager.root))]);
+  assert.notEqual(indexTree(stager.root), judged, 'the officer staged its fix: the working tree is tidy, the index is not the tree judged');
+  assert.equal(readVerdict(stager.root, judged, baseOf(stager.root, 'main')), null);
+});
+
+test('C1: an officer that leaves the tree alone still passes; one that changes a file and puts it back is not detected (a stated limit)', () => {
+  const quiet = installed({ officers: officersOf([['check', ['node', 'tools/check.mjs']]]) });
+  assert.equal(ko(quiet.root, ['run']).status, 0);
+  assert.notEqual(readVerdict(quiet.root, indexTree(quiet.root), baseOf(quiet.root, 'main')), null);
+
+  const restorer = installed({ officers: officersOf([['lint', ['node', 'tools/flip.mjs']]]) });
+  restorer.write('tools/flip.mjs', "import { writeFileSync } from 'node:fs';\nwriteFileSync('src/a.js', 'GOOD\\n');\nwriteFileSync('src/a.js', 'BAD\\n');\n");
+  restorer.write('src/a.js', 'BAD\n');
+  stage(restorer);
+  const result = ko(restorer.root, ['run']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.notEqual(readVerdict(restorer.root, indexTree(restorer.root), baseOf(restorer.root, 'main')), null, 'what the officers saw in between is not known');
+});
+
+test('C1: verify-branch whose officer rewrites a file of HEAD\'s tree records no verdict and fails, naming the file', () => {
+  const repo = installed({ officers: officersOf([['lint', ['node', 'tools/fix.mjs']]]) });
+  repo.write('tools/fix.mjs', FIXER);
+  repo.write('src/a.js', 'BAD\n');
+  stage(repo);
+  // Committed with git's hooks off: a commit git never ran the gate for, as verify-branch is for.
+  assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'unchecked']).status, 0);
+  const tree = gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
+  const base = headBaseOf(repo.root, 'main');
+  const result = ko(repo.root, ['verify-branch']);
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(
+    TEXT.treeChangedHead(['src/a.js']),
+    `git -C ${shellWord(repo.root)} add -- <each changed path that is wanted> && git -C ${shellWord(repo.root)} commit, then ${agent(repo.root, 'verify-branch')}`,
+  )]);
+  assert.equal(readVerdict(repo.root, tree, base), null);
+  assert.equal(
+    TEXT.treeChangedHead(['src/a.js']),
+    'The working tree changed while the officers ran, so no verdict is recorded: they did not pass on HEAD\'s tree as it is (an officer that fixes files, a lint --fix say, does this, and so does one that writes a file git does not ignore). Commit what they changed if it is wanted, add a file they write to .gitignore, discard the rest, then verify again. Changed: src/a.js.',
+  );
+});
