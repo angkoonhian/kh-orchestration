@@ -12,12 +12,16 @@ import { pathToFileURL } from 'node:url';
 const RULE = 'V8';
 const MAX_LISTED = 20;
 const MAX_GLOB_LENGTH = 512;
+const MAX_REASON = 300;
 const OPTION_KEYS = ['logic', 'docs'];
 
-// A control character is shown as \uXXXX so that a path or a reason cannot rewrite the screen.
-const visible = (text) => text.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, '0')}`);
+// A control, format (bidi controls, zero-width characters, BOM), line or paragraph separator character is shown
+// as \uXXXX so that a path or a reason cannot rewrite or hide text on the screen.
+const visible = (text) => text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, '0')}`);
 
-export const waivedMessage = (reason) => `${RULE}: waived by the owner. Reason: ${visible(reason)}\n`;
+const cut = (text) => (text.length > MAX_REASON ? `${text.slice(0, MAX_REASON)}...` : text);
+
+export const waivedMessage = (reason) => `${RULE}: waived by the owner. Reason: ${cut(visible(reason))}\n`;
 
 export const MESSAGES = Object.freeze({
   badOptions: `${RULE}: KO_OPTIONS must be a JSON object with exactly the keys logic and docs, each a list of globs. Fix the officer's options in officers.json.\n`,

@@ -11,6 +11,7 @@ const FILE = 'db.py';
 const DEFAULT_FILE = 'products/vision/backend/src/vyugate_api/db.py';
 const HAS_PYTHON = spawnSync('python3', ['--version'], { env: testEnv() }).status === 0;
 
+const BAD_OPTIONS = 'V11: KO_OPTIONS must be a JSON object whose only keys are file and name, each a non-empty string with no empty, . or .. segment and no leading or trailing /, name being a Python identifier. Fix the officer\'s options in officers.json.\n';
 const SCHEMAS = 'SCHEMA_V1 = """CREATE TABLE a (id int);"""\nSCHEMA_V2 = """ALTER TABLE a ADD b int;"""\nSCHEMA_V3 = """ALTER TABLE a ADD c int;"""\n';
 const listOf = (...elements) => `MIGRATIONS = [\n${elements.map((element) => `    ${element},\n`).join('')}]\n`;
 const BASE = SCHEMAS + listOf('SCHEMA_V1', 'SCHEMA_V2');
@@ -166,11 +167,60 @@ describe('V11 migrations-append-only', { skip: HAS_PYTHON ? false : 'python3 is 
     fails({ base: list('SCHEMA_V1'), current: list('SCHEMA_V2'), options: { file: FILE, name: 'STEPS' } }, differs(0, 'SCHEMA_V1', 'SCHEMA_V2').replace('MIGRATIONS', 'STEPS'));
   });
 
+  test('a name bound to another name is followed to the string, and an edit behind the chain fails naming the element', () => {
+    const chain = (inner) => `_A = """${inner}"""\n_B = _A\nSCHEMA_V1 = _B\n${listOf('SCHEMA_V1')}`;
+    passes({ base: chain('a'), current: chain('a') });
+    fails({ base: chain('a'), current: chain('b') }, 'V11: SCHEMA_V1 (element 0 of MIGRATIONS) was edited: the value assigned to it is not the same as at the base.\n');
+  });
+
+  test('a name in a chain that is assigned twice, or not at all, fails as not assigned exactly once', () => {
+    const chain = (extra) => `${extra}SCHEMA_V1 = _A\n${listOf('SCHEMA_V1')}`;
+    fails({ base: chain('_A = 1\n'), current: chain('_A = 1\n_A = 2\n') }, 'V11: SCHEMA_V1 (element 0 of MIGRATIONS) is not assigned exactly once at module level in the tree.\n');
+    fails({ base: chain(''), current: chain('_A = 1\n') }, 'V11: SCHEMA_V1 (element 0 of MIGRATIONS) is not assigned exactly once at module level at the base.\n');
+  });
+
+  test('a cycle of names, or a chain of more than 16 hops, fails as unreadable; 16 hops pass', () => {
+    const cycle = 'A = B\nB = A\nMIGRATIONS = [A]\n';
+    const message = (name, where) => `V11: ${name} (element 0 of MIGRATIONS) refers to other names in a cycle or through more than 16 names ${where}.\n`;
+    fails({ base: cycle, current: cycle }, message('A', 'at the base'));
+    fails({ base: "A = 'x'\nMIGRATIONS = [A]\n", current: cycle }, message('A', 'in the tree'));
+    const hops = (count) => `${Array.from({ length: count }, (_, index) => `N${index} = N${index + 1}\n`).join('')}N${count} = 'x'\nMIGRATIONS = [N0]\n`;
+    passes({ base: hops(16), current: hops(16) });
+    fails({ base: hops(17), current: hops(17) }, message('N0', 'at the base'));
+  });
+
+  test('source too deeply nested to parse fails with its own text', () => {
+    fails({ current: `${BASE}DEEP = 1${'+1'.repeat(100000)}\n` }, `V11: ${FILE} in the tree is too deeply nested to read.\n`);
+  });
+
+  test('a file that is absent in both the base and the tree fails, so a typo in officers.json is not a pass', () => {
+    fails({ current: BASE, options: { file: 'nothere.py' } }, 'V11: nothere.py exists neither at the base nor in the tree; check the file option in officers.json.\n');
+  });
+
+  test('a file configured with a path that is not a plain relative one fails as bad options', () => {
+    for (const file of ['/db.py', './db.py', 'a//db.py', 'a/./db.py', 'a/../db.py', '../db.py', 'a/', '.', '..']) {
+      fails({ current: BASE, options: { file } }, BAD_OPTIONS);
+    }
+  });
+
+  test('a Python older than 3.10 is refused with fixed text naming the minimum', () => {
+    const script = [
+      'import importlib.util, sys',
+      'spec = importlib.util.spec_from_file_location("officer", sys.argv[1])',
+      'module = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(module)',
+      'print(module.version_problem((3, 9, 18)))',
+      'print(module.version_problem((3, 10, 0)))',
+    ].join('\n');
+    const result = spawnSync('python3', ['-B', '-I', '-c', script, SCRIPT], { env: testEnv(), encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'V11: this officer needs Python 3.10 or later; this is Python 3.9.\nNone\n');
+  });
+
   describe('malformed input fails with exit 1 and fixed text', () => {
-    const badOptions = 'V11: KO_OPTIONS must be a JSON object whose only keys are file and name, each a non-empty string, name being a Python identifier. Fix the officer\'s options in officers.json.\n';
     test('KO_OPTIONS unusable', () => {
       for (const values of [{ KO_OPTIONS: '{' }, { KO_OPTIONS: '[]' }, { KO_OPTIONS: undefined }, { KO_OPTIONS: '{"file":""}' }, { KO_OPTIONS: '{"name":"a b"}' }, { KO_OPTIONS: '{"name":1}' }, { KO_OPTIONS: '{"other":"x"}' }]) {
-        fails({ current: BASE, values }, badOptions);
+        fails({ current: BASE, values }, BAD_OPTIONS);
       }
     });
     test('KO_BASE or KO_TREE not an object id', () => {

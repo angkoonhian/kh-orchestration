@@ -72,6 +72,27 @@ describe('V8 docs-with-logic', () => {
     assert.equal(result.output, 'V8: waived by the owner. Reason: line one\\u000aline two\\u001b[0m\n');
   });
 
+  test('format characters (bidi controls, zero-width, BOM) are shown as escapes in a reason and in a path', () => {
+    const tricky = '\u202e\u2066\u200b\ufeff';
+    const shown = '\\u202e\\u2066\\u200b\\ufeff';
+    const waived = run({ changed: ['src/a.py'], values: { KO_WAIVERS: JSON.stringify([{ rule: 'V8', reason: `x${tricky}y` }]) } });
+    assert.equal(waived.output, `V8: waived by the owner. Reason: x${shown}y\n`);
+    const failed = run({ changed: [`src/a${tricky}.py`] });
+    assert.match(failed.output, new RegExp(`^ {2}src/a${shown.replaceAll('\\', '\\\\')}\\.py$`, 'm'));
+    assert.doesNotMatch(failed.output, /[\u202e\u2066\u200b\ufeff]/u);
+  });
+
+  test('a glob with a format character is shown as escapes in the bad-glob text', () => {
+    const result = run({ changed: ['src/a'], options: { logic: ['src/\u202e/'], docs: ['docs/**'] } });
+    assert.equal(result.output, MESSAGES.badGlob('src/\u202e/'));
+    assert.doesNotMatch(result.output, /\u202e/u);
+  });
+
+  test('a waiver reason longer than 300 characters is cut to 300 and ends with "..."', () => {
+    const result = run({ changed: ['src/a.py'], values: { KO_WAIVERS: JSON.stringify([{ rule: 'V8', reason: 'r'.repeat(400) }]) } });
+    assert.equal(result.output, `V8: waived by the owner. Reason: ${'r'.repeat(300)}...\n`);
+  });
+
   test('a waiver for another rule does not pass', () => {
     const result = run({ changed: ['src/a.py'], values: { KO_WAIVERS: JSON.stringify([{ rule: 'V11', reason: 'x' }]) } });
     assert.equal(result.status, 1);

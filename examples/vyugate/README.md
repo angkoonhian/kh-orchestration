@@ -18,7 +18,7 @@ It fails when at least one changed path matches a `logic` glob and no changed pa
 glob. It names up to 20 of the logic paths (then "and N more") and says to update a documentation
 path or to ask the owner for a waiver of V8 with a reason. It passes when a docs path changed, when
 no logic path changed, or when a waiver for `V8` is in force on the branch (it prints the reason
-on one line, control characters made visible). Malformed input (options, waivers or the changed-paths
+on one line, cut to 300 characters, with control, format (bidi, zero-width, BOM) and separator characters shown as `\uXXXX`). Malformed input (options, waivers or the changed-paths
 file) fails with exit 1 and fixed text.
 
 Limits:
@@ -39,7 +39,9 @@ Limits:
 ## `migrations-append-only.py` (rule V11: database migrations are append-only)
 
 Options: `{ "file": "<path>", "name": "MIGRATIONS" }`, both optional; the defaults are
-`products/vision/backend/src/vyugate_api/db.py` and `MIGRATIONS`. Python 3, standard library only.
+`products/vision/backend/src/vyugate_api/db.py` and `MIGRATIONS`. Python 3.10 or later, standard
+library only; on an older Python it exits 1 with a fixed text naming the minimum. `file` must be a plain
+relative path (no leading or trailing `/`, no empty, `.` or `..` segment), else the officer fails.
 
 It reads the file at the base commit and in the tree with `git`, finds the module-level list
 assignment of that name (plain or annotated, `MIGRATIONS: list[str] = [...]`) with the `ast` module,
@@ -52,22 +54,26 @@ new one.
 Names are checked too. vyugate's list holds names (`SCHEMA_V1`), and comparing names would not
 notice an edit to the string a name refers to. So for each element of the base list that is a bare
 name, the module-level assignment of that name must be present exactly once in both versions with
-the same `ast.dump` value; otherwise the officer fails naming it.
+the same `ast.dump` value; otherwise the officer fails naming it. A name bound to another bare name
+(`SCHEMA_V1 = _V1`) is followed to the value assigned last, each name on the way assigned exactly
+once; a cycle, or more than 16 hops, fails as unreadable.
 
-It passes with nothing to compare when `KO_BASE` is `none` or the file did not exist at the base. It
-fails when the file exists at the base and not in the tree, and as unreadable (fixed text) when, in
-either version, the source has a syntax error, the name is not assigned, is assigned more than once
+It passes with nothing to compare when `KO_BASE` is `none`, or when the file did not exist at the base
+but exists in the tree (a new migrations file). It fails when the file exists in neither (so a typo in
+`officers.json` is not a pass), when it exists at the base and not in the tree, and as unreadable (fixed text) when, in
+either version, the source has a syntax error or is too deeply nested to read, the name is not assigned, is assigned more than once
 at module level (including `+=` and assignments under `if`/`try`), or its value is not a plain list
 literal (a call, a comprehension, a `+` expression, a tuple, another name) or holds a starred
 element.
 
 Limits:
 
-- A name's value is compared as written. If a migration string is built from another name
-  (`SCHEMA_V2 = SCHEMA_V1 + "..."`) or is imported from another file, an edit behind that name is not
-  seen. Names must be assigned in the file itself.
-- Bindings other than assignment (`import ... as MIGRATIONS`, `def`, `for`, `with ... as`, `del`) are
-  not recognised, and nor is a change made at run time (`MIGRATIONS.append(...)`).
+- A name's value is compared as written, after following name-to-name assignments. A value built from
+  other names (`SCHEMA_V2 = SCHEMA_V1 + "..."`) is compared as that expression, so an edit to a name
+  inside it is not seen. A name imported from another file is not assigned in the file, so it fails
+  ("not assigned exactly once"), the safer outcome.
+- Not detected: a change to the list after its literal (`MIGRATIONS.append(...)`, `insert`, `del`), and
+  names rebound by `for`, `import`, `def`, `global` or `:=`.
 - It does not know whether a migration has been applied anywhere; it treats every element of the
   base list as applied.
 
