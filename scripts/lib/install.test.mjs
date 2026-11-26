@@ -16,7 +16,7 @@ import {
 } from './install.mjs';
 import { MANIFEST_PATH, readManifest } from './manifest.mjs';
 import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
-import { TEXT as KO_TEXT } from '../../assets/scripts/ko-cli.mjs';
+import { TEXT as KO_TEXT, statusOf } from '../../assets/scripts/ko-cli.mjs';
 import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
 import { refreshBin, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
@@ -342,7 +342,7 @@ test('an existing hook that is not kh-orchestration\'s is a conflict: it is not 
   assert.equal(readFileSync(preCommit, 'utf8'), '#!/bin/sh\necho owner-hook >&2\n');
   for (const name of ['pre-merge-commit', 'reference-transaction']) assert.ok(existsSync(join(hooksDir(repo.root), name)), name);
   assert.deepEqual(readManifest(repo.root).manifest.gitHooks.map((hook) => hook.name), ['pre-merge-commit', 'reference-transaction']);
-  assert.equal(TEXT.hookConflict('pre-commit', '/h/pre-commit', 'L'), 'The pre-commit hook at /h/pre-commit is not kh-orchestration\'s, so it is not written over. To run the commit gate from it, add this line directly after its first line:\n    L');
+  assert.equal(TEXT.hookConflict('pre-commit', '/h/pre-commit', 'L'), 'The pre-commit hook at /h/pre-commit is not kh-orchestration\'s, so it is not written over. To run the commit gate from it, make its first line #!/bin/sh and put this line directly after it, with only blank or comment lines between:\n    L');
 
   // The line, added after the first line, runs the gate: the commit is refused with the gate's own text.
   writeFileSync(preCommit, `#!/bin/sh\n${line}\necho owner-hook >&2\n`);
@@ -697,4 +697,39 @@ test('uninstall says a kept hook still starts the gate, which refuses every comm
   const hook = join(hooksDir(repo.root), 'pre-commit');
   assert.equal(TEXT.keptHook(hook), `kept: the git hook ${hook} was changed since kh-orchestration wrote it, and it still starts the commit gate, which now refuses every commit: remove it (rm -- ${shellWord(hook)}) or take kh-orchestration's lines out of it`);
   assert.ok(TEXT.rewriteHook(hook).endsWith('; any edit made in it is discarded)'));
+});
+
+test('a foreign hook hosts the gate only when the line is its first command under #!/bin/sh; anywhere else apply and status say so and the install is not complete (after Task 9\'s re-review)', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const path = join(hooksDir(repo.root), 'pre-commit');
+  const line = hookLine('pre-commit', { env: envPath(), node: process.execPath });
+  const cases = [
+    ['first, under #!/bin/sh', `#!/bin/sh\n${line}\nexit 0\n`, 'hosted'],
+    ['first, under #!/bin/sh -p, after comments and blank lines', `#!/bin/sh -p\n# the owner's hook\n\n${line}\necho done\n`, 'hosted'],
+    ['after exit 0', `#!/bin/sh\nexit 0\n${line}\n`, 'misplaced'],
+    ['inside if false', `#!/bin/sh\nif false; then\n${line}\nfi\n`, 'misplaced'],
+    ['after another command', `#!/bin/sh\necho hi\n${line}\n`, 'misplaced'],
+    ['under #!/bin/bash', `#!/bin/bash\n${line}\n`, 'misplaced'],
+    ['under #!/usr/bin/env python3', `#!/usr/bin/env python3\n${line}\n`, 'misplaced'],
+    ['commented out', `#!/bin/sh\n# ${line}\nexit 0\n`, 'not-ours'],
+  ];
+  for (const [label, text, expected] of cases) {
+    writeFileSync(path, text, { mode: 0o755 });
+    const planned = plan(repo.root);
+    const hook = statusOf(repo.root).hooks.find((entry) => entry.name === 'pre-commit');
+    if (expected === 'hosted') {
+      assert.deepEqual(planned.conflicts, [], label);
+      assert.equal(hook.hosted, true, label);
+      continue;
+    }
+    const text2 = expected === 'misplaced' ? TEXT.hostedMisplaced('pre-commit', path, line) : TEXT.hookConflict('pre-commit', path, line);
+    assert.deepEqual(planned.conflicts, [{ text: text2, next: TEXT.askOwner(applyCommand(repo.root)) }], label);
+    assert.equal(hook.hosted, false, label);
+    assert.equal(hook.misplaced, expected === 'misplaced', label);
+    assert.ok(statusOf(repo.root).problems.some((problem) => problem.text === (expected === 'misplaced' ? KO_TEXT.hookMisplaced('pre-commit', path) : KO_TEXT.hookNotOurs('pre-commit', path))), label);
+    assert.notEqual(detect(repo.root).next, TEXT.allClear, label);
+  }
+  assert.equal(TEXT.hostedMisplaced('pre-commit', '/h', 'L'), 'The pre-commit hook at /h holds kh-orchestration\'s line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between:\n    L');
+  assert.equal(TEXT.hookConflict('pre-commit', '/h', 'L'), 'The pre-commit hook at /h is not kh-orchestration\'s, so it is not written over. To run the commit gate from it, make its first line #!/bin/sh and put this line directly after it, with only blank or comment lines between:\n    L');
 });

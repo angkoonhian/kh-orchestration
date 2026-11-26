@@ -212,6 +212,7 @@ export const TEXT = Object.freeze({
   binDiffers: (bin, baseline, names) => `${shownName(bin)}/ differs from ${baseline}: ${named(names)}. The hooks and the owner's commands run bin/; kh-orchestration's apply restores it from the approved tree.`,
   hookMissing: (name, path) => `The ${name} hook is not installed at ${shownName(path)}, so git does not run the commit gate there.`,
   raceHookMissing: (path) => `The reference-transaction hook is not installed at ${shownName(path)}, so a change to the index in the instant after the gate allows a commit is not caught: verify-branch is then the remedy.`,
+  hookMisplaced: (name, path) => `The ${name} hook at ${shownName(path)} holds kh-orchestration's line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between.`,
   hookNotOurs: (name, path) => `The ${name} hook at ${shownName(path)} is not kh-orchestration's, so the commit gate may not run.`,
   hookDiffers: (name, path) => `The ${name} hook at ${shownName(path)} is not exactly the text kh-orchestration writes for the env and Node it names, so it may not run the gate as it should.`,
   hookNotExecutable: (name, path) => `The ${name} hook at ${shownName(path)} is not executable, so git skips it.`,
@@ -431,7 +432,7 @@ function attempt(problems, root, read, fallback) {
 // the gate (after Task 9's review), and is judged by the env and Node that line names.
 function inspectHook(root, name) {
   const path = join(commonDir(root), 'hooks', name);
-  const hook = { name, path, present: false, ours: false, hosted: false, matches: false, executable: false, env: null, envExists: false, node: null, nodeExists: false };
+  const hook = { name, path, present: false, ours: false, hosted: false, misplaced: false, matches: false, executable: false, env: null, envExists: false, node: null, nodeExists: false };
   const stat = statOrNull(path);
   if (stat === null || !stat.isFile()) return hook;
   hook.present = true;
@@ -441,7 +442,8 @@ function inspectHook(root, name) {
   const parts = hookParts(text);
   hook.ours = parts !== null && parts.hook === name;
   const hosted = hook.ours ? null : hostedParts(text, name);
-  hook.hosted = hosted !== null;
+  hook.hosted = hosted?.first === true;
+  hook.misplaced = hosted?.first === false;
   const named = hook.hosted ? hosted : parts;
   if ((!hook.ours && !hook.hosted) || named.env === null) return hook;
   hook.env = named.env;
@@ -455,6 +457,7 @@ function inspectHook(root, name) {
 function hookProblems(root, hook) {
   const apply = APPLY(root);
   if (!hook.present) return [hook.name === REFERENCE_HOOK ? { text: TEXT.raceHookMissing(hook.path), next: apply } : { text: TEXT.hookMissing(hook.name, hook.path), next: apply }];
+  if (hook.misplaced) return [{ text: TEXT.hookMisplaced(hook.name, hook.path), next: apply }];
   if (!hook.ours && !hook.hosted) return [{ text: TEXT.hookNotOurs(hook.name, hook.path), next: apply }];
   const problems = [];
   if (hook.ours && !hook.matches) problems.push({ text: TEXT.hookDiffers(hook.name, hook.path), next: apply });
@@ -665,7 +668,7 @@ export function statusOf(root) {
     digest,
     inflight,
     bin,
-    hooks: hooks.map(({ name, present, ours, hosted, matches, executable, env, envExists, node, nodeExists }) => ({ name, present, ours, hosted, matches, executable, env, envExists, node, nodeExists })),
+    hooks: hooks.map(({ name, present, ours, hosted, misplaced, matches, executable, env, envExists, node, nodeExists }) => ({ name, present, ours, hosted, misplaced, matches, executable, env, envExists, node, nodeExists })),
     hooksPath,
     git: gitAt,
     problems,
@@ -675,7 +678,7 @@ export function statusOf(root) {
 const yesNo = (value, yes, no) => (value === null ? 'unknown (see the problems)' : value ? yes : no);
 
 function statusLines(root, status) {
-  const hookWord = (hook) => (!hook.present ? 'missing' : !hook.ours && !hook.hosted ? 'not ours' : (hook.matches || hook.hosted) && hook.executable && hook.envExists && hook.nodeExists ? (hook.hosted ? 'ok (its line in a hook of another)' : 'ok') : 'broken');
+  const hookWord = (hook) => (!hook.present ? 'missing' : hook.misplaced ? 'holds the line, but not where it runs first' : !hook.ours && !hook.hosted ? 'not ours' : (hook.matches || hook.hosted) && hook.executable && hook.envExists && hook.nodeExists ? (hook.hosted ? 'ok (its line in a hook of another)' : 'ok') : 'broken');
   const binWord = (bin) => (bin === null ? 'unknown' : !bin.present ? 'missing' : binProblems(root, bin).length === 0 ? `equal to ${bin.baseline.kind === 'approved' ? 'the last approved tree' : 'the working copy'}` : 'differs');
   return [
     TEXT.statusHeader(root),

@@ -192,7 +192,8 @@ export const TEXT = Object.freeze({
   scriptEdited: (path) => `${path} is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. To take this version, restore it (git checkout -- ${path}), then run apply again.`,
   hooksStopped: 'The git hooks are not written while an installed script is kept: the install is incomplete until the scripts above are kh-orchestration\'s.',
   extensionSkipped: `kh-orchestration's entry in ${EXTENSIONS_PATH} is not written while ${MODULE} is kept: the entry would register bytes kh-orchestration did not ship.`,
-  hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so it is not written over. To run the commit gate from it, add this line directly after its first line:\n    ${line}`,
+  hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so it is not written over. To run the commit gate from it, make its first line #!/bin/sh and put this line directly after it, with only blank or comment lines between:\n    ${line}`,
+  hostedMisplaced: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between:\n    ${line}`,
   hostedStale: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line for another env or Node, so the commit gate may not start from it. Replace that line with this one:\n    ${line}`,
   hostedNotExecutable: (name, path) => `The ${name} hook at ${path} holds kh-orchestration's line but is not executable, so git skips it.`,
   hostedRemains: (name, path) => `The ${name} hook at ${path} is not kh-orchestration's and is left as it is, but it still holds kh-orchestration's line, which refuses every commit once kh-orchestration is gone: remove that line from it by hand.`,
@@ -538,6 +539,7 @@ function hookState(path, name, { env, node }) {
   if (hookParts(text)?.hook === name) return { state: 'ours', bytes: file.bytes };
   const hosted = hostedParts(text, name);
   if (hosted === null) return { state: 'not-ours', bytes: file.bytes };
+  if (!hosted.first) return { state: 'hosted-misplaced', bytes: file.bytes };
   if (hosted.env !== env || hosted.node !== node) return { state: 'hosted-other', bytes: file.bytes };
   return { state: executable ? 'hosted' : 'hosted-off', bytes: file.bytes };
 }
@@ -933,6 +935,7 @@ export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
     else if (found.state === 'ours') hookActions.push({ kind: 'git-hook', path, detail: TEXT.rewriteHook(path), name, create: false });
     else if (found.state === 'current' && recorded !== sha256(found.bytes)) hookActions.push({ kind: 'record', path, detail: TEXT.record(path), gitHook: { name, sha256: sha256(found.bytes) } });
     else if (found.state === 'not-ours') hookConflicts.push({ text: TEXT.hookConflict(name, path, line), next });
+    else if (found.state === 'hosted-misplaced') hookConflicts.push({ text: TEXT.hostedMisplaced(name, path, line), next });
     else if (found.state === 'hosted-other') hookConflicts.push({ text: TEXT.hostedStale(name, path, line), next });
     else if (found.state === 'hosted-off') hookConflicts.push({ text: TEXT.hostedNotExecutable(name, path), next: `chmod +x ${shellWord(path)}` });
   }
@@ -1305,6 +1308,7 @@ const HOOK_WORDS = {
   ours: 'kh-orchestration\'s, not this version\'s exact text',
   hosted: 'not kh-orchestration\'s, but holds its line, so it runs the gate',
   'hosted-other': 'not kh-orchestration\'s, holding its line for another env or Node',
+  'hosted-misplaced': 'not kh-orchestration\'s, holding its line, but not where it runs first',
   'hosted-off': 'not kh-orchestration\'s, holding its line, but not executable',
   'not-ours': 'not kh-orchestration\'s',
   missing: 'missing',

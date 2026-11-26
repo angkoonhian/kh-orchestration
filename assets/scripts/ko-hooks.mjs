@@ -97,17 +97,26 @@ export function hookLine(hook, { env, node }) {
 
 const LINE_START = new RegExp(`ko_out=\\$\\((${QUOTED}) -i .* (${QUOTED}) "\\$ko_d/kh-orchestration/bin/gate\\.mjs" `);
 
+// The first line a hosting hook may have, and the lines that may stand between it and our line.
+const SH_FIRST = /^#!\/bin\/sh(?: -p)?$/;
+const NOTHING_RUNS = /^\s*(?:#.*)?$/;
+
 /**
- * The env and Node, `{ env, node }`, named by a line of `text` that is exactly the line hookLine
- * gives for hook `hook` and those paths: a hook file that is someone else's and holds it runs the
- * gate as that hook (after Task 9's review). Null when no line is.
+ * The env and Node named by a line of `text` that is exactly the line hookLine gives for hook
+ * `hook` and those paths, `{ env, node, first }`; null when no line is. `first` says whether it
+ * is the file's first command — its first line is `#!/bin/sh` (with or without -p) and only blank
+ * or comment lines stand between: only then does a hook file that is someone else's host the gate
+ * (after Task 9's re-review), since anything before the line can skip it.
  */
 export function hostedParts(text, hook) {
-  for (const line of text.split('\n')) {
+  const lines = text.split('\n');
+  for (const [index, line] of lines.entries()) {
     const start = line.includes('$ko_d/kh-orchestration/bin/gate.mjs') ? line.match(LINE_START) : null;
     if (start === null) continue;
     const parts = { env: unquote(start[1]), node: unquote(start[2]) };
-    if (hookLine(hook, parts) === line) return parts;
+    if (hookLine(hook, parts) !== line) continue;
+    const first = index > 0 && SH_FIRST.test(lines[0]) && lines.slice(1, index).every((between) => NOTHING_RUNS.test(between));
+    return { ...parts, first };
   }
   return null;
 }
