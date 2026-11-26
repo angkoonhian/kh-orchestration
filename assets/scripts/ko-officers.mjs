@@ -83,7 +83,7 @@ export function officersOfTree(root, tree) {
 }
 
 // Not passed on: the variables a git hook sets, all git configuration injected through the environment,
-// and any KO_ variable of the caller (this module sets the four the officer is meant to see).
+// and any KO_ variable of the caller (this module sets the five the officer is meant to see).
 const NOT_INHERITED = /^(?:GIT_(?:DIR|WORK_TREE|INDEX_FILE|PREFIX|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES)|GIT_CONFIG_.*|KO_.*)$/;
 const KILL_GRACE_MS = 1000;
 // How long output still in the pipes is read after the officer has ended, before the pipes are closed on any descendant that holds them.
@@ -199,20 +199,24 @@ const skipped = (officer) => ({ id: officer.id, rule: officer.rule, result: 'ski
  * `appliesTo` glob; the officer is not started). The officers come from
  * `officersOfTree`. `changed` is written once to a fresh file outside the
  * repository, named by `KO_CHANGED_FILE` (NUL-separated), and removed afterwards.
+ * `waivers` are the waivers in force on the branch (ko-state's `{ rule, branch, reason, at }`);
+ * every officer sees them as `KO_WAIVERS`, a JSON array of `{ rule, reason }` (`[]` for none), and
+ * decides itself whether one is for its rule (the V8 officer honours a waiver of `V8`).
  */
-export async function runOfficers(root, { officers, base, tree, changed }) {
+export async function runOfficers(root, { officers, base, tree, changed, waivers }) {
   const directory = mkdtempSync(join(tmpdir(), 'ko-changed-'));
   try {
     const changedFile = join(directory, 'changed');
     writeFileSync(changedFile, changed.join('\0'));
     const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !NOT_INHERITED.test(name)));
+    const waived = JSON.stringify(waivers.map(({ rule, reason }) => ({ rule, reason })));
     const results = [];
     for (const officer of officers) {
       if (!changed.some((path) => officer.appliesTo.some((glob) => matchesGlob(glob, path)))) {
         results.push(skipped(officer));
         continue;
       }
-      const env = { ...inherited, KO_OPTIONS: JSON.stringify(officer.options), KO_BASE: base, KO_TREE: tree, KO_CHANGED_FILE: changedFile };
+      const env = { ...inherited, KO_OPTIONS: JSON.stringify(officer.options), KO_BASE: base, KO_TREE: tree, KO_CHANGED_FILE: changedFile, KO_WAIVERS: waived };
       results.push(await runOne(root, officer, env));
     }
     return results;

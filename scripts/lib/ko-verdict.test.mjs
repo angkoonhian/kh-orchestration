@@ -105,11 +105,11 @@ const node = (code) => [process.execPath, '-e', code];
 test('produceVerdict reads the officers from the tree, and records the digest, the results and the supplied fields', async () => {
   const marker = (id) => `require("node:fs").writeFileSync(${JSON.stringify(id)}, "x")`;
   await withRepo({
-    [OFFICERS]: officersFile({ id: 'ok', argv: node('') }, { id: 'bad', argv: node('process.exit(1)'), rule: 'R1' }, { id: 'docs', argv: node(marker('docs-ran')), appliesTo: ['docs/**'] }),
+    [OFFICERS]: officersFile({ id: 'ok', argv: node('process.stdout.write(process.env.KO_WAIVERS)') }, { id: 'bad', argv: node('process.exit(1)'), rule: 'R1' }, { id: 'docs', argv: node(marker('docs-ran')), appliesTo: ['docs/**'] }),
     'src/a.js': 'one\n',
   }, async (repo) => {
     const tree = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
-    const waivers = [{ officer: 'bad', reason: 'x' }];
+    const waivers = [{ rule: 'R1', branch: 'main', reason: 'x', at: '2026-11-26T00:00:00.000Z' }];
     const before = new Date().toISOString();
     const made = await produceVerdict(repo.root, { tree, base: 'none', branch: 'main', waivers, kitVersion: KIT_VERSION });
     const { verdict } = made;
@@ -118,6 +118,7 @@ test('produceVerdict reads the officers from the tree, and records the digest, t
     assert.equal(verdict.digest, digestOfTree(repo.root, tree).digest);
     assert.deepEqual(verdict.officers.map((r) => [r.id, r.rule, r.result]), [['ok', null, 'pass'], ['bad', 'R1', 'fail'], ['docs', null, 'skipped']]);
     assert.deepEqual([verdict.agentRuleChanges, verdict.waivers], [[], waivers]);
+    assert.deepEqual(JSON.parse(verdict.officers[0].output), [{ rule: 'R1', reason: 'x' }], 'the waivers reach the officers');
     assert.ok(before <= verdict.startedAt && verdict.startedAt <= verdict.finishedAt && verdict.finishedAt <= new Date().toISOString());
     assert.equal(existsSync(join(repo.root, 'docs-ran')), false);
     writeVerdict(repo.root, verdict);

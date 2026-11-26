@@ -20,7 +20,8 @@ const resultHasShape = (entry) => entry !== null && typeof entry === 'object'
  * cannot be used, or the digest cannot be trusted; then no officer is started
  * and there is no verdict. The officers are read from `tree` here, never taken
  * from the caller, so the record is of the tree's own checks. `base` is a commit
- * id or `none`; its tree is derived from it. `waivers` are recorded as given.
+ * id or `none`; its tree is derived from it. `waivers` (the branch's, from ko-state's
+ * readWaivers) are recorded as given and reach the officers as KO_WAIVERS.
  * Precondition: the working tree equals `tree` (the officers run in it); the
  * caller checks that, this function cannot. Throws what `agentRuleChanges`,
  * `treeOfCommit` and `changedPaths` throw.
@@ -38,7 +39,7 @@ export async function produceVerdict(root, { tree, base, branch, waivers, kitVer
   if (digest.problem !== undefined) return { problem: digest.problem };
   const startedAt = new Date().toISOString();
   const changes = agentRuleChanges(root, treeOfCommit(root, base), tree);
-  const results = await runOfficers(root, { officers: read.officers, base, tree, changed: changedPaths(root, base, tree) });
+  const results = await runOfficers(root, { officers: read.officers, base, tree, changed: changedPaths(root, base, tree), waivers });
   return {
     verdict: {
       schema: 1, tree, base, branch, digest: digest.digest, officers: results, agentRuleChanges: changes, waivers, startedAt, finishedAt: new Date().toISOString(), kitVersion,

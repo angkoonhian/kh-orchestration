@@ -1,8 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { isolateProcessEnv, makeRepo } from './test-repo.mjs';
 import { MAX_GLOBS, matchesGlob } from '../../assets/scripts/extension.mjs';
 import { OFFICERS, officersUnreadableMessage, treeNotIdMessage } from '../../assets/scripts/ko-digest.mjs';
@@ -107,7 +106,7 @@ test('officersOfTree refuses what the runner cannot run, with fixed text naming 
 // ---- running ----
 
 const node = (code) => [process.execPath, '-e', code];
-const run = (repo, officers, extra = {}) => runOfficers(repo.root, { base: BASE, tree: TREE, changed: ['src/a.js'], officers: officers.map((entry) => ({ rule: null, appliesTo: ['**'], timeoutSeconds: 30, options: {}, ...entry })), ...extra });
+const run = (repo, officers, extra = {}) => runOfficers(repo.root, { base: BASE, tree: TREE, changed: ['src/a.js'], waivers: [], officers: officers.map((entry) => ({ rule: null, appliesTo: ['**'], timeoutSeconds: 30, options: {}, ...entry })), ...extra });
 
 test('every officer runs in listed order, even after a failure, and the results carry the record fields', async () => {
   await inRepo({ 'a.txt': 'x' }, async (repo) => {
@@ -152,9 +151,6 @@ test('KO_OPTIONS, KO_BASE, KO_TREE and KO_CHANGED_FILE reach the officer, and th
     const out = join(repo.root, '..', 'seen.json');
     const code = `const fs = require("node:fs"); const file = process.env.KO_CHANGED_FILE;
       fs.writeFileSync(${JSON.stringify(out)}, JSON.stringify({ options: process.env.KO_OPTIONS, base: process.env.KO_BASE, tree: process.env.KO_TREE, file, text: fs.readFileSync(file, "utf8"), cwd: process.cwd() }));`;
-    // Only this module's own directories are counted: other test files make temporary directories at the same time.
-    const changedDirs = () => readdirSync(tmpdir()).filter((name) => name.startsWith('ko-changed-')).length;
-    const before = changedDirs();
     const [result] = await run(repo, [{ id: 'env', options: { level: 2 }, argv: node(code) }], { changed: ['a b.js', 'dir/c.js'] });
     assert.equal(result.result, 'pass', result.output);
     const seen = JSON.parse(readFileSync(out, 'utf8'));
@@ -164,8 +160,8 @@ test('KO_OPTIONS, KO_BASE, KO_TREE and KO_CHANGED_FILE reach the officer, and th
     assert.equal(seen.text, 'a b.js\0dir/c.js');
     assert.equal(seen.cwd, repo.root);
     assert.equal(seen.file.startsWith(repo.root), false);
-    assert.equal(existsSync(seen.file), false);
-    assert.equal(changedDirs(), before);
+    // Its own directory, not a count of all of them: other test files run officers at the same time.
+    assert.equal(existsSync(dirname(seen.file)), false);
   });
 });
 
@@ -332,16 +328,28 @@ test('standard output and standard error are decoded separately, so a split char
   });
 });
 
-test('the officer inherits no git configuration and no KO_ variable but the four it is given', async () => {
+test('the officer inherits no git configuration and no KO_ variable but the five it is given', async () => {
   await inRepo({}, async (repo) => {
     const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'KO_STRAY', 'KO_OPTIONS_EXTRA'];
     for (const name of names) process.env[name] = 'x';
     process.env.KEEP_ME = 'y';
     try {
       const [result] = await run(repo, [{ id: 'env', argv: node('process.stdout.write(JSON.stringify(Object.keys(process.env).filter((n) => /^(GIT_|KO_|KEEP_)/.test(n)).sort()))') }]);
-      assert.deepEqual(JSON.parse(result.output), ['KEEP_ME', 'KO_BASE', 'KO_CHANGED_FILE', 'KO_OPTIONS', 'KO_TREE']);
+      assert.deepEqual(JSON.parse(result.output), ['KEEP_ME', 'KO_BASE', 'KO_CHANGED_FILE', 'KO_OPTIONS', 'KO_TREE', 'KO_WAIVERS']);
     } finally {
       for (const name of [...names, 'KEEP_ME']) delete process.env[name];
     }
+  });
+});
+
+test('KO_WAIVERS gives every officer the waivers in force as a JSON array of { rule, reason }, and [] when there are none', async () => {
+  await inRepo({}, async (repo) => {
+    const show = node('process.stdout.write(process.env.KO_WAIVERS)');
+    const waivers = [{ rule: 'V8', branch: 'feat', reason: 'docs land next', at: '2026-11-26T00:00:00.000Z' }, { rule: 'V11', branch: 'feat', reason: 'a "quoted" why', at: 'x' }];
+    const [one, two] = await run(repo, [{ id: 'a', argv: show }, { id: 'b', argv: show }], { waivers });
+    assert.deepEqual(JSON.parse(one.output), [{ rule: 'V8', reason: 'docs land next' }, { rule: 'V11', reason: 'a "quoted" why' }]);
+    assert.equal(two.output, one.output);
+    const [none] = await run(repo, [{ id: 'a', argv: show }]);
+    assert.equal(none.output, '[]');
   });
 });
