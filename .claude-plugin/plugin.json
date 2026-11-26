@@ -1,0 +1,6 @@
+{
+  "name": "kh-orchestration",
+  "version": "0.1.0",
+  "description": "Refuses any commit whose tree has not passed the repository's checks, and lets the files that define those checks change only with the owner's approval.",
+  "author": { "name": "Ang Koon Hian" }
+}
