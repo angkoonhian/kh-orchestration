@@ -57,7 +57,7 @@
 // - environment variables that git or a shell runs as commands (GIT_EDITOR,
 //   GIT_SSH_COMMAND, BASH_ENV, PROMPT_COMMAND...) when exported earlier rather
 //   than set in the command's own assignments, which are scanned; and a
-//   variable that steers git or its hooks (PATH, HOME, GIT_EXEC_PATH, ...)
+//   variable that steers git or its hooks (PATH, HOME, GIT_EXEC_PATH, GIT_COMMON_DIR, ...)
 //   exported in an earlier command line, or inside a script fed to a shell on
 //   its standard input. One exported in the same line as git is blocked.
 // - a glob or a search whose output becomes another command's words (`chmod a-x
@@ -233,8 +233,8 @@ export const MESSAGES = Object.freeze({
   hiddenOption: 'A flag of git commit, merge or pull is given through a variable or a substitution, which could turn the hooks off, so it is blocked. Write the flags out literally.',
   commitTree: `git commit-tree makes a commit without the commit gate and is not run from a session. Run ${RUN}, then git commit.`,
   gitConfig: 'Git configuration that redirects hooks or names a command git runs (core.hooksPath, include, alias, mergeOptions, filters, fsmonitor, diff and merge drivers, pagers, editors, gpg and ssh programs) is not changed from a session. The owner changes it; git config --get reads it.',
-  exportedEnv: 'This line runs git and also sets a variable that steers git or its hooks (NODE_*, LD_*, DYLD_*, GIT_CONFIG_*, GIT_EXEC_PATH, HOME, XDG_CONFIG_HOME, PATH, TMOUT, PS4, SHELLOPTS, BASH_ENV, ENV, BASH_FUNC_*), exports a function, or defines git as one. Run git in a line of its own.',
-  gitEnv: 'GIT_CONFIG_*, GIT_EXEC_PATH (or --exec-path), HOME, XDG_CONFIG_HOME, PATH, NODE_*, LD_*, DYLD_*, TMOUT, SHELLOPTS, PS4, BASH_ENV, ENV and BASH_FUNC_* are not set for git from a session: they change what git and its hooks run. Run the git command without them.',
+  exportedEnv: 'This line runs git and sets a variable that steers git or a hook (NODE_OPTIONS etc., LD_*, DYLD_*, GIT_CONFIG_*, GIT_EXEC_PATH, GIT_COMMON_DIR, HOME, XDG_CONFIG_HOME, PATH, TMOUT, PS4, SHELLOPTS, BASH_ENV, ENV, BASH_FUNC_*), exports a function, or defines git as one. Run git in a line of its own.',
+  gitEnv: 'GIT_CONFIG_*, GIT_EXEC_PATH (or --exec-path), GIT_COMMON_DIR, HOME, XDG_CONFIG_HOME, PATH, NODE_OPTIONS etc., LD_*, DYLD_*, TMOUT, SHELLOPTS, PS4, BASH_ENV, ENV and BASH_FUNC_* are not set for git from a session: they change what git and its hooks run. Run the git command without them.',
   xargs: 'A git command or ko.mjs run through xargs takes words the hook cannot see, so it is blocked. Run the command directly, with its subcommand and options written out.',
   guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
@@ -1452,10 +1452,14 @@ const XARGS_HIDDEN = new Set(['commit', 'merge', 'pull', 'config', 'commit-tree'
 // Environment that changes git's configuration or programs: on any command for GIT_CONFIG*,
 // on a git command for the rest.
 const GIT_CONFIG_ENV = /^GIT_CONFIG[A-Za-z0-9_]*\+?=/i;
-// PATH: a git command's PATH decides which programs its hooks start. NODE_*, LD_* and DYLD_*:
-// they load code into the hooks' processes, Node among them.
+// PATH: a git command's PATH decides which programs its hooks start. GIT_COMMON_DIR: git looks
+// for its hooks under it, so another one runs no hook of ours at all. The Node variables that load
+// code or write files (NODE_OPTIONS, NODE_PATH, NODE_REPL_EXTERNAL_MODULE, NODE_EXTRA_CA_CERTS,
+// NODE_V8_COVERAGE, NODE_COMPILE_CACHE), LD_* and DYLD_*: they load code into a process. The hooks
+// start node through env -i, which drops all of these, so for them this rule is defence in depth;
+// other NODE_* names (NODE_ENV, NODE_NO_WARNINGS) are everyday and allowed.
 // TMOUT, SHELLOPTS, PS4, BASH_ENV, ENV and BASH_FUNC_*: they steer the shell a hook runs in.
-const GUARDED_ENV = '(?:HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH|PATH|NODE_[A-Za-z0-9_]*|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|TMOUT|SHELLOPTS|PS4|BASH_ENV|ENV|BASH_FUNC_[^=]*)';
+const GUARDED_ENV = '(?:HOME|XDG_CONFIG_HOME|GIT_EXEC_PATH|GIT_COMMON_DIR|PATH|NODE_(?:OPTIONS|PATH|REPL_EXTERNAL_MODULE|EXTRA_CA_CERTS|V8_COVERAGE|COMPILE_CACHE)|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|TMOUT|SHELLOPTS|PS4|BASH_ENV|ENV|BASH_FUNC_[^=]*)';
 const GIT_ENV = new RegExp(`^${GUARDED_ENV}\\+?=`, 'i');
 // A variable set or exported elsewhere in a line that runs git reaches git's hooks just as well
 // (decision 15, addition after Task 6's fourth re-review): these and GIT_CONFIG_*.
