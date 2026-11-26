@@ -511,7 +511,8 @@ test('I5: apply --yes with a changed extension.mjs takes the entry out (tool cal
   assert.equal(harnessAllowsRead(repo.root), true, 'without our entry, tool calls work');
   const status = statusJson(repo.root);
   assert.equal(status.contract.ok, false, 'commits are refused');
-  assert.ok(status.problems.some((problem) => problem.text === KO_TEXT.extensionPairDiffers && problem.next === `${repair}, then ${repairCommand(shellWord(repo.root))}`), JSON.stringify(status.problems));
+  assert.deepEqual(status.problems[0], { text: KO_TEXT.extensionPairDiffers, next: `${repair}, then ${repairCommand(shellWord(repo.root))}` }, 'the one repair, first');
+  assert.equal(status.problems.some((problem) => problem.text.includes('differs from the tree being committed')), false, 'no advice to stage the pair for approval meanwhile');
 
   assert.equal(shell(repair, { cwd: join(repo.root, '.claude') }).status, 0);
   assert.equal(run('apply', [repo.root, '--yes']).status, 0);

@@ -676,6 +676,11 @@ export function statusOf(root) {
   const approveNext = ownerCommand(root, 'approve');
   const off = isOff(root);
   if (off) problems.push({ text: TEXT.offProblem(ownerCommand(root, 'on')), next: ownerCommand(root, 'on') });
+  // The module and its entry apart (after the whole-branch review) is said first, as the one repair
+  // to make: until it is made, staging the live files for approval would lead nowhere.
+  const contract = contractHolds(root, { probe: false });
+  const pairDiffers = !contract.ok && extensionPairDiffers(root);
+  if (pairDiffers) problems.push({ text: TEXT.extensionPairDiffers, next: `${restoreExtensionPair(shellWord(root))}, then ${APPLY(root)}` });
   const branch = currentBranch(root);
   const tree = attempt(problems, root, () => indexTree(root), null);
   const head = attempt(problems, root, () => headTree(root), null);
@@ -699,7 +704,7 @@ export function statusOf(root) {
     }
     const differs = attempt(problems, root, () => liveFilesRefusal(root, tree), null);
     liveFiles = differs === null ? { equal: true, reason: null, next: null } : { equal: false, reason: differs.reason, next: differs.next };
-    if (differs !== null) problems.push({ text: differs.reason, next: differs.next });
+    if (differs !== null && !pairDiffers) problems.push({ text: differs.reason, next: differs.next });
     const digested = digestOfTree(root, tree);
     if (digested.problem !== undefined) {
       problems.push({ text: TEXT.undigestable(digested.problem), next: agentCommand(root, 'status') });
@@ -735,8 +740,6 @@ export function statusOf(root) {
     }
   }
 
-  const contract = contractHolds(root, { probe: false });
-  if (!contract.ok && extensionPairDiffers(root)) problems.push({ text: TEXT.extensionPairDiffers, next: `${restoreExtensionPair(shellWord(root))}, then ${APPLY(root)}` });
   for (const problem of contract.ok ? [] : contract.problems) problems.push({ text: TEXT.contractProblem(problem), next: agentCommand(root, 'status') });
 
   const here = realpathSync(root);
