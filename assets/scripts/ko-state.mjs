@@ -177,28 +177,28 @@ const proposalHasShape = (entry) => isText(entry) && isAbsolute(entry);
 export const readApprovals = (root) => readList(root, 'approvals.json', 'digests', approvalHasShape);
 
 /**
- * Whether a tree's protected-files `digest` is accepted, given `approvals` (readApprovals, in the
- * order they were appended) and `baseDigest`, a function giving the digest of the tree's base's
- * tree, or null when the base is `none` or that digest cannot be computed (after the whole-branch
- * review: approvals are ordered). The one rule the gate, verify-branch, status, run and approve
- * apply:
+ * Whether a tree's protected-files `digest` is accepted (approvals are ordered: after the
+ * whole-branch review, extended at its adjudication), given `approvals` (readApprovals, in the
+ * order they were appended) and `points`, a function giving the digests of what the tree builds
+ * on: its base's tree and the tree of the commit it is made on (HEAD at a commit; HEAD's first
+ * parent when verify-branch judges HEAD), each null when that is none or its digest cannot be
+ * computed. The one rule the gate, verify-branch, status, run and approve apply:
  *   'unapproved' — `digest` was never approved;
- *   'approved'   — it was, and it equals the base's digest, or the base's digest is null or was
- *                  never approved (no order), or its latest approval comes after the base digest's
- *                  latest approval;
- *   'older'      — it was, but before the base's digest was last approved: an earlier approved
- *                  version of the checks than the base's, which needs the owner's approval again.
- * Order is position in approvals.json, never a clock. `baseDigest` is called only for an approved
- * digest, so an unapproved one costs no second digest.
+ *   'older'      — it was, but some point's digest, other than it, was last approved after it:
+ *                  the tree's protected files match a version approved before one it builds on,
+ *                  so the owner must approve them again (`newer` names that point's digest);
+ *   'approved'   — otherwise: against every point it equals the point's digest, or was last
+ *                  approved after it, or the point is null or was never approved (no order).
+ * Order is position in approvals.json, never a clock. `points` is called only for an approved
+ * digest, so an unapproved one costs no further digest. `{ standing, newer }`, `newer` null
+ * unless 'older'.
  */
-export function approvalStanding(approvals, digest, baseDigest) {
+export function approvalStanding(approvals, digest, points) {
   const latest = (wanted) => approvals.findLastIndex((entry) => entry.digest === wanted);
   const at = latest(digest);
-  if (at === -1) return 'unapproved';
-  const base = baseDigest();
-  if (base === null || base === digest) return 'approved';
-  const baseAt = latest(base);
-  return baseAt === -1 || at > baseAt ? 'approved' : 'older';
+  if (at === -1) return { standing: 'unapproved', newer: null };
+  const newer = points().find((point) => point !== null && point !== digest && latest(point) > at) ?? null;
+  return { standing: newer === null ? 'approved' : 'older', newer };
 }
 
 // The exemptions, `[{ name, reason, at }]`. Throws a StateError for a file that cannot be read or is of another shape.

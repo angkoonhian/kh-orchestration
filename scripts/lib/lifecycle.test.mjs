@@ -469,8 +469,11 @@ test('apply --yes refuses inside a Claude Code session before printing or writin
   const session = { env: { ...env(), CLAUDE_CODE_SESSION_ID: 'abc' } };
   const refused = run('apply', [repo.root, '--yes'], session);
   assert.deepEqual([refused.status, refused.stdout, refused.stderr], [1, '', `kh-orchestration: ${TEXT.ownerOnly('apply', 'CLAUDE_CODE_SESSION_ID')}\nNext: ${TEXT.askOwner(applyCommand(repo.root))}\n`]);
-  assert.equal(run('apply', [repo.root], session).status, 0);
-  assert.equal(run('detect', [repo.root], session).status, 0);
+  // Status and standard error together, so a failure under load shows its cause.
+  const dry = run('apply', [repo.root], session);
+  assert.deepEqual([dry.status, dry.stderr], [0, '']);
+  const detected = run('detect', [repo.root], session);
+  assert.deepEqual([detected.status, detected.stderr], [0, '']);
   assert.deepEqual({ tree: listing(repo.root) }, before);
 });
 
@@ -509,6 +512,14 @@ test('I5: apply --yes with a changed extension.mjs takes the entry out (tool cal
   assert.ok(out.includes(`  - ${TEXT.moduleKept(`${SCRIPTS_DIR}/extension.mjs`)}`), applied.stdout);
   assert.ok(out.includes(`    Next: ${next}`), applied.stdout);
   assert.equal(harnessAllowsRead(repo.root), true, 'without our entry, tool calls work');
+  assert.equal(out.at(-1), TEXT.incompleteGateRuns, 'the hooks are in place: git runs the gate');
+  // The gate's own refusal in this state names the same repair, not "stage the install".
+  writeFileSync(join(repo.root, 'work.txt'), 'w\n');
+  assert.equal(git(repo.root, 'add', 'work.txt').status, 0);
+  const refusedCommit = git(repo.root, 'commit', '-q', '-m', 'work');
+  assert.equal(refusedCommit.status, 1);
+  assert.ok(refusedCommit.stderr.startsWith(`kh-orchestration: ${REASONS.extensionPair}\nNext: ${repair}, then ${repairCommand(shellWord(repo.root))}\n`), refusedCommit.stderr);
+  assert.equal(git(repo.root, 'reset', '-q', '--', 'work.txt').status, 0);
   const status = statusJson(repo.root);
   assert.equal(status.contract.ok, false, 'commits are refused');
   assert.deepEqual(status.problems[0], { text: KO_TEXT.extensionPairDiffers, next: `${repair}, then ${repairCommand(shellWord(repo.root))}` }, 'the one repair, first');
@@ -521,7 +532,7 @@ test('I5: apply --yes with a changed extension.mjs takes the entry out (tool cal
   assert.deepEqual(checkContract1(repo.root, ownEntry(repo.root)), { problems: [], warnings: [] });
   assert.equal(
     TEXT.moduleKept('m'),
-    'm is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration\'s entry is kept out of .claude/kh-harness/extensions.json, since an entry naming other bytes than its module makes kh-harness block every tool call: tool calls work, but the commit gate refuses every commit until the module and the entry are restored together from HEAD and apply is run again.',
+    'm is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration\'s entry is kept out of .claude/kh-harness/extensions.json, since an entry naming other bytes than its module makes kh-harness block every tool call. So tool calls work, but until the module and the entry are restored together from HEAD and apply is run again the extension is off, so nothing blocks a session\'s one-line ways round the commit gate, and the gate refuses every commit.',
   );
 });
 

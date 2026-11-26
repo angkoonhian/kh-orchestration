@@ -170,6 +170,7 @@ export const TEXT = Object.freeze({
   noEnv: `Neither ${ENV_CANDIDATES.join(' nor ')} is an executable file, and the hooks start Node through env by its absolute path, never through PATH.`,
   noShP: `${SHELL} does not accept -p, which the hooks use so that no function or startup file of the environment can change what they run.`,
   gateDidNotAnswer: 'the gate did not answer through the env and Node the hooks name',
+  selfTestTimedOut: `a hook it started did not finish within ${SELF_TEST_TIMEOUT_MS / 1000} seconds, which is load on this machine rather than a wrong answer; run apply again when it is quieter`,
   hookTextDiffers: 'an installed hook is not the text that was written',
   fastPathFailed: 'the reference-transaction hook did not let a ref update without an in-flight record through',
   binUnreadable: 'bin/ could not be read',
@@ -200,7 +201,7 @@ export const TEXT = Object.freeze({
   scriptNotOurs: (path) => `${path} is kept as it is: it does not begin with kh-orchestration's stamp line, so kh-orchestration did not write it and never overwrites it. The path is kh-orchestration's own script's: move the file elsewhere to keep it, then run apply again.`,
   scriptEdited: (path) => `${path} is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. To take this version, restore it (git checkout -- ${path}), then run apply again.`,
   hooksStopped: 'The git hooks are not written while an installed script is kept: the install is incomplete until the scripts above are kh-orchestration\'s.',
-  moduleKept: (path) => `${path} is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration's entry is kept out of ${EXTENSIONS_PATH}, since an entry naming other bytes than its module makes kh-harness block every tool call: tool calls work, but the commit gate refuses every commit until the module and the entry are restored together from HEAD and apply is run again.`,
+  moduleKept: (path) => `${path} is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration's entry is kept out of ${EXTENSIONS_PATH}, since an entry naming other bytes than its module makes kh-harness block every tool call. So tool calls work, but until the module and the entry are restored together from HEAD and apply is run again the extension is off, so nothing blocks a session's one-line ways round the commit gate, and the gate refuses every commit.`,
   hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so it is not written over. To run the commit gate from it, make its first line #!/bin/sh and put this line directly after it, with only blank or comment lines between:\n    ${line}`,
   hostedMisplaced: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between:\n    ${line}`,
   hostedStale: (name, path, line) => `The ${name} hook at ${path} holds kh-orchestration's line for another env or Node, so the commit gate may not start from it. Replace that line with this one:\n    ${line}`,
@@ -234,6 +235,7 @@ export const TEXT = Object.freeze({
   nothingToDo: (root) => `kh-orchestration ${KIT_VERSION} is installed in ${root} and up to date: nothing to do.`,
   dryRunEnd: (command) => `Nothing was written. To apply, ${askOwner(command)}`,
   incomplete: 'The install is incomplete: the conflicts above are left as they are, so git does not run the commit gate yet. Resolve them and run apply again.',
+  incompleteGateRuns: 'The install is incomplete: the conflicts above are left as they are. The hooks are in place, so git runs the commit gate, which refuses what it cannot check. Resolve them and run apply again.',
   installed: (root) => `kh-orchestration ${KIT_VERSION} is installed in ${root}.`,
   notApprovedYet: 'Nothing is approved yet: the commit gate refuses every commit until the owner approves the protected files.',
   approveAgain: 'The files this run changed are protected: the commit gate refuses every commit until the owner approves them again.',
@@ -736,8 +738,14 @@ function contractAfter(root, entry, extensionsText) {
  * reference-transaction text lets a ref update without an in-flight record through without
  * starting node. Null when all of that holds, else what failed (fixed text).
  */
+// Whether a self-test run was stopped by its time limit (heavy load), told apart from a wrong
+// answer, so apply's refusal says which (at the adjudication).
+export const timedOut = (result) => result.error?.code === 'ETIMEDOUT';
+
 function selfTest({ env, node, binFiles }) {
-  if (spawnSync(SHELL, ['-p', '-c', 'exit 0'], { env: {}, timeout: SELF_TEST_TIMEOUT_MS }).status !== 0) return TEXT.noShP;
+  const shell = spawnSync(SHELL, ['-p', '-c', 'exit 0'], { env: {}, timeout: SELF_TEST_TIMEOUT_MS });
+  if (timedOut(shell)) return TEXT.selfTestTimedOut;
+  if (shell.status !== 0) return TEXT.noShP;
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ko-apply-self-test-')));
   try {
     mkdirSync(join(dir, 'hooks'));
@@ -749,12 +757,14 @@ function selfTest({ env, node, binFiles }) {
       return spawnSync(path, args, { cwd: dir, env: {}, encoding: 'utf8', timeout: SELF_TEST_TIMEOUT_MS });
     };
     const answer = run(SELF_TEST_HOOK, []);
+    if (timedOut(answer)) return TEXT.selfTestTimedOut;
     const gateText = answer.stderr?.slice(0, -REFUSED_LINE.length) ?? '';
     const answered = answer.status === 1 && answer.stdout === '' && answer.stderr.endsWith(REFUSED_LINE)
       && gateText === `kh-orchestration: ${REASONS.couldNotDecide(REASONS.notAHook)}\nNext: ${COMMANDS.status}\n`;
     if (!answered) return TEXT.gateDidNotAnswer;
     for (const state of ['prepared', 'committed']) {
       const passed = run('reference-transaction', [state]);
+      if (timedOut(passed)) return TEXT.selfTestTimedOut;
       if (passed.status !== 0 || passed.stdout !== '' || passed.stderr !== '') return TEXT.fastPathFailed;
     }
     return null;
@@ -1110,6 +1120,17 @@ function hooksFailing(root, planned, names) {
 }
 
 // ---- the text apply prints ----
+
+/**
+ * What a finished but incomplete `apply --yes` prints last: whether git now runs the commit gate,
+ * which it does when every hook is this kit's, as written for `planned`'s env and Node, or hosts
+ * its line.
+ */
+export function incompleteLine(root, planned) {
+  const hooks = join(commonDir(root), 'hooks');
+  const inPlace = HOOK_NAMES.every((name) => ['current', 'hosted'].includes(hookState(join(hooks, name), name, planned).state));
+  return inPlace ? TEXT.incompleteGateRuns : TEXT.incomplete;
+}
 
 /** The lines of the plan, as the dry run and --yes print them before acting. */
 export function planLines(planned, { dryRun }) {

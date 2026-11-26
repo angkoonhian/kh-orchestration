@@ -13,7 +13,7 @@ import { KIT_VERSION, makeRepo, testEnv } from './test-repo.mjs';
 import { ageInstall, entryOf, everything, fresh, hooksDir, read, repos, scratch, sha256 } from './install-fixture.mjs';
 import {
   ATTRIBUTES_LINE, EXTENSIONS_PATH, OFFICERS_PATH, SCRIPTS_DIR, SCRIPT_NAMES, TEXT, applyCommand, applyPlan, applyUninstall, coverageOf, envPath, khHarnessApply,
-  detect, plan, shippedScripts, stampScript, uninstallPlan,
+  detect, plan, shippedScripts, stampScript, timedOut, uninstallPlan,
 } from './install.mjs';
 import { MANIFEST_PATH, readManifest } from './manifest.mjs';
 import { HOOK_NAMES, REFUSED_HINT, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
@@ -860,4 +860,10 @@ test('hooks of the same version written before the hint line was added are rewri
   assert.deepEqual(planned.actions.map((action) => action.detail), HOOK_NAMES.map((name) => TEXT.rewriteHook(join(hooksDir(repo.root), name))));
   applyPlan(repo.root, planned);
   for (const name of HOOK_NAMES) assert.equal(readFileSync(join(hooksDir(repo.root), name), 'utf8'), hookText(name, { env: envPath(), node: process.execPath, version: KIT_VERSION }), name);
+});
+
+test('the self-test tells a run stopped by its time limit from a wrong answer', () => {
+  assert.equal(timedOut(spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], { timeout: 100 })), true);
+  assert.equal(timedOut(spawnSync(process.execPath, ['-e', 'process.exit(3)'], { timeout: 5000 })), false);
+  assert.equal(TEXT.selfTestTimedOut, 'a hook it started did not finish within 30 seconds, which is load on this machine rather than a wrong answer; run apply again when it is quieter');
 });

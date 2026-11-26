@@ -3,6 +3,8 @@
 // imposes no order (none, from before the install). Each case through the real commands and hooks:
 // the gate, status and verify-branch must agree.
 import { test } from 'node:test';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { OFFICERS_PATH, gitIn, installed, ko, owner, stage } from './gate-fixture.mjs';
 import { TEXT } from '../../assets/scripts/ko-cli.mjs';
@@ -87,9 +89,9 @@ test('C2: an older approved officers file restored by checkout is refused by the
 
   assert.equal(
     REASONS.olderApproval('0123456789abcdef'),
-    'The protected files of this tree (digest 0123456789ab) are an earlier approved version than its base\'s: the owner approved them before the base\'s, so going back to them needs the owner\'s approval again. The owner reviews and approves them in their own terminal.',
+    'The protected files of this tree (digest 0123456789ab) match a version the owner approved before one this tree builds on (its base or the commit it is made on), so the owner must approve them again. The owner reviews and approves them in their own terminal.',
   );
-  assert.equal(TEXT.olderApproval('0123456789abcdef'), 'The protected files of the staged tree (digest 0123456789ab) are an earlier approved version than the base\'s: the owner must approve again.');
+  assert.equal(TEXT.olderApproval('0123456789abcdef'), 'The protected files of the staged tree (digest 0123456789ab) match a version approved before one it builds on (its base or the commit it is made on): the owner must approve again.');
 });
 
 test('C2: a branch whose protected files equal its base\'s needs no approval, nor one approved after its base\'s; a base from before the install, or none, imposes no order', () => {
@@ -205,4 +207,97 @@ test('C2: a merge conflict in a protected file resolved by taking the side appro
   approve(repo);
   landed(repo, 'merge side');
   agreeLanded(repo);
+});
+
+// At the adjudication: the order is measured from the commit a tree builds on as well as its base.
+test('C2: on a feature branch, going back from a stricter approved officers file to the earlier one is refused by the gate, run, status and verify-branch, and lands once approved again', () => {
+  const repo = installed();
+  run(repo);
+  approve(repo);
+  landed(repo, 'install');
+  switchTo(repo, '-c', 'feat');
+  repo.write(OFFICERS_PATH, officers([['check', 'tools/check.mjs'], ['strict', 'tools/strict.mjs']]));
+  repo.write('tools/strict.mjs', STRICT);
+  stage(repo);
+  run(repo);
+  approve(repo);
+  landed(repo, 'a strict officer');
+  const strictDigest = digestOfTree(repo.root, gitIn(repo.root, ['rev-parse', 'HEAD^{tree}']).stdout.trim()).digest;
+
+  assert.equal(gitIn(repo.root, ['checkout', 'HEAD~1', '--', OFFICERS_PATH]).status, 0);
+  repo.write('bad.txt', 'strict fails on this\n');
+  stage(repo);
+  const older = stagedDigest(repo);
+  assert.deepEqual(run(repo).slice(-2), [TEXT.passingOlder(older), `Next: ${ownerCommand(repo.root, 'approve')}`], 'equal to the merge base\'s digest, but older than HEAD\'s');
+  assert.ok(problemTexts(repo).includes(TEXT.olderApproval(older)));
+  const refused = gitIn(repo.root, ['commit', '-q', '-m', 'back to the old checks']);
+  assert.equal(refused.status, 1);
+  assert.ok(refused.stderr.startsWith(gateRefusal(repo, REASONS.olderApproval(older))), refused.stderr);
+
+  // Committed with the hooks off, verify-branch measures from HEAD's parent too.
+  assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'unhooked']).status, 0);
+  const verified = ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(verified.status, 1, verified.stdout);
+  assert.ok(lines(verified.stdout).includes(TEXT.notVerified(REASONS.olderApproval(older))), verified.stdout);
+  assert.equal(gitIn(repo.root, ['reset', '-q', '--soft', 'HEAD~1']).status, 0);
+
+  assert.ok(approve(repo).includes(TEXT.approvesOlder(older, strictDigest)));
+  landed(repo, 'the old checks, approved again');
+  agreeLanded(repo);
+});
+
+test('C2: a merge whose conflict is resolved by taking the newer side lands without approval', () => {
+  const repo = installed({ officers: officers([['check', 'tools/check.mjs']], ['conf/**']) });
+  repo.write('conf/x.txt', 'x0\n');
+  stage(repo);
+  run(repo);
+  approve(repo);
+  landed(repo, 'install');
+  switchTo(repo, '-c', 'side');
+  repo.write('conf/x.txt', 'side\n');
+  stage(repo);
+  run(repo);
+  approve(repo);
+  landed(repo, 'side');
+  switchTo(repo, 'main');
+  repo.write('conf/x.txt', 'main\n');
+  stage(repo);
+  run(repo);
+  approve(repo);
+  landed(repo, 'main moves on');
+  assert.equal(gitIn(repo.root, ['merge', '-q', '--no-ff', '--no-commit', 'side']).status, 1, 'a conflict');
+  assert.equal(gitIn(repo.root, ['checkout', '--ours', '--', 'conf/x.txt']).status, 0);
+  stage(repo);
+  assert.equal(run(repo).at(-1), 'Next: git commit');
+  landed(repo, 'merge side, keeping main\'s');
+  agreeLanded(repo);
+});
+
+test('C2: two worktrees approving in turn go on committing without approving again while their own protected files stay as approved', () => {
+  const repo = installed({ officers: officers([['check', 'tools/check.mjs']], ['conf/**']) });
+  repo.write('conf/x.txt', 'x0\n');
+  stage(repo);
+  run(repo);
+  approve(repo);
+  landed(repo, 'install');
+  const at = (root) => ({ root });
+  const trees = ['a', 'b'].map((name) => at(repo.addWorktree(name)));
+  const write = (tree, path, text) => {
+    writeFileSync(join(tree.root, path), text);
+    assert.equal(gitIn(tree.root, ['add', '-A']).status, 0);
+  };
+  // Each approves its own change, a's first: b's approval is the later one.
+  for (const [tree, text] of [[trees[0], 'a\n'], [trees[1], 'b\n']]) {
+    write(tree, 'conf/x.txt', text);
+    run(tree);
+    approve(tree);
+    landed(tree, 'protected change');
+  }
+  // a, whose digest is now the earlier approval, commits an unprotected change: no approval needed.
+  for (const tree of trees) {
+    write(tree, `notes-${tree.root.slice(-1)}.txt`, 'n\n');
+    assert.equal(run(tree).at(-1), 'Next: git commit');
+    landed(tree, 'notes');
+    agreeLanded(tree);
+  }
 });

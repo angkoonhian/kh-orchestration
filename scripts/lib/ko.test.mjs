@@ -290,9 +290,10 @@ test('every owner-only command refuses with fixed text when CLAUDECODE or CLAUDE
   const repo = installed();
   const before = stateSnapshot(repo.root);
   for (const variable of ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID']) {
-    for (const args of [...OWNER_COMMANDS, ['waive']]) {
+    for (const args of [...OWNER_COMMANDS, ['waive'], ['propose', '--close']]) {
       const result = owner(repo.root, args, { env: { ...testEnv(), [variable]: variable === 'CLAUDECODE' ? '1' : 'abc' }, input: 'approve\n' });
-      assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.ownerOnly(args[0], variable), `${ownerCommand(repo.root, args[0])}, in the owner's own terminal`)], `${variable} ${args.join(' ')}`);
+      // The next line is the command as typed, its words included (propose --close keeps --close).
+      assert.deepEqual([result.status, result.stdout, result.stderr], [1, '', refusalText(TEXT.ownerOnly(args[0], variable), `${ownerCommand(repo.root, args.map(shellWord).join(' '))}, in the owner's own terminal`)], `${variable} ${args.join(' ')}`);
     }
   }
   assert.deepEqual(stateSnapshot(repo.root), before);
@@ -1414,4 +1415,46 @@ test('I4: propose --close closes this worktree without approving, from the appro
   assert.ok(USAGE.includes('  propose [--close]'));
   assert.equal(TEXT.proposalClosed('/w'), 'This worktree (/w) is closed for proposals without an approval: a session here may no longer edit the protected files.');
   assert.equal(TEXT.notProposed('/w'), 'This worktree (/w) was not open for proposals; nothing changed.');
+});
+
+test('C1 at the adjudication: an officer that flags a file assume-unchanged and then rewrites it records no verdict, and the refusal names the command that clears the flag', () => {
+  const repo = installed({ officers: officersOf([['lint', ['node', 'tools/hide-fix.mjs']]]) });
+  repo.write('tools/hide-fix.mjs', `import { spawnSync } from 'node:child_process';\nspawnSync('git', ['update-index', '--assume-unchanged', 'src/a.js']);\n${FIXER}`);
+  repo.write('src/a.js', 'BAD\n');
+  stage(repo);
+  const tree = indexTree(repo.root);
+  const base = baseOf(repo.root, 'main');
+  const result = ko(repo.root, ['run']);
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(
+    TEXT.hiddenEntries(['src/a.js']),
+    `git -C ${shellWord(repo.root)} update-index --no-assume-unchanged -- src/a.js, then ${agent(repo.root, 'run')}`,
+  )]);
+  assert.equal(readVerdict(repo.root, tree, base), null);
+});
+
+test('verify-branch run from bin/ names bin/\'s ko.mjs in its next lines; run from the working copy, the working copy\'s', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  repo.write('b.txt', 'b\n');
+  stage(repo);
+  assert.equal(gitIn(repo.root, ['-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'unhooked']).status, 0);
+  const fromBin = owner(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(fromBin.status, 1);
+  assert.equal(lines(fromBin.stdout).at(-1), `Next: ${ownerCommand(repo.root, 'verify-branch')}`);
+  const fromWorkingCopy = ko(repo.root, ['verify-branch', '--no-run']);
+  assert.equal(lines(fromWorkingCopy.stdout).at(-1), `Next: ${agent(repo.root, 'verify-branch')}`);
+  repo.write('loose.txt', 'x\n');
+  assert.ok(owner(repo.root, ['verify-branch']).stderr.endsWith(`git stash -u && ${ownerCommand(repo.root, 'verify-branch')}\n`));
+});
+
+test('I1 at the adjudication: in a sparse checkout the refusal\'s step is git sparse-checkout disable, which clears the flags and brings the files back', () => {
+  const repo = installed();
+  runApproveCommit(repo, 'install');
+  assert.equal(gitIn(repo.root, ['sparse-checkout', 'set', '--no-cone', '/*', '!a.txt']).status, 0);
+  assert.equal(existsSync(join(repo.root, 'a.txt')), false, 'fixture: a.txt is outside the sparse checkout');
+  const result = ko(repo.root, ['run']);
+  const step = `git -C ${shellWord(repo.root)} sparse-checkout disable`;
+  assert.deepEqual([result.status, result.stderr], [1, refusalText(TEXT.hiddenEntries(['a.txt']), `${step}, then ${agent(repo.root, 'run')}`)]);
+  assert.equal(spawnSync('sh', ['-c', step], { env: testEnv() }).status, 0);
+  assert.equal(ko(repo.root, ['run']).status, 0, 'the files are back and nothing is flagged');
 });

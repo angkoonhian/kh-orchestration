@@ -5,7 +5,7 @@
 // A dry run unless --yes: it prints every action and writes nothing. --yes is the owner's alone
 // (after Task 9's review): it refuses inside a Claude Code session. Exit 0 done or nothing to
 // do, 1 refused or incomplete, 2 usage. The logic is scripts/lib/install.mjs's.
-import { TEXT, applyCommand, applyPlan, closingLines, nextAfterApply, ownerRefusal, parseArguments, plan, planLines, print, refuse, runCommand, usageError } from './lib/install.mjs';
+import { TEXT, applyCommand, applyPlan, closingLines, incompleteLine, nextAfterApply, ownerRefusal, parseArguments, plan, planLines, print, refuse, runCommand, usageError } from './lib/install.mjs';
 
 function main(argv) {
   const args = parseArguments(argv, ['--yes', '--downgrade', '--bin-from-plugin']);
@@ -34,7 +34,7 @@ function main(argv) {
   const result = applyPlan(planned.root, planned);
   if (result.refusal !== null) return refuse([result.refusal]);
   if (planned.conflicts.length > 0) {
-    print([TEXT.incomplete]);
+    print([incompleteLine(planned.root, planned)]);
     return 1;
   }
   print(closingLines(planned.root, planned));

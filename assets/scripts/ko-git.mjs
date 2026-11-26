@@ -157,9 +157,14 @@ export function headBaseOf(root, baseBranch) {
     const base = baseOf(root, baseBranch);
     if (base !== head) return base;
   }
+  return headParent(root) ?? NO_BASE;
+}
+
+// HEAD's first parent, or null for a root commit. HEAD must name a commit.
+export function headParent(root) {
   const parent = git(root, ['rev-parse', '--verify', '-q', 'HEAD^1']);
   if (parent.status === 0) return oneLine(parent.stdout);
-  if (parent.status === 1) return NO_BASE;
+  if (parent.status === 1) return null;
   throw new GitError(gitFailedMessage('read HEAD'));
 }
 

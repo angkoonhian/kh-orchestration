@@ -475,8 +475,10 @@ test('refreshBin killed at any moment leaves bin/ whole: one tree\'s scripts or 
       return treeOfIndex(repo);
     });
     const module = new URL('../../assets/scripts/ko-state.mjs', import.meta.url).href;
+    // The kill is timed from the first COMPLETED refresh, so under any load at least one bin/ exists
+    // and every kill falls inside a later refresh.
     const loop = `const { refreshBin } = await import(${JSON.stringify(module)}); const trees = ${JSON.stringify(trees)};
-      process.stdout.write('ready\\n'); for (let i = 0; ; i += 1) refreshBin(${JSON.stringify(repo.root)}, trees[i % 2]);`;
+      refreshBin(${JSON.stringify(repo.root)}, trees[1]); process.stdout.write('refreshed\\n'); for (let i = 0; ; i += 1) refreshBin(${JSON.stringify(repo.root)}, trees[i % 2]);`;
     const versions = new Set();
     for (let round = 0; round < 15; round += 1) {
       const child = spawn(process.execPath, ['--input-type=module', '-e', loop], { env: testEnv(), stdio: ['ignore', 'pipe', 'inherit'] });
@@ -536,31 +538,43 @@ test('a write whose directory is a file throws the fixed StateError, not the err
   });
 });
 
-// approvalStanding's truth table (after the whole-branch review: approvals are ordered). D is the
-// tree's digest, B its base tree's; the list is approvals.json in append order.
-test('approvalStanding: a digest is accepted when approved and equal to the base\'s, or approved later than the base\'s, or the base imposes no order', () => {
-  const [D, B, X] = ['d', 'b', 'x'].map((letter) => letter.repeat(64));
+// approvalStanding's truth table (approvals are ordered; extended at the adjudication). D is the
+// tree's digest; the points are the digests of what it builds on, B its base's tree and H the tree
+// of the commit it builds on (HEAD, or for verify-branch HEAD's first parent), each null when it
+// is none or cannot be computed; the list is approvals.json in append order. Against EVERY point
+// that is approved, D must be equal to it or approved later.
+test('approvalStanding: a digest is accepted when approved and, against each approved point it builds on, equal to it or approved later', () => {
+  const [D, B, H, X] = ['d', 'b', 'h', 'x'].map((letter) => letter.repeat(64));
   const at = (digest) => ({ digest, approvedAt: 'x', branch: 'main' });
   const rows = [
-    // [approvals, base digest, standing, why]
-    [[], B, 'unapproved', 'D never approved'],
-    [[at(B)], B, 'unapproved', 'only the base approved'],
-    [[], null, 'unapproved', 'never approved, base none or not computable'],
-    [[at(D)], D, 'approved', 'equal to the base digest'],
-    [[at(D), at(B)], D, 'approved', 'equal to the base digest, whatever the order'],
-    [[at(B), at(D)], B, 'approved', 'approved after the base digest'],
-    [[at(D), at(B)], B, 'older', 'approved before the base digest'],
-    [[at(D), at(B), at(D)], B, 'approved', 'approved again after the base digest: the latest approval counts'],
-    [[at(B), at(D), at(B)], B, 'older', 'the base digest approved again after it'],
-    [[at(D), at(X)], B, 'approved', 'the base digest never approved: no order'],
-    [[at(D), at(B)], null, 'approved', 'base none, or its digest not computable: no order'],
+    // [approvals, points, standing, newer, why]
+    [[], [B], 'unapproved', null, 'D never approved'],
+    [[at(B)], [B], 'unapproved', null, 'only the base approved'],
+    [[], [null], 'unapproved', null, 'never approved, base none or not computable'],
+    [[at(D)], [D], 'approved', null, 'equal to the base digest'],
+    [[at(D), at(B)], [D], 'approved', null, 'equal to the base digest, whatever the order'],
+    [[at(B), at(D)], [B], 'approved', null, 'approved after the base digest'],
+    [[at(D), at(B)], [B], 'older', B, 'approved before the base digest'],
+    [[at(D), at(B), at(D)], [B], 'approved', null, 'approved again after the base digest: the latest approval counts'],
+    [[at(B), at(D), at(B)], [B], 'older', B, 'the base digest approved again after it'],
+    [[at(D), at(X)], [B], 'approved', null, 'the base digest never approved: no order'],
+    [[at(D), at(B)], [null], 'approved', null, 'base none, or its digest not computable: no order'],
+    [[at(D), at(H)], [D, H], 'older', H, 'equal to the base, but HEAD\'s digest was approved after it: going back on the branch'],
+    [[at(D), at(H)], [null, H], 'older', H, 'no base digest, HEAD\'s approved after it'],
+    [[at(H), at(D)], [D, H], 'approved', null, 'equal to the base and approved after HEAD\'s'],
+    [[at(D), at(B), at(H)], [B, H], 'older', B, 'before both: the first point named'],
+    [[at(B), at(D), at(H)], [B, H], 'older', H, 'after the base, before HEAD\'s'],
+    [[at(B), at(H), at(D)], [B, H], 'approved', null, 'after both'],
+    [[at(D), at(X)], [D, H], 'approved', null, 'HEAD\'s digest never approved: no order from it'],
+    [[at(D)], [D, D], 'approved', null, 'base and HEAD both equal to it'],
+    [[at(D), at(B)], [null, null], 'approved', null, 'no point computable (an orphan, a tree from before the install)'],
   ];
-  for (const [approvals, baseDigest, standing, why] of rows) {
-    assert.equal(approvalStanding(approvals, D, () => baseDigest), standing, why);
+  for (const [approvals, points, standing, newer, why] of rows) {
+    assert.deepEqual(approvalStanding(approvals, D, () => points), { standing, newer }, why);
   }
   let asked = false;
-  assert.equal(approvalStanding([at(B)], D, () => { asked = true; return B; }), 'unapproved');
-  assert.equal(asked, false, 'the base digest is computed only for an approved digest');
+  assert.deepEqual(approvalStanding([at(B)], D, () => { asked = true; return [B]; }), { standing: 'unapproved', newer: null });
+  assert.equal(asked, false, 'the points are computed only for an approved digest');
 });
 
 test('readApprovals keeps a digest approved more than once, every record in the order written', () => {

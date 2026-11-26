@@ -26,11 +26,11 @@ import { accessSync, constants, readFileSync, readSync, readdirSync, realpathSyn
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { COMMANDS, shellWord } from './extension.mjs';
-import { EXTENSION_ID, MODULE, STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
+import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
-import { REASONS, baseDigestOf, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
+import { REASONS, askOwner, buildsOnDigests, exemptionOf, extensionPairDiffers, repairCommand, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
-  GitError, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, hiddenEntries, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
+  GitError, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headParent, headTree, hiddenEntries, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
 } from './ko-git.mjs';
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
@@ -39,7 +39,7 @@ import {
   refreshBin, removeStaleInflight, restoreExtensionPair, stateDir, switchOff, switchOn, verdictName, writeState,
 } from './ko-state.mjs';
 import { passing, produceVerdict, readVerdict, writeVerdict } from './ko-verdict.mjs';
-import { checkContract1, lfSha256 } from './verify-contract-1.mjs';
+import { checkContract1 } from './verify-contract-1.mjs';
 
 // The variables a Claude Code session sets (decision 13): an owner's command refuses while either is
 // set. The installer's writing runs (apply --yes, uninstall --yes) read the same list.
@@ -50,7 +50,6 @@ const MAX_REASON = 500;
 const MIN_GIT = [2, 30];
 const REFERENCE_HOOK = 'reference-transaction';
 const CONTRACT_FILE = '.claude/kh-harness/contract.json';
-const EXTENSIONS_FILE = '.claude/kh-harness/extensions.json';
 const HARNESS_LOG = '.claude/scripts/harness-log.mjs';
 const SCRIPTS = '.claude/kh-orchestration/scripts';
 // What recordExternalEvent needs listed in the contract file (CONTRACT.md, step 2): the log, and
@@ -75,15 +74,21 @@ function named(items) {
 const withReason = (entries, label) => entries.map((entry) => `${shownName(entry[label])} (${shownText(entry.reason)})`).join(', ');
 const branchWords = (branch) => (branch === null ? 'a detached HEAD' : shownName(branch));
 const KO = COMMANDS.status.slice(0, -' status'.length);
-// A command only the owner runs, as a next line a session may read (after Task 9's review).
-export const askOwner = (command) => `ask the owner to run, in their own terminal outside Claude Code: ${command}`;
-// The repair for a missing or damaged bin/: kh-orchestration's apply, from the plugin, the owner's
-// to run. ko.mjs and gate.mjs can only print literals, so they print it for the word <repository>;
-// a test holds the three texts to this one.
-export const repairCommand = (rootWord) => askOwner(`node <kh-orchestration>/scripts/apply.mjs ${rootWord} --yes`);
+// askOwner and repairCommand are ko-gate's, which names the repair too; the installer and the
+// tests import them from here.
+export { askOwner, repairCommand };
 const APPLY = (root) => repairCommand(shellWord(root));
 // agentCommand is ko-state's, shared with the gate; the session brief imports it from here.
 export { agentCommand };
+// An agent's command as this run names it (at the adjudication): the working copy's ko.mjs, or,
+// when an agent's command (run, status, verify-branch, unexempt, unwaive) runs from bin/ (the
+// owner's pre-merge verify-branch, say), bin/'s own, so a next line never sends the owner back to
+// scripts a session may have changed. An owner command's next lines stay the working copy's: they
+// are often an agent's next step, and a session cannot run bin/. dispatch sets `namesBin`.
+let namesBin = false;
+const localCommand = (root, words) => (namesBin ? ownerCommand(root, words) : agentCommand(root, words));
+// A line from the gate, which names the working copy, as this run names it.
+const localLine = (root, line) => (namesBin ? line.replaceAll(agentCommand(root, ''), ownerCommand(root, '')) : line);
 // A command line holding words the person typed: pasteable when they hold no character a terminal
 // hides; otherwise shown with those characters written as \u{…}, to be typed, never pasted.
 function commandLine(prefix, words) {
@@ -150,7 +155,7 @@ export const TEXT = Object.freeze({
     : `Exemption in force: ${shownName(exemption.name)} (${shownText(exemption.reason)}); the gate lets its commits through unchecked.`),
   passingApproved: (tree) => `Passing: the staged tree ${short(tree)} may be committed; its protected files are approved.`,
   passingUnapproved: (digest) => `Passing, but the protected files of this tree (digest ${short(digest)}) are not approved, so the commit gate refuses it until the owner approves them in their own terminal.`,
-  passingOlder: (digest) => `Passing, but the protected files of this tree (digest ${short(digest)}) are an earlier approved version than the base's, so the commit gate refuses it until the owner approves them again in their own terminal.`,
+  passingOlder: (digest) => `Passing, but the protected files of this tree (digest ${short(digest)}) match a version approved before one this tree builds on (its base or the commit it is made on), so the commit gate refuses it until the owner approves them again in their own terminal.`,
   failing: (ids) => `Failing: these officers did not pass: ${named(ids)}. Fix what they report, stage the fix, and run the officers again.`,
 
   noHead: 'HEAD names no commit yet, so there is no branch head to verify.',
@@ -174,7 +179,7 @@ export const TEXT = Object.freeze({
   noEarlierApproval: 'No earlier approval records a tree to compare with, so read these files in full before approving.',
   earlierTreeGone: (tree, branch) => `The tree of the last approval on ${branchWords(branch)} (${short(tree)}) is no longer in the object store.`,
   alreadyApproved: 'This digest is approved already; approving again records it once more, refreshes bin/ from this tree and closes this worktree for proposals.',
-  approvesOlder: (digest, baseDigest) => `These protected files (digest ${short(digest)}) are an earlier approved state, approved before the base's (digest ${short(baseDigest)}), so the commit gate refuses them: going back to an older version of the checks needs approving again. Approving records a new approval, later than the base's.`,
+  approvesOlder: (digest, newer) => `These protected files (digest ${short(digest)}) match a version approved before one this tree builds on (digest ${short(newer)}), so the commit gate refuses them until they are approved again. Approving records a new approval, later than that one.`,
   prompt: 'Type approve and press Enter to approve; anything else cancels: ',
   notApproved: 'Nothing was approved: the answer was not the word approve.',
   pinFailed: 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved (bin/ already holds its scripts; the gate refuses them until approved). Check that the git directory can be written, then approve again.',
@@ -208,7 +213,7 @@ export const TEXT = Object.freeze({
   contractProblem: (problem) => `kh-harness contract 1 does not hold in this working directory: ${sentence(problem)}`,
   undigestable: (problem) => `The protected files of the staged tree cannot be checked: ${sentence(problem)}`,
   unapproved: (digest) => `The protected files of the staged tree (digest ${short(digest)}) are not approved.`,
-  olderApproval: (digest) => `The protected files of the staged tree (digest ${short(digest)}) are an earlier approved version than the base's: the owner must approve again.`,
+  olderApproval: (digest) => `The protected files of the staged tree (digest ${short(digest)}) match a version approved before one it builds on (its base or the commit it is made on): the owner must approve again.`,
   indexFailing: (ids) => `The verdict for the staged tree is failing: ${named(ids)} did not pass.`,
   indexStale: 'The verdict for the staged tree records other officers or other protected files than the tree holds, so the gate does not trust it.',
   verdictDamaged: (name) => `The shared state file ${name} exists but is not a verdict kh-orchestration can use; the gate treats it as no verdict.`,
@@ -311,23 +316,6 @@ function foreignFilter(root) {
   return null;
 }
 
-// Whether the working copy's extension module is present but its entry in kh-harness's extensions
-// file is missing or names another hash (after the whole-branch review): the state apply leaves when
-// it keeps a changed module, which only the two-file restore and apply repair. Executes nothing.
-function extensionPairDiffers(root) {
-  const module = readNoFollow(join(root, MODULE));
-  if (module.bytes === undefined) return false;
-  const listed = readNoFollow(join(root, EXTENSIONS_FILE));
-  let entries;
-  try {
-    entries = listed.bytes === undefined ? [] : JSON.parse(listed.bytes.toString('utf8'));
-  } catch {
-    return false;
-  }
-  const entry = Array.isArray(entries) ? entries.find((candidate) => candidate?.id === EXTENSION_ID) : undefined;
-  return entry === undefined || entry.sha256 !== lfSha256(module.bytes);
-}
-
 // The waivers in force on `branch`: none on a detached HEAD.
 const waiversOf = (root, branch) => (branch === null ? [] : readWaivers(root).filter((entry) => entry.branch === branch));
 
@@ -397,11 +385,15 @@ function changedByOfficers(root, tree) {
 // Runs the officers on `tree` (the working tree equals it: the caller checked) and records the
 // verdict and the journal line, unless the officers changed the working tree or the index: a
 // verdict is for a tree the officers left as they found it, so then nothing is recorded.
-// `{ verdict, isPassing }`, `{ verdict, changed }` (the paths) or `{ problem }`.
+// `{ verdict, isPassing }`, `{ verdict, changed }` (the paths), `{ verdict, hidden: true }` (an
+// officer flagged an index entry assume-unchanged or skip-worktree) or `{ problem }`.
 async function runAndRecord(root, { tree, base, branch, officers, command }) {
   const produced = await produceVerdict(root, { tree, base, branch, waivers: waiversOf(root, branch), kitVersion: kitVersion() });
   if (produced.problem !== undefined) return produced;
   const { verdict } = produced;
+  // An officer that flagged an entry hid it from the tidiness check (at the adjudication).
+  const { assumed, skipped } = hiddenEntries(root);
+  if (assumed.length + skipped.length > 0) return { verdict, hidden: true };
   const changed = changedByOfficers(root, tree);
   if (changed.length > 0) return { verdict, changed };
   writeVerdict(root, verdict);
@@ -425,10 +417,14 @@ function hiddenRefusal(root, then) {
   if (paths.length === 0) return null;
   const shown = new Set(paths.slice(0, NAMED_AT_MOST));
   const rootWord = shellWord(root);
-  const clear = [['--no-assume-unchanged', assumed], ['--no-skip-worktree', skipped]]
+  // In a sparse checkout, clearing skip-worktree by hand would leave the files it left out showing
+  // as deleted; turning the sparse checkout off clears the flags and writes the files back.
+  const sparse = git(root, ['config', '--type=bool', '--get', 'core.sparseCheckout']).stdout.trim() === 'true';
+  const clear = [['--no-assume-unchanged', assumed], ...(sparse ? [] : [['--no-skip-worktree', skipped]])]
     .map(([flag, list]) => [flag, list.filter((path) => shown.has(path))])
     .filter(([, list]) => list.length > 0)
     .map(([flag, list]) => commandLine(`git -C ${rootWord} update-index ${flag} --`, list));
+  if (sparse && skipped.length > 0) clear.push(`git -C ${rootWord} sparse-checkout disable`);
   return refusal(TEXT.hiddenEntries(paths), `${clear.join(' && ')}, then ${then}`);
 }
 
@@ -442,24 +438,28 @@ const treeExists = (root, tree) => {
 async function run(root) {
   const filter = foreignFilter(root);
   if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
-  const hidden = hiddenRefusal(root, agentCommand(root, 'run'));
+  const hidden = hiddenRefusal(root, localCommand(root, 'run'));
   if (hidden !== null) return hidden;
   const untidy = untidyPaths(root);
   // Never a command that stages everything (after Task 9's re-review): an unignored
   // settings.local.json would go into the tree the owner approves.
-  if (untidy.length > 0) return refusal(TEXT.untidy(untidy), `git -C ${shellWord(root)} add -- <each path meant to be committed>, then ${agentCommand(root, 'run')}`);
+  if (untidy.length > 0) return refusal(TEXT.untidy(untidy), `git -C ${shellWord(root)} add -- <each path meant to be committed>, then ${localCommand(root, 'run')}`);
   // As the gate does on every run: records of git processes that ended before their branch update.
   removeStaleInflight(root);
   const tree = indexTree(root);
   const branch = currentBranch(root);
   const read = officersOfTree(root, tree);
-  if (read.problem !== undefined) return refusal(TEXT.cannotRun(read.problem), agentCommand(root, 'status'));
+  if (read.problem !== undefined) return refusal(TEXT.cannotRun(read.problem), localCommand(root, 'status'));
   const base = baseOf(root, read.baseBranch);
   const recorded = await runAndRecord(root, { tree, base, branch, officers: read.officers, command: 'run' });
-  if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), agentCommand(root, 'status'));
+  if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), localCommand(root, 'status'));
+  if (recorded.hidden) {
+    print([TEXT.runHeader(tree, base), ...officerLines(recorded.verdict)]);
+    return hiddenRefusal(root, localCommand(root, 'run'));
+  }
   if (recorded.changed !== undefined) {
     print([TEXT.runHeader(tree, base), ...officerLines(recorded.verdict)]);
-    return refusal(TEXT.treeChanged(recorded.changed), `git -C ${shellWord(root)} add -- <each changed path that is wanted>, then ${agentCommand(root, 'run')}`);
+    return refusal(TEXT.treeChanged(recorded.changed), `git -C ${shellWord(root)} add -- <each changed path that is wanted>, then ${localCommand(root, 'run')}`);
   }
   const { verdict, isPassing } = recorded;
   await recordSessionEvent(root, verdictSummary(verdict, isPassing));
@@ -468,10 +468,10 @@ async function run(root) {
   print(lines);
   if (!isPassing) {
     // The verdict was made from the tree's own officers, so at least one of them did not pass.
-    print([TEXT.failing(failedIds(verdict)), nextLine(agentCommand(root, 'run'))]);
+    print([TEXT.failing(failedIds(verdict)), nextLine(localCommand(root, 'run'))]);
     return 1;
   }
-  const standing = approvalStanding(readApprovals(root), verdict.digest, () => baseDigestOf(root, base));
+  const { standing } = approvalStanding(readApprovals(root), verdict.digest, () => buildsOnDigests(root, base, headCommit(root)));
   if (standing === 'approved') print([TEXT.passingApproved(tree), nextLine('git commit')]);
   else print([standing === 'older' ? TEXT.passingOlder(verdict.digest) : TEXT.passingUnapproved(verdict.digest), nextLine(ownerCommand(root, 'approve'))]);
   return 0;
@@ -484,7 +484,7 @@ function attempt(problems, root, read, fallback) {
   try {
     return read();
   } catch (error) {
-    problems.push({ text: failureReason(error), next: agentCommand(root, 'status') });
+    problems.push({ text: failureReason(error), next: localCommand(root, 'status') });
     return fallback;
   }
 }
@@ -699,18 +699,18 @@ export function statusOf(root) {
     const found = attempt(problems, root, () => installOf(root, tree), null);
     if (found !== null) {
       install = { present: found.absent === undefined, problem: found.absent ?? found.problem ?? null };
-      if (found.absent !== undefined) problems.push({ text: TEXT.noInstall(found.absent), next: agentCommand(root, 'status') });
-      else if (found.problem !== undefined) problems.push({ text: TEXT.installProblem(found.problem), next: agentCommand(root, 'status') });
+      if (found.absent !== undefined) problems.push({ text: TEXT.noInstall(found.absent), next: localCommand(root, 'status') });
+      else if (found.problem !== undefined) problems.push({ text: TEXT.installProblem(found.problem), next: localCommand(root, 'status') });
     }
     const differs = attempt(problems, root, () => liveFilesRefusal(root, tree), null);
     liveFiles = differs === null ? { equal: true, reason: null, next: null } : { equal: false, reason: differs.reason, next: differs.next };
     if (differs !== null && !pairDiffers) problems.push({ text: differs.reason, next: differs.next });
     const digested = digestOfTree(root, tree);
     if (digested.problem !== undefined) {
-      problems.push({ text: TEXT.undigestable(digested.problem), next: agentCommand(root, 'status') });
+      problems.push({ text: TEXT.undigestable(digested.problem), next: localCommand(root, 'status') });
     } else {
       digest = digested.digest;
-      const standing = approvals === null ? null : attempt(problems, root, () => approvalStanding(approvals, digest, () => (base === null ? null : baseDigestOf(root, base))), null);
+      const standing = approvals === null ? null : attempt(problems, root, () => approvalStanding(approvals, digest, () => buildsOnDigests(root, base, headCommit(root))).standing, null);
       digestApproved = standing === null ? null : standing === 'approved';
       if (standing === 'unapproved') problems.push({ text: TEXT.unapproved(digest), next: approveNext });
       if (standing === 'older') problems.push({ text: TEXT.olderApproval(digest), next: approveNext });
@@ -718,8 +718,8 @@ export function statusOf(root) {
     if (officers !== null && base !== null && digest !== null) {
       const judged = attempt(problems, root, () => verdictState(root, tree, base, officers, digest), { state: 'none', failed: [] });
       verdict = judged.state;
-      if (verdict === 'damaged') problems.push({ text: TEXT.verdictDamaged(verdictName(tree, base)), next: agentCommand(root, 'run') });
-      if (verdict === 'failing') problems.push({ text: judged.failed.length > 0 ? TEXT.indexFailing(judged.failed) : TEXT.indexStale, next: agentCommand(root, 'run') });
+      if (verdict === 'damaged') problems.push({ text: TEXT.verdictDamaged(verdictName(tree, base)), next: localCommand(root, 'run') });
+      if (verdict === 'failing') problems.push({ text: judged.failed.length > 0 ? TEXT.indexFailing(judged.failed) : TEXT.indexStale, next: localCommand(root, 'run') });
     }
   }
 
@@ -736,11 +736,11 @@ export function statusOf(root) {
       ? 'none'
       : attempt(problems, root, () => verdictState(root, head, headBase, headRead.officers, headDigest.digest).state, 'none');
     if (headVerdict !== 'passing') {
-      problems.push({ text: headAccepted ? TEXT.headAcceptedUnverdicted(head, headBase) : TEXT.headNoRecord(head, headBase), next: agentCommand(root, 'verify-branch') });
+      problems.push({ text: headAccepted ? TEXT.headAcceptedUnverdicted(head, headBase) : TEXT.headNoRecord(head, headBase), next: localCommand(root, 'verify-branch') });
     }
   }
 
-  for (const problem of contract.ok ? [] : contract.problems) problems.push({ text: TEXT.contractProblem(problem), next: agentCommand(root, 'status') });
+  for (const problem of contract.ok ? [] : contract.problems) problems.push({ text: TEXT.contractProblem(problem), next: localCommand(root, 'status') });
 
   const here = realpathSync(root);
   const proposals = attempt(problems, root, () => readProposals(root), null);
@@ -749,12 +749,12 @@ export function statusOf(root) {
   if (exemptionHere !== undefined) {
     // A branch from before the install has no working copy of ko.mjs: the approved copy's then.
     const fromWorkingCopy = statOrNull(join(root, SCRIPTS, 'ko.mjs'))?.isFile() === true;
-    problems.push({ text: TEXT.exemptHere(branch, exemptionHere.reason), next: fromWorkingCopy ? commandLine(agentCommand(root, 'unexempt'), [branch]) : ownerLine(root, ['unexempt', branch]) });
+    problems.push({ text: TEXT.exemptHere(branch, exemptionHere.reason), next: fromWorkingCopy ? commandLine(localCommand(root, 'unexempt'), [branch]) : ownerLine(root, ['unexempt', branch]) });
   }
   const waivers = attempt(problems, root, () => waiversOf(root, branch), null);
   const records = attempt(problems, root, () => listInflight(root), []);
   const inflight = { live: records.filter((record) => record.live).map((record) => record.pid), stale: records.filter((record) => !record.live).map((record) => record.pid) };
-  if (inflight.stale.length > 0) problems.push({ text: TEXT.staleInflight(inflight.stale), next: agentCommand(root, 'run') });
+  if (inflight.stale.length > 0) problems.push({ text: TEXT.staleInflight(inflight.stale), next: localCommand(root, 'run') });
 
   const bin = attempt(problems, root, () => binOf(root, binSourceOf(root)), null);
   if (bin !== null) problems.push(...binProblems(root, bin));
@@ -835,29 +835,34 @@ function status(root, { json }) {
 // --no-run the existing verdict is read and nothing from the repository is executed.
 async function verifyBranch(root, { noRun }) {
   const head = headTree(root);
-  if (head === null) return refusal(TEXT.noHead, agentCommand(root, 'run'));
+  if (head === null) return refusal(TEXT.noHead, localCommand(root, 'run'));
   const branch = currentBranch(root);
   const read = officersOfTree(root, head);
   const { accepted, base } = headJudged(root, head, read);
   if (!noRun) {
     const filter = foreignFilter(root);
     if (filter !== null) return refusal(TEXT.filterDriver(filter.name, filter.key), FILTER_ORIGIN);
-    const hidden = hiddenRefusal(root, agentCommand(root, 'verify-branch'));
+    const hidden = hiddenRefusal(root, localCommand(root, 'verify-branch'));
     if (hidden !== null) return hidden;
     const untidy = untidyPaths(root);
-    if (untidy.length > 0) return refusal(TEXT.untidyHead(untidy), `git stash -u && ${agentCommand(root, 'verify-branch')}`);
-    if (indexTree(root) !== head) return refusal(TEXT.stagedChanges, `git stash && ${agentCommand(root, 'verify-branch')}`);
+    if (untidy.length > 0) return refusal(TEXT.untidyHead(untidy), `git stash -u && ${localCommand(root, 'verify-branch')}`);
+    if (indexTree(root) !== head) return refusal(TEXT.stagedChanges, `git stash && ${localCommand(root, 'verify-branch')}`);
     if (read.problem === undefined) {
       const recorded = await runAndRecord(root, { tree: head, base, branch, officers: read.officers, command: 'verify-branch' });
-      if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), agentCommand(root, 'status'));
+      if (recorded.problem !== undefined) return refusal(TEXT.cannotRun(recorded.problem), localCommand(root, 'status'));
+      if (recorded.hidden) {
+        print([TEXT.verifyHeader(branchWords(branch), head, base), ...officerLines(recorded.verdict)]);
+        return hiddenRefusal(root, localCommand(root, 'verify-branch'));
+      }
       if (recorded.changed !== undefined) {
         print([TEXT.verifyHeader(branchWords(branch), head, base), ...officerLines(recorded.verdict)]);
         const rootWord = shellWord(root);
-        return refusal(TEXT.treeChangedHead(recorded.changed), `git -C ${rootWord} add -- <each changed path that is wanted> && git -C ${rootWord} commit, then ${agentCommand(root, 'verify-branch')}`);
+        return refusal(TEXT.treeChangedHead(recorded.changed), `git -C ${rootWord} add -- <each changed path that is wanted> && git -C ${rootWord} commit, then ${localCommand(root, 'verify-branch')}`);
       }
     }
   }
-  const decision = judge(root, { tree: head, base, branch }, { honourSwitches: false, probe: !noRun });
+  // HEAD's tree builds on its base and on HEAD's first parent: the order is measured from both.
+  const decision = judge(root, { tree: head, base, branch, on: headParent(root) }, { honourSwitches: false, probe: !noRun });
   const verdict = base === null ? null : readVerdict(root, head, base);
   const changes = base === null ? [] : agentRuleChanges(root, treeOfCommit(root, base), head);
   const lines = [
@@ -875,7 +880,7 @@ async function verifyBranch(root, { noRun }) {
   }
   // The gate's `run` judges the index against the next commit's base, not HEAD's tree against its
   // own, so following it would loop: verify-branch without --no-run runs the officers on HEAD's tree.
-  const next = decision.next === agentCommand(root, 'run') ? agentCommand(root, 'verify-branch') : decision.next;
+  const next = decision.next === agentCommand(root, 'run') ? localCommand(root, 'verify-branch') : localLine(root, decision.next);
   print([...lines, TEXT.notVerified(decision.reason), nextLine(next)]);
   return 1;
 }
@@ -956,9 +961,8 @@ function approvalPreview(root, { tree, digest, branch }) {
   }
   const read = officersOfTree(root, tree);
   const base = read.problem === undefined ? baseOf(root, read.baseBranch) : null;
-  const baseDigest = base === null ? null : baseDigestOf(root, base);
-  const standing = approvalStanding(approvals, digest.digest, () => baseDigest);
-  if (standing === 'older') lines.push(TEXT.approvesOlder(digest.digest, baseDigest));
+  const { standing, newer } = approvalStanding(approvals, digest.digest, () => buildsOnDigests(root, base, headCommit(root)));
+  if (standing === 'older') lines.push(TEXT.approvesOlder(digest.digest, newer));
   else if (standing === 'approved') lines.push(TEXT.alreadyApproved);
   return lines;
 }
@@ -979,7 +983,7 @@ function closeProposal(root, path) {
 function approve(root) {
   const tree = indexTree(root);
   const digest = digestOfTree(root, tree);
-  if (digest.problem !== undefined) return refusal(TEXT.approveUndigestable(digest.problem), agentCommand(root, 'status'));
+  if (digest.problem !== undefined) return refusal(TEXT.approveUndigestable(digest.problem), localCommand(root, 'status'));
   const branch = currentBranch(root);
   print(approvalPreview(root, { tree, digest, branch }));
   process.stdout.write(TEXT.prompt);
@@ -1021,14 +1025,14 @@ function approve(root) {
   }
   closeProposal(root, realpathSync(root));
   removeStaleInflight(root);
-  print([TEXT.approved(digest.digest, tree), nextLine(TEXT.approvedNext(agentCommand(root, 'run')))]);
+  print([TEXT.approved(digest.digest, tree), nextLine(TEXT.approvedNext(localCommand(root, 'run')))]);
   return 0;
 }
 
 function propose(root, { close }) {
   const path = realpathSync(root);
   if (close) {
-    print([closeProposal(root, path) ? TEXT.proposalClosed(path) : TEXT.notProposed(path), nextLine(agentCommand(root, 'status'))]);
+    print([closeProposal(root, path) ? TEXT.proposalClosed(path) : TEXT.notProposed(path), nextLine(localCommand(root, 'status'))]);
     return 0;
   }
   const next = nextLine(ownerCommand(root, 'approve'));
@@ -1058,7 +1062,7 @@ function unwaive(root, { rule }) {
     return 0;
   }
   writeState(root, 'waivers.json', { waivers });
-  print([TEXT.unwaived(rule, branch), TEXT.waivers(branch, here), nextLine(agentCommand(root, 'run'))]);
+  print([TEXT.unwaived(rule, branch), TEXT.waivers(branch, here), nextLine(localCommand(root, 'run'))]);
   return 0;
 }
 
@@ -1069,7 +1073,7 @@ function waive(root, { rule, reason }) {
   const others = readWaivers(root).filter((entry) => !(entry.rule === rule && entry.branch === branch));
   const waivers = [...others, { rule, branch, reason, at: new Date().toISOString() }];
   writeState(root, 'waivers.json', { waivers });
-  print([TEXT.waived(rule, branch), TEXT.waivers(branch, waivers.filter((entry) => entry.branch === branch)), nextLine(agentCommand(root, 'run'))]);
+  print([TEXT.waived(rule, branch), TEXT.waivers(branch, waivers.filter((entry) => entry.branch === branch)), nextLine(localCommand(root, 'run'))]);
   return 0;
 }
 
@@ -1115,7 +1119,7 @@ function off(root) {
 
 function on(root) {
   switchOn(root);
-  print([TEXT.on, nextLine(agentCommand(root, 'status'))]);
+  print([TEXT.on, nextLine(localCommand(root, 'status'))]);
   return 0;
 }
 
@@ -1162,11 +1166,12 @@ function parse(command, words) {
   return { operands, flags, reason: spec.reason ? cleanReason(command, reason) : undefined };
 }
 
-// The next line of the session refusal: the approved copy's command when the repository can be
-// found, the working copy's otherwise (there is then no shared state to name).
-function ownerNext(command) {
+// The next line of the session refusal: the command as typed, its words included, through the
+// approved copy when the repository can be found, the working copy otherwise (there is then no
+// shared state to name).
+function ownerNext(argv) {
   const root = repoRoot(process.cwd());
-  return `${root === null ? `${KO} ${command}` : ownerCommand(root, command)}, in the owner's own terminal`;
+  return `${root === null ? commandLine(KO, argv) : ownerLine(root, argv)}, in the owner's own terminal`;
 }
 
 async function dispatch(argv) {
@@ -1181,13 +1186,14 @@ async function dispatch(argv) {
   if (isOwners) {
     // This process's own environment, never one passed in (after Task 7's review).
     const variable = OWNER_VARIABLES.find((name) => process.env[name] !== undefined);
-    if (variable !== undefined) return refusal(TEXT.ownerOnly(command, variable), ownerNext(command));
+    if (variable !== undefined) return refusal(TEXT.ownerOnly(command, variable), ownerNext(argv));
   }
   const { operands, flags, reason } = parse(command, words);
   if ((command === 'waive' || command === 'unwaive') && !RULE_ID.test(operands[0])) throw new UsageError(TEXT.badRule(operands[0]));
   const root = repoRoot(process.cwd());
   if (root === null) return refusal(TEXT.notARepository, `cd <the repository> && ${KO} ${command}`);
   if (isOwners && !fromApprovedCopy(root)) return refusal(TEXT.notFromBin(command), ownerLine(root, argv));
+  namesBin = !isOwners && fromApprovedCopy(root);
   switch (command) {
     case 'run': return run(root);
     case 'status': return status(root, { json: flags.has('--json') });
@@ -1217,6 +1223,6 @@ export async function main(argv) {
       return 2;
     }
     const root = repoRoot(process.cwd());
-    return refusal(TEXT.failed(failureReason(error)), root === null ? COMMANDS.status : agentCommand(root, 'status'));
+    return refusal(TEXT.failed(failureReason(error)), root === null ? COMMANDS.status : localCommand(root, 'status'));
   }
 }
