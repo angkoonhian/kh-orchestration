@@ -26,19 +26,21 @@
 //   kh-harness's hooks/hooks.json and scripts/session-nudge.mjs register and write the same way.
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installKhHarness, makeRepo, testEnv } from './test-repo.mjs';
+import { envPath } from './install.mjs';
 import { gitIn, installed, owner } from './gate-fixture.mjs';
 import { shellWord } from '../../assets/scripts/extension.mjs';
+import { REFUSED_TEXT, hookLine } from '../../assets/scripts/ko-hooks.mjs';
 import { stateDir } from '../../assets/scripts/ko-state.mjs';
 
 const PLUGIN = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SCRIPT = join(PLUGIN, 'scripts', 'session-brief.mjs');
-const CLI = '.claude/kh-orchestration/scripts/ko-cli.mjs';
+const WORKING_CLI = '.claude/kh-orchestration/scripts/ko-cli.mjs';
 
 const CHECKED = 'Commits in this repository are checked by kh-orchestration: a commit lands only when the officers passed on exactly the staged tree and the protected files are owner-approved.';
 const OWNER_ONLY = 'Owner-only steps (approve, propose, waive, exempt, off, on, and the plugin\'s apply and uninstall --yes) are the owner\'s to run in their own terminal: ask, do not attempt.';
@@ -47,7 +49,11 @@ const NOT_OPEN_HERE = 'This worktree is not open for proposals: do not edit prot
 const FIX = 'Only the owner can fix this: ask the owner to run the plugin\'s apply.';
 const run = (root) => `node ${shellWord(join(root, '.claude/kh-orchestration/scripts/ko.mjs'))} run`;
 const normal = (root, open = NOT_OPEN_HERE) => `${CHECKED} Before committing, run the officers with \`${run(root)}\`. ${OWNER_ONLY} ${open}`;
-const broken = (clause) => `kh-orchestration is installed here, but ${clause}, so every commit here will be refused. ${FIX}`;
+const refused = (clause) => `kh-orchestration is installed here, but ${clause}, so every commit here will be refused. ${FIX}`;
+const unchecked = (clause) => `kh-orchestration is installed here, but ${clause}, so git does not run the commit gate here and commits are NOT being checked; only the owner can fix this (ask them to run the plugin's apply).`;
+const unsure = (clause) => `kh-orchestration is installed here, but ${clause}. ${FIX}`;
+const SCRIPTS_MISSING = `kh-orchestration is installed here, but its approved scripts are missing from the git directory, so commits may be refused. ${FIX}`;
+const CONTRACT = 'kh-harness\'s contract with this plugin does not hold here';
 const OFF = 'kh-orchestration is switched off for this repository by its owner: commits here are not being checked.';
 
 // The hook as Claude Code runs it: its JSON on standard input, a clean environment.
@@ -156,65 +162,121 @@ test('a branch name is shown with control characters made visible and cut in len
   check(repo.root, 'This branch, a\\u{202e}b, is exempt from kh-orchestration: its commits are not being checked.');
 });
 
-// ---- the problems that refuse every commit ----
+// ---- the problems, each claim about a commit proved with a real `git commit` ----
 
-test('a missing bin/, a missing or foreign or broken hook, a global core.hooksPath and a removed extension entry', () => {
+const commitOf = (root, env) => gitIn(root, ['commit', '-q', '-m', 'work'], env);
+const editHook = (root, name, change) => {
+  const path = join(root, '.git', 'hooks', name);
+  writeFileSync(path, change(readFileSync(path, 'utf8')));
+};
+
+test('a problem that makes the gate refuse is said to refuse, and the commit is refused', () => {
+  const cases = {
+    'its install is absent from this branch\'s tree': (root) => gitIn(root, ['rm', '-r', '-q', '--cached', '.claude/kh-orchestration/officers.json']),
+    'the officers file in the staged tree cannot be used': (root) => {
+      writeFileSync(join(root, '.claude/kh-orchestration/officers.json'), '{');
+      gitIn(root, ['add', '-A']);
+    },
+    [CONTRACT]: (root) => rmSync(join(root, '.claude/kh-harness/extensions.json')),
+    'the installed gate directory bin/ holds no gate': (root) => rmSync(join(stateDir(root), 'bin', 'gate.mjs')),
+    'the pre-commit git hook names a program that is gone': (root) => editHook(root, 'pre-commit', (text) => text.replace(`'${envPath()}'`, '\'/nonexistent/env\'')),
+  };
+  for (const [clause, change] of Object.entries(cases)) {
+    const repo = installed();
+    change(repo.root);
+    check(repo.root, refused(clause));
+    const committed = commitOf(repo.root);
+    assert.equal(committed.status, 1, clause);
+    assert.ok(committed.stderr.length > 0, clause);
+  }
+});
+
+test('with bin/ gone the brief says the approved scripts are missing, imports nothing, and the commit is refused', () => {
+  const repo = installed();
+  rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
+  check(repo.root, SCRIPTS_MISSING);
+  const committed = commitOf(repo.root);
+  assert.equal(committed.status, 1);
+  assert.ok(committed.stderr.includes(REFUSED_TEXT), committed.stderr);
+  // Only the approved copy is missing; the same sentence, whatever else is in bin/.
+  const other = installed();
+  rmSync(join(stateDir(other.root), 'bin', 'ko-cli.mjs'));
+  check(other.root, SCRIPTS_MISSING);
+  const linked = installed();
+  rmSync(join(stateDir(linked.root), 'bin', 'ko-cli.mjs'));
+  mkdirSync(join(stateDir(linked.root), 'bin', 'ko-cli.mjs'));
+  check(linked.root, SCRIPTS_MISSING);
+});
+
+test('a problem that makes git not run the gate is said so, and the commit lands unchecked', () => {
   const home = tmp('ko-brief-home-');
-  {
+  writeFileSync(join(home, '.gitconfig'), '[core]\n\thooksPath = /dev/null\n');
+  const globalEnv = { ...testEnv(), HOME: home };
+  delete globalEnv.GIT_CONFIG_GLOBAL;
+  const cases = [
+    ['the pre-commit git hook is missing', (root) => rmSync(join(root, '.git', 'hooks', 'pre-commit'))],
+    ['the pre-commit git hook is not kh-orchestration\'s', (root) => editHook(root, 'pre-commit', () => '#!/bin/sh\nexit 0\n')],
+    ['the pre-commit git hook is not executable', (root) => chmodSync(join(root, '.git', 'hooks', 'pre-commit'), 0o644)],
+    ['the pre-commit git hook is not where it runs first', (root) => editHook(root, 'pre-commit', () => `#!/bin/sh\nexit 0\n${hookLine('pre-commit', { env: envPath(), node: process.execPath })}\n`)],
+    ['core.hooksPath is set in the global git configuration', () => {}, globalEnv],
+  ];
+  for (const [clause, change, env] of cases) {
     const repo = installed();
-    rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
-    check(repo.root, broken('the installed gate directory bin/ is missing'));
+    change(repo.root);
+    check(repo.root, unchecked(clause), env === undefined ? undefined : { env });
+    const committed = commitOf(repo.root, env);
+    assert.equal(committed.status, 0, `${clause}: ${committed.stderr}`);
   }
-  {
-    const repo = installed();
-    rmSync(join(repo.root, '.git', 'hooks', 'pre-commit'));
-    check(repo.root, broken('the pre-commit git hook is missing'));
-  }
-  {
-    const repo = installed();
-    writeFileSync(join(repo.root, '.git', 'hooks', 'pre-merge-commit'), '#!/bin/sh\nexit 0\n');
-    chmodSync(join(repo.root, '.git', 'hooks', 'pre-merge-commit'), 0o755);
-    check(repo.root, broken('the pre-merge-commit git hook is not kh-orchestration\'s'));
-  }
-  {
-    const repo = installed();
-    chmodSync(join(repo.root, '.git', 'hooks', 'pre-commit'), 0o644);
-    check(repo.root, broken('the pre-commit git hook is not executable'));
-  }
-  {
-    const repo = installed();
-    writeFileSync(join(home, '.gitconfig'), '[core]\n\thooksPath = /dev/null\n');
-    const env = { ...testEnv(), HOME: home };
-    delete env.GIT_CONFIG_GLOBAL;
-    check(repo.root, 'kh-orchestration is installed here, but core.hooksPath is set in the global git configuration, so git runs none of its hooks and commits are not being checked. Only the owner can fix this.', { env });
-  }
-  {
-    const repo = installed();
-    rmSync(join(repo.root, '.claude/kh-harness/extensions.json'));
-    const text = said(brief(repo.root));
-    assert.ok(text.startsWith('kh-orchestration is installed here, but kh-harness contract 1 does not hold ('), text);
-    assert.ok(text.endsWith(`), so every commit here will be refused. ${FIX}`), text);
-    texts.push(text);
-  }
-  {
-    const repo = installed();
-    assert.equal(gitIn(repo.root, ['rm', '-r', '-q', '--cached', '.claude/kh-orchestration/officers.json']).status, 0);
-    check(repo.root, broken('its install is absent from this branch\'s tree'));
-  }
+});
+
+test('a hook or bin/ that differs from the approved one is said without claiming what a commit does', () => {
+  const hook = installed();
+  editHook(hook.root, 'pre-commit', (text) => `${text}# edited\n`);
+  check(hook.root, unsure('the pre-commit git hook differs from the installed one'));
+  const bin = installed();
+  appendFileSync(join(stateDir(bin.root), 'bin', 'ko-verdict.mjs'), '\n// edited\n');
+  check(bin.root, unsure('the installed gate directory bin/ differs from the approved scripts'));
 });
 
 test('the first problem is the one named, in the order status reports them', () => {
   const repo = installed();
-  rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
   rmSync(join(repo.root, '.git', 'hooks', 'pre-commit'));
-  check(repo.root, broken('the installed gate directory bin/ is missing'));
+  rmSync(join(stateDir(repo.root), 'bin', 'gate.mjs'));
+  check(repo.root, refused('the installed gate directory bin/ holds no gate'));
 });
 
-// ---- failures are silent ----
+// ---- only the approved copy is imported ----
 
-const stubCli = (root, source) => writeFileSync(join(root, CLI), source);
+// A ko-cli.mjs that writes `marker` when it is loaded, and says everything is fine.
+const markerStub = (marker) => `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'imported');\nexport const statusOf = () => ({});\nexport const agentCommand = () => 'x';\n`;
 
-test('a damaged, missing, replaced or lying ko-cli.mjs, and a statusOf that throws, print nothing and exit 0', () => {
+test('a ko-cli.mjs in the working copy is never imported: a clone, or a repository with a planted install, stays silent', () => {
+  const planted = makeRepo();
+  const marker = join(planted.root, 'imported.txt');
+  planted.write(WORKING_CLI, markerStub(marker));
+  planted.commitAll('a repository that carries an install');
+  silent(brief(planted.root), 'a repository holding only the files');
+  assert.ok(!existsSync(marker));
+
+  // Installed on this machine, with a different working copy of the script: the approved one speaks
+  // (and status, reading the working repository, sees that bin/ no longer equals the working copy).
+  const repo = installed();
+  const working = join(repo.root, 'marker.txt');
+  writeFileSync(join(repo.root, WORKING_CLI), markerStub(working));
+  check(repo.root, unsure('the installed gate directory bin/ differs from the approved scripts'));
+  assert.ok(!existsSync(working));
+
+  // A fresh clone has the files but no state directory in its git directory.
+  const clone = installed();
+  rmSync(stateDir(clone.root), { recursive: true });
+  silent(brief(clone.root), 'no state directory');
+});
+
+// ---- failures are silent, and the hook always ends with 0 ----
+
+const binCli = (root) => join(stateDir(root), 'bin', 'ko-cli.mjs');
+
+test('a damaged, lying, exiting or noisy approved ko-cli.mjs, and a statusOf that throws, print nothing and exit 0', () => {
   const stubs = {
     syntax: 'export const x = ;\n',
     emptyModule: '',
@@ -224,21 +286,44 @@ test('a damaged, missing, replaced or lying ko-cli.mjs, and a statusOf that thro
     wrongShape: 'export const statusOf = () => ({ off: "no" });\nexport const agentCommand = () => "x";\n',
     noHelper: 'export const statusOf = () => ({});\n',
     importsMissing: 'import "./does-not-exist.mjs";\nexport const statusOf = () => ({});\n',
+    exits: 'process.exit(3);\n',
+    exitsInStatus: 'export const statusOf = () => process.exit(3);\nexport const agentCommand = () => "x";\n',
+    neverSettles: 'await new Promise(() => {});\nexport const statusOf = () => ({});\n',
   };
   for (const [name, source] of Object.entries(stubs)) {
     const repo = installed();
-    stubCli(repo.root, source);
+    writeFileSync(binCli(repo.root), source);
     silent(brief(repo.root), name);
   }
-  const gone = installed();
-  rmSync(join(gone.root, CLI));
-  silent(brief(gone.root), 'missing');
-  const linked = installed();
-  const real = join(linked.root, 'elsewhere.mjs');
-  writeFileSync(real, readFileSync(join(linked.root, CLI)));
-  rmSync(join(linked.root, CLI));
-  symlinkSync(real, join(linked.root, CLI));
-  silent(brief(linked.root), 'symlink');
+  // Output from the imported module never reaches the context, even beside a valid answer.
+  const noisy = installed();
+  writeFileSync(binCli(noisy.root), `process.stdout.write('stray text');\nconsole.log('more');\n${readFileSync(binCli(noisy.root), 'utf8')}`);
+  silent(brief(noisy.root), 'stray output');
+  const symlinked = installed();
+  const real = join(symlinked.root, 'elsewhere.mjs');
+  writeFileSync(real, readFileSync(binCli(symlinked.root)));
+  rmSync(binCli(symlinked.root));
+  symlinkSync(real, binCli(symlinked.root));
+  check(symlinked.root, SCRIPTS_MISSING);
+});
+
+test('an input that never closes, or a module that keeps the process alive, ends silently with 0 inside the timeout', async () => {
+  const repo = installed();
+  writeFileSync(binCli(repo.root), 'setInterval(() => {}, 1000);\nexport const statusOf = () => ({});\nexport const agentCommand = () => "x";\n');
+  const started = performance.now();
+  const wait = (child) => new Promise((resolveWait) => {
+    let out = '';
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.on('close', (status) => resolveWait({ status, out }));
+  });
+  const alive = spawn(process.execPath, [SCRIPT], { env: testEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
+  alive.stdin.end(JSON.stringify({ cwd: repo.root }));
+  const open = spawn(process.execPath, [SCRIPT], { env: testEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
+  const results = await Promise.all([wait(alive), wait(open)]);
+  open.stdin.destroy();
+  assert.deepEqual(results, [{ status: 0, out: '' }, { status: 0, out: '' }]);
+  const seconds = (performance.now() - started) / 1000;
+  assert.ok(seconds >= 7.5 && seconds < 10, `${seconds} s`);
 });
 
 // ---- where it runs ----
@@ -269,25 +354,37 @@ test('a very long path falls back to the short run command and the text stays bo
 
 // ---- what it may and may not do ----
 
-test('it imports only node: built-ins and, dynamically, the one ko-cli.mjs, and runs nothing from the repository', () => {
+// Records every program the brief starts: a preload that wraps child_process.
+const PRELOAD = `const cp = require('node:child_process');
+const { appendFileSync } = require('node:fs');
+for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
+  const original = cp[name];
+  cp[name] = function (file, ...rest) {
+    appendFileSync(process.env.KO_SPAWN_LOG, JSON.stringify([name, String(file)]) + '\\n');
+    return original.call(this, file, ...rest);
+  };
+}
+`;
+
+test('it imports only node: built-ins and the plugin\'s ko-git.mjs, and the only program it starts is git', () => {
   const source = readFileSync(SCRIPT, 'utf8');
   const statics = [...source.matchAll(/^import .* from '([^']+)';$/gm)].map((match) => match[1]);
-  assert.ok(statics.length > 0 && statics.every((specifier) => specifier.startsWith('node:')), statics.join(', '));
+  assert.ok(statics.every((specifier) => specifier.startsWith('node:') || specifier === '../assets/scripts/ko-git.mjs'), statics.join(', '));
   assert.equal([...source.matchAll(/\bimport\(/g)].length, 1);
-  assert.deepEqual([...source.matchAll(/'(\.claude[^']*)'/g)].map((match) => match[1]), [CLI]);
-  assert.deepEqual([...source.matchAll(/\bspawnSync\(\s*'([^']+)'/g)].map((match) => match[1]), ['git']);
-  assert.ok(!/\bexecFile|\bexecSync|\bspawn\(|\bfork\(|\beval\(/.test(source));
+  assert.ok(!/\.claude\/kh-orchestration\/scripts\/ko-cli/.test(source));
+  assert.ok(!/^await /m.test(source), 'no top-level await');
 
-  // A stub where the gate's probe would run: it must never run.
+  const dir = tmp('ko-brief-spawn-');
+  const preload = join(dir, 'record.cjs');
+  const log = join(dir, 'spawns.log');
+  writeFileSync(preload, PRELOAD);
   const repo = installed();
-  const marker = join(repo.root, 'probe-ran.txt');
-  mkdirSync(join(repo.root, '.claude/scripts'), { recursive: true });
-  writeFileSync(join(repo.root, '.claude/scripts/dispatch-pre-tool.mjs'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\nprocess.stdout.write('{}');\n`);
-  // Replacing the file changes the contract's files, so the brief names that problem; the stub never ran.
-  const text = said(brief(repo.root));
-  assert.ok(text.startsWith('kh-orchestration is installed here, but kh-harness contract 1 does not hold ('), text);
-  texts.push(text);
-  assert.ok(!existsSync(marker));
+  // The contract's files are intact (the probe is not made impossible), the brief says the usual.
+  const env = { ...testEnv(), NODE_OPTIONS: `--require ${preload}`, KO_SPAWN_LOG: log };
+  check(repo.root, normal(repo.root), { env });
+  const started = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.ok(started.length > 0);
+  assert.deepEqual([...new Set(started.map(([, file]) => file))], ['git']);
 });
 
 test('it finishes well inside the hook\'s timeout of 10 seconds', () => {

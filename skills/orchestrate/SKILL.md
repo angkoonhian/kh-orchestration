@@ -5,7 +5,7 @@ description: Use when a person asks to "run the checks", "run the officers", "is
 
 # orchestrate
 
-kh-orchestration refuses any commit whose exact staged tree has not passed the repository's checks (its officers), and any change to the protected files that the owner has not approved. Nothing depends on this skill being used: the commit hooks enforce it, and each session is told the rules at its start.
+kh-orchestration refuses any commit whose exact staged tree has not passed the repository's checks (its officers), and any change to the protected files that the owner has not approved. Nothing depends on this skill being used: the commit hooks enforce it, and sessions in a repository where it is installed on this machine are told the rules at their start.
 
 Every command below is the working copy's `ko.mjs`, run from anywhere in the repository:
 
