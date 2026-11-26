@@ -556,8 +556,14 @@ test('status shows the switch, proposals, exemptions, this branch\'s waivers and
   assert.deepEqual([status.off, status.openForProposals, status.exemptions, status.waivers.map((entry) => entry.rule)], [true, true, exemptions, ['V8']]);
   assert.deepEqual(status.inflight, { live: [String(process.pid)], stale: [dead] });
   assert.deepEqual(status.problems.slice(0, 1), [{ text: TEXT.offProblem(ownerCommand(repo.root, 'on')), next: ownerCommand(repo.root, 'on') }]);
-  assert.ok(status.problems.some((problem) => problem.text === TEXT.staleInflight([dead])));
+  assert.ok(status.problems.some((problem) => problem.text === TEXT.staleInflight([dead]) && problem.next === agent(repo.root, 'run')));
   assert.ok(existsSync(join(stateDir(repo.root), `inflight-${dead}.json`)), 'status removes nothing');
+  // The next line does what the text says: run removes the stale record and keeps the live one.
+  assert.equal(owner(repo.root, ['on']).status, 0);
+  assert.equal(ko(repo.root, ['run']).status, 0);
+  assert.equal(existsSync(join(stateDir(repo.root), `inflight-${dead}.json`)), false);
+  assert.ok(existsSync(join(stateDir(repo.root), `inflight-${process.pid}.json`)));
+  assert.equal(TEXT.staleInflight(['7']), 'In-flight records of git processes that have ended are left: 7. They are harmless; the next run of the officers, commit attempt, approve or apply removes them.');
 });
 
 test('status reports each hook that is missing, not ours, not executable, or names an env or Node that no longer exists', () => {

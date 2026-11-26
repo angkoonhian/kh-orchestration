@@ -194,6 +194,7 @@ export const TEXT = Object.freeze({
   rewriteHook: (path) => `rewrite the git hook ${path} (it names kh-orchestration but is not the exact text this version writes for this env and Node; any edit made in it is discarded)`,
   removeInflight: (pids) => `remove the in-flight records of git processes that have ended: ${pids.join(', ')}`,
   record: (what) => `record ${what} in ${MANIFEST_PATH} (already in place)`,
+  writeManifest: `write ${MANIFEST_PATH}, the record of every write above, from which uninstall works`,
   takeEntryOut: `take kh-orchestration's entry out of ${EXTENSIONS_PATH}: ${MODULE} is kept with other bytes than the entry names, and kh-harness blocks every tool call while the two disagree`,
 
   scriptNotOurs: (path) => `${path} is kept as it is: it does not begin with kh-orchestration's stamp line, so kh-orchestration did not write it and never overwrites it. The path is kh-orchestration's own script's: move the file elsewhere to keep it, then run apply again.`,
@@ -269,6 +270,8 @@ export const TEXT = Object.freeze({
   keptHeader: 'Kept (the owner\'s now):',
   uninstallDryEnd: (command) => `Nothing was removed. To uninstall, ${askOwner(command)}`,
   uninstalled: (root) => `kh-orchestration is uninstalled from ${root}.`,
+  commitRemoval: (root) => `Commit the removal, with no gate left to refuse it: git -C ${shellWord(root)} add -A -- ${INSTALL_PATHS.join(' ')} && git -C ${shellWord(root)} commit -m "chore: uninstall kh-orchestration"`,
+  otherWorktrees: 'Other worktrees keep their working copies of the install, and kh-harness goes on running the extension there, until they take in that commit; their commits are no longer checked.',
   nothingToRemove: 'Nothing to remove.',
   statusUnreadable: 'an unexpected error stopped it',
   stageAndApprove: (root) => `stage the install (${stageCommand(root)}; ${STAGE_INSTALL_NOTE}), then ${askOwner(`cd ${shellWord(root)} && ${ownerCommand(root, 'approve')}`)}`,
@@ -1112,6 +1115,8 @@ function hooksFailing(root, planned, names) {
 export function planLines(planned, { dryRun }) {
   const lines = [TEXT.header(planned.root, dryRun)];
   if (planned.actions.length > 0) lines.push(TEXT.actionsHeader, ...planned.actions.map((action) => `  - ${action.detail}`));
+  // The manifest is written with every action but the removal of stale in-flight records.
+  if (planned.actions.some((action) => action.kind !== 'inflight')) lines.push(`  - ${TEXT.writeManifest}`);
   if (planned.notes.length > 0) lines.push(TEXT.notesHeader, ...planned.notes.map((note) => `  - ${note}`));
   if (planned.conflicts.length > 0) lines.push(TEXT.conflictsHeader, ...planned.conflicts.flatMap((conflict) => [`  - ${conflict.text}`, `    Next: ${conflict.next}`]));
   return lines;
@@ -1265,6 +1270,17 @@ export function applyUninstall(root, planned) {
     if (isRealDirectory(absolute) && readdirSync(absolute).length === 0) rmSync(absolute, { recursive: true, force: true });
   }
   return { refusal: null };
+}
+
+/**
+ * What a finished `uninstall --yes` prints last: that it is done, and, when the removal left changes
+ * to the committed install in the working tree, the command that commits them and what other
+ * worktrees keep meanwhile.
+ */
+export function uninstalledLines(root) {
+  const left = git(root, ['diff', '--name-only', 'HEAD', '--', ...INSTALL_PATHS]);
+  if (left.status !== 0 || left.stdout === '') return [TEXT.uninstalled(root)];
+  return [TEXT.uninstalled(root), TEXT.commitRemoval(root), TEXT.otherWorktrees];
 }
 
 /** The lines of the uninstall plan. */

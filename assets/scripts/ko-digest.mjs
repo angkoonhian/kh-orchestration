@@ -20,7 +20,10 @@ export const linkMessage = (path) => `${path} is a symbolic link or a submodule,
 export const globDirectoryMessage = (glob) => `The protected glob ${glob} names a directory and matches no file: write ${glob}/** in ${OFFICERS}.`;
 export const objectMismatchMessage = (path) => `The bytes of ${path} do not hash to its object id, so the object is damaged or forged.`;
 
-const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+// A full object id, 40 or 64 lower-case hexadecimal digits, as regular-expression source: the one
+// definition (ko-state builds its state file names from it; the gate reads ids through isFullObjectId).
+export const OBJECT_ID_SOURCE = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
+const OBJECT_ID = new RegExp(`^${OBJECT_ID_SOURCE}$`);
 
 // Whether a string is a full object id: 40 or 64 lower-case hexadecimal digits.
 export const isFullObjectId = (text) => OBJECT_ID.test(text);
@@ -107,7 +110,7 @@ function compute(root, tree) {
   if (officers === null) return { problem: officersUnreadableMessage };
 
   const { officerCandidates, protectedGlobs } = officers;
-    const underPrefix = (path) => PROTECTED_PREFIXES.some((prefix) => path.startsWith(prefix));
+  const underPrefix = (path) => PROTECTED_PREFIXES.some((prefix) => path.startsWith(prefix));
   const matchesProtectedGlob = (path) => protectedGlobs.some((glob) => matchesGlob(glob, path));
 
   const directories = new Set(entries.flatMap((entry) => ancestorsAndSelf(entry.path).slice(0, -1)));

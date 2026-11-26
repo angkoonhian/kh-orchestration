@@ -18,7 +18,8 @@
 // one of those commands; it does not run the contract probe, and the brief never calls detect,
 // apply or the gate. The brief starts no program but git.
 //
-// A state directory without `bin/ko-cli.mjs` is said in one fixed sentence, importing nothing.
+// A state directory without `bin/` (every commit is then refused), or without `bin/ko-cli.mjs`,
+// is said in one fixed sentence, importing nothing.
 //
 // It is silent wherever there is nothing to say and on every failure: input it cannot read, no
 // state directory, a damaged approved script, a `statusOf` that throws or answers in a shape it does
@@ -29,7 +30,7 @@
 import { lstatSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { commonDir, repoRoot } from '../assets/scripts/ko-git.mjs';
+import { UNSHOWABLE, commonDir, repoRoot } from '../assets/scripts/ko-git.mjs';
 
 const WATCHDOG_MS = 8_000;
 // The text is a short paragraph; no state's text reaches this length.
@@ -46,6 +47,8 @@ const FIX = 'Only the owner can fix this: ask the owner to run the plugin\'s app
 const runLine = (command) => `Before committing, run the officers with \`${command}\`.`;
 const SWITCHED_OFF = 'kh-orchestration is switched off for this repository by its owner: commits here are not being checked.';
 const SCRIPTS_MISSING = `kh-orchestration is installed here, but its approved scripts are missing from the git directory, so commits may be refused. ${FIX}`;
+// With no bin/ at all the hooks find no gate, so the refusal is certain.
+const BIN_MISSING = `kh-orchestration is installed here, but its approved scripts are missing from the git directory, so every commit here will be refused. ${FIX}`;
 const exempt = (branch) => `This branch, ${branch}, is exempt from kh-orchestration: its commits are not being checked.`;
 // What a problem does to a commit, each kind verified with a real `git commit` in the tests:
 // refused (the gate runs and says no), unchecked (git does not run the gate), or neither known.
@@ -53,10 +56,10 @@ const refused = (clause) => `kh-orchestration is installed here, but ${clause}, 
 const unchecked = (clause) => `kh-orchestration is installed here, but ${clause}, so git does not run the commit gate here and commits are NOT being checked; only the owner can fix this (ask them to run the plugin's apply).`;
 const unsure = (clause) => `kh-orchestration is installed here, but ${clause}. ${FIX}`;
 
-/** A name from git as it is shown: control, format and separator characters written as \u{...},
- * then cut at MAX_NAME characters. */
+/** A name from git as it is shown: every character ko-git's UNSHOWABLE names, TAB and newline
+ * included, written as \u{...}, then cut at MAX_NAME characters. */
 function shown(text) {
-  const visible = String(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+  const visible = String(text).replace(UNSHOWABLE, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
   return visible.length > MAX_NAME ? `${visible.slice(0, MAX_NAME)}...` : visible;
 }
 
@@ -143,6 +146,7 @@ async function brief() {
   if (root === null) return null;
   const state = join(commonDir(root), 'kh-orchestration');
   if (!entry(state)?.isDirectory()) return null;
+  if (!entry(join(state, 'bin'))?.isDirectory()) return BIN_MISSING;
   const cli = join(state, 'bin', 'ko-cli.mjs');
   if (!entry(cli)?.isFile()) return SCRIPTS_MISSING;
   const { statusOf, agentCommand } = await import(pathToFileURL(cli).href);

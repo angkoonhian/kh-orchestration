@@ -237,6 +237,10 @@ const OWNER_KO = 'node "$(git rev-parse --git-common-dir)/kh-orchestration/bin/k
 const RUN = `${COMMANDS.run} from the repository's top directory`;
 const unseen = (reason) => `This command's structure cannot be seen (${reason}) and its text holds a way round the commit gate (no-verify, hooksPath, a .git path, an owner-only ko.mjs command), so it is blocked. Run it as plain commands.`;
 
+// What kh-orchestration's installer writes in the working tree, staged and unstaged as one (after
+// Task 9's second re-review): the one list, which ko-state gives the installer and the gate.
+export const INSTALL_PATHS = Object.freeze(['.claude/kh-orchestration', '.claude/kh-orchestration.manifest.json', '.claude/kh-harness/extensions.json', '.gitattributes']);
+
 // Every text the hook returns. Each is one line of at most 300 characters with no `<` or `>`,
 // so kh-harness's cleaning leaves it as it is.
 export const MESSAGES = Object.freeze({
@@ -254,8 +258,8 @@ export const MESSAGES = Object.freeze({
   sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session, nor the environment cleared in front of an owner command: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
   // Without the clause the staging step carries elsewhere (it also stages any other change in
   // .gitattributes): with it the text would pass kh-harness's 300 characters.
-  restoreExtension: 'Restoring extensions.json or extension.mjs alone can leave an entry its module does not match, which blocks every tool call. Stage the whole install (git add -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes).',
-  unstageExtension: 'Unstaging extensions.json or extension.mjs alone lets a later git restore split the pair and block every tool call. Unstage the whole install: git restore --staged -- .claude/kh-orchestration .claude/kh-orchestration.manifest.json .claude/kh-harness/extensions.json .gitattributes',
+  restoreExtension: `Restoring extensions.json or extension.mjs alone can leave an entry its module does not match, which blocks every tool call. Stage the whole install (git add -- ${INSTALL_PATHS.join(' ')}).`,
+  unstageExtension: `Unstaging extensions.json or extension.mjs alone lets a later git restore split the pair and block every tool call. Unstage the whole install: git restore --staged -- ${INSTALL_PATHS.join(' ')}`,
   installerHidden: 'This names kh-orchestration\'s apply.mjs or uninstall.mjs with a word the hook cannot read whole (a variable, a substitution, a brace or glob pattern, or xargs), which could hide --yes. Write the path and arguments out; --yes is the owner\'s to run in their own terminal.',
   installerOwnerOnly: 'kh-orchestration\'s apply --yes and uninstall --yes are the owner\'s to run in their own terminal, outside Claude Code: they change the hooks and the files the commit gate checks. Ask the owner to run it; without --yes it is a dry run, open here.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),

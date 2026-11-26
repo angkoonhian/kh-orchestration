@@ -32,18 +32,16 @@
 // ways, and verify-branch, which re-runs the officers, is the remedy.
 import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, constants, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { COMMANDS, shellWord } from './extension.mjs';
+import { COMMANDS, PROTECTED_PREFIXES, shellWord } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
-import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
-import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommit, treeOfCommitId } from './ko-git.mjs';
+import { OFFICERS, digestOfTree, hashesTo, isFullObjectId, objectMismatchMessage } from './ko-digest.mjs';
+import { GitError, UNSHOWABLE, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommit, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { FILE_MODES, StateError, agentCommand, approvalStanding, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, STAGE_INSTALL_NOTE, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
+import { FILE_MODES, StateError, agentCommand, approvalStanding, isOff, isProcessId, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, STAGE_INSTALL_NOTE, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
 const REFERENCE_HOOK = 'reference-transaction';
-const PID = /^[1-9][0-9]{0,9}$/;
-const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const NULL_ID = /^(?:0{40}|0{64})$/;
 const TOKEN = /^\S+$/;
 // A symbolic ref's value as the hook is given it: `ref:refs/heads/main`.
@@ -52,8 +50,9 @@ const EXTENSION = '.claude/kh-orchestration/scripts/extension.mjs';
 const NAMED_AT_MOST = 10;
 // What this session's hooks run from the working directory (amended decision 17): kh-harness's
 // files and settings and this plugin's scripts. Their working copies must equal the tree.
+// They are the extension's protected prefixes, by one definition.
 const LIVE_FILE = '.claude/settings.json';
-const LIVE_DIRS = ['.claude/kh-harness', '.claude/scripts', '.claude/kh-orchestration/scripts'];
+const LIVE_DIRS = PROTECTED_PREFIXES.map((prefix) => prefix.replace(/\/$/, ''));
 // Directories a live path is reached through; each must be a real directory, not a link.
 const LIVE_ANCESTORS = ['.claude', '.claude/kh-orchestration', ...LIVE_DIRS];
 const isLive = (path) => path === LIVE_FILE || LIVE_DIRS.some((dir) => path.startsWith(`${dir}/`));
@@ -64,11 +63,8 @@ const MAX_SETTINGS_BYTES = 1024 * 1024;
 // Project env names that would load code into every hook process of a session.
 const LOADER_ENV = /^(?:NODE_|LD_|DYLD_)/i;
 const REASON_SHOWN_AT_MOST = 200;
-// C0 and C1 controls, DEL, the line and paragraph separators, and the zero-width and bidi
-// characters: what can make a terminal show other text than the record holds. The one definition
-// (ko.mjs uses it too).
-const UNSHOWABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
-// Text shown in full (a name, a path, a diff): every such character but TAB and newline written as
+// Text shown in full (a name, a path, a diff): every character ko-git's UNSHOWABLE names (what can
+// make a terminal show other text than the record holds) but TAB and newline written as
 // \u{…}, so what is shown cannot differ from what is meant, and two names never look the same.
 export const visible = (text) => text.replace(UNSHOWABLE, (char) => (char === '\t' || char === '\n' ? char : `\\u{${char.codePointAt(0).toString(16)}}`));
 // Text without what a terminal would act on: ko.mjs records a reason in this form.
@@ -450,7 +446,7 @@ function parseUpdates(input) {
   const updates = [];
   for (const line of input.split('\n').filter((text) => text !== '')) {
     const parts = line.split(' ');
-    if (parts.length !== 3 || !parts.slice(0, 2).every((value) => OBJECT_ID.test(value) || SYMBOLIC.test(value)) || !TOKEN.test(parts[2])) return null;
+    if (parts.length !== 3 || !parts.slice(0, 2).every((value) => isFullObjectId(value) || SYMBOLIC.test(value)) || !TOKEN.test(parts[2])) return null;
     updates.push({ next: parts[1], ref: parts[2] });
   }
   return updates;
@@ -464,7 +460,7 @@ const movesBranch = (update) => update.ref === 'HEAD' || update.ref.startsWith('
 function keepsTree(root, update, tree) {
   if (!movesBranch(update)) return true;
   if (NULL_ID.test(update.next)) return true;
-  return OBJECT_ID.test(update.next) && treeOfCommitId(root, update.next) === tree;
+  return isFullObjectId(update.next) && treeOfCommitId(root, update.next) === tree;
 }
 
 // The reference-transaction hook's judgement, in the `prepared` state of git process `pid`'s
@@ -511,7 +507,7 @@ export function runGate(args, cwd, { readTree = indexTree, input } = {}) {
     const [hook, pid] = args;
     // Before the root is known, the status line is the root-relative one: a hook runs at the
     // worktree's top, and only a gate started by hand gets here.
-    if (args.length !== 2 || ![...COMMIT_HOOKS, REFERENCE_HOOK].includes(hook) || !PID.test(pid)) {
+    if (args.length !== 2 || ![...COMMIT_HOOKS, REFERENCE_HOOK].includes(hook) || !isProcessId(pid)) {
       return refuse(REASONS.couldNotDecide(REASONS.notAHook), COMMANDS.status);
     }
     root = repoRoot(cwd);

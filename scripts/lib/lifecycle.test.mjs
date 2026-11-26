@@ -126,6 +126,8 @@ test('the dry run prints every action and writes nothing, in the tree, the hooks
   assert.equal(dry.status, 0, dry.stderr);
   const planned = plan(repo.root);
   assert.equal(dry.stdout, `${[...planLines(planned, { dryRun: true }), TEXT.dryRunEnd(applyCommand(repo.root))].join('\n')}\n`);
+  assert.ok(lines(dry.stdout).includes(`  - ${TEXT.writeManifest}`), 'the manifest is among what it would write');
+  assert.equal(TEXT.writeManifest, 'write .claude/kh-orchestration.manifest.json, the record of every write above, from which uninstall works');
   assert.deepEqual({ tree: listing(repo.root) }, before);
   assert.equal(existsSync(stateDir(repo.root)), false);
 });
@@ -520,4 +522,18 @@ test('I5: apply --yes with a changed extension.mjs takes the entry out (tool cal
     TEXT.moduleKept('m'),
     'm is kept as it is: it is not the file kh-orchestration wrote, and kh-orchestration never overwrites a change it did not make. kh-orchestration\'s entry is kept out of .claude/kh-harness/extensions.json, since an entry naming other bytes than its module makes kh-harness block every tool call: tool calls work, but the commit gate refuses every commit until the module and the entry are restored together from HEAD and apply is run again.',
   );
+});
+
+test('uninstall --yes of a committed install says how to commit the removal, which then leaves the tree clean, and what other worktrees keep', () => {
+  const repo = fresh();
+  assert.equal(run('apply', [repo.root, '--yes']).status, 0);
+  assert.equal(git(repo.root, 'add', '-A').status, 0);
+  assert.equal(git(repo.root, '-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-m', 'install').status, 0);
+  const done = run('uninstall', [repo.root, '--yes', '--state']);
+  assert.equal(done.status, 0, done.stderr);
+  assert.deepEqual(lines(done.stdout).slice(-3), [TEXT.uninstalled(repo.root), TEXT.commitRemoval(repo.root), TEXT.otherWorktrees]);
+  const step = TEXT.commitRemoval(repo.root).slice(TEXT.commitRemoval(repo.root).indexOf('git -C '));
+  const committed = shell(step, { cwd: repo.root });
+  assert.equal(committed.status, 0, committed.stderr);
+  assert.equal(porcelain(repo.root), '');
 });

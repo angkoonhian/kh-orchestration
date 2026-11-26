@@ -5,8 +5,8 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFile
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, sep } from 'node:path';
-import { shellWord } from './extension.mjs';
-import { hashesTo, objectMismatchMessage } from './ko-digest.mjs';
+import { INSTALL_PATHS, shellWord } from './extension.mjs';
+import { OBJECT_ID_SOURCE as OBJECT_ID, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { commonDir, listEntries, readBlobs } from './ko-git.mjs';
 
 export class StateError extends Error {
@@ -63,11 +63,13 @@ export const shapeMessage = (name) =>
 // update. Only the owner writes them, one command at a time in practice.
 const STATE_NAMES = new Set(['approvals.json', 'waivers.json', 'exemptions.json', 'proposals.json']);
 // `verdicts/<tree>-<base>.json`: the one sub-path a state name may have (decision 5).
-const OBJECT_ID = '(?:[0-9a-f]{40}|[0-9a-f]{64})';
 const VERDICT_NAME = new RegExp(`^verdicts/${OBJECT_ID}-(?:${OBJECT_ID}|none)\\.json$`);
-const INFLIGHT_NAME = /^inflight-[1-9][0-9]{0,9}\.json$/;
+// The id of a git process as a hook passes it ($PPID): digits, no leading zero. The one definition.
+const PID_SOURCE = '[1-9][0-9]{0,9}';
+const PID = new RegExp(`^${PID_SOURCE}$`);
+export const isProcessId = (text) => typeof text === 'string' && PID.test(text);
+const INFLIGHT_NAME = new RegExp(`^inflight-${PID_SOURCE}\\.json$`);
 const ACCEPTED_NAME = new RegExp(`^accepted/${OBJECT_ID}\\.json$`);
-const PID = /^[1-9][0-9]{0,9}$/;
 const OFF_FILE = 'off';
 const JOURNAL_FILE = 'journal.jsonl';
 
@@ -209,7 +211,7 @@ export const readWaivers = (root) => readList(root, 'waivers.json', 'waivers', w
 export const readProposals = (root) => readList(root, 'proposals.json', 'worktrees', proposalHasShape);
 
 function inflightName(pid) {
-  if (typeof pid !== 'string' || !PID.test(pid)) throw new StateError(invalidPidMessage);
+  if (!isProcessId(pid)) throw new StateError(invalidPidMessage);
   return `inflight-${pid}.json`;
 }
 
@@ -337,8 +339,9 @@ export const agentCommand = (root, words) => `node ${shellWord(join(root, '.clau
 // What kh-orchestration's installer writes in the working tree, staged in one command (after Task
 // 9's second re-review): staged one file at a time, an extension entry and its module could be
 // split by an ordinary git restore, and kh-harness would then block every tool call. apply's
-// closing text, the gate's next step and status name this one list.
-export const INSTALL_PATHS = Object.freeze(['.claude/kh-orchestration', '.claude/kh-orchestration.manifest.json', '.claude/kh-harness/extensions.json', '.gitattributes']);
+// closing text, the gate's next step, status and the extension's messages name this one list,
+// defined in extension.mjs, which can import nothing.
+export { INSTALL_PATHS };
 // The command staging them: in the current directory (the worktree's top, as a hook's next lines
 // read), or with `rootWord` (a path already quoted for a shell) for git -C.
 // Said wherever the step is printed (after Task 9's third re-review): the whole .gitattributes is staged.

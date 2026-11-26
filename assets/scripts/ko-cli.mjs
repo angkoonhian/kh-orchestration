@@ -232,7 +232,7 @@ export const TEXT = Object.freeze({
   hooksPath: (value, scope) => `core.hooksPath is set to ${shownName(value)} in the ${scope} git configuration, so git runs no hook from the repository's hooks directory and the commit gate is off for every commit.`,
   oldGit: (version) => `git ${shownName(version)} is older than 2.30, the oldest git kh-orchestration works with. Install git 2.30 or later.`,
   unknownGit: 'The version of git could not be read.',
-  staleInflight: (pids) => `In-flight records of git processes that have ended are left: ${named(pids)}. The next gate run, approve or apply removes them.`,
+  staleInflight: (pids) => `In-flight records of git processes that have ended are left: ${named(pids)}. They are harmless; the next run of the officers, commit attempt, approve or apply removes them.`,
 });
 
 // The next command after a filter-driver refusal: where each driver is set.
@@ -448,6 +448,8 @@ async function run(root) {
   // Never a command that stages everything (after Task 9's re-review): an unignored
   // settings.local.json would go into the tree the owner approves.
   if (untidy.length > 0) return refusal(TEXT.untidy(untidy), `git -C ${shellWord(root)} add -- <each path meant to be committed>, then ${agentCommand(root, 'run')}`);
+  // As the gate does on every run: records of git processes that ended before their branch update.
+  removeStaleInflight(root);
   const tree = indexTree(root);
   const branch = currentBranch(root);
   const read = officersOfTree(root, tree);
@@ -749,7 +751,7 @@ export function statusOf(root) {
   const waivers = attempt(problems, root, () => waiversOf(root, branch), null);
   const records = attempt(problems, root, () => listInflight(root), []);
   const inflight = { live: records.filter((record) => record.live).map((record) => record.pid), stale: records.filter((record) => !record.live).map((record) => record.pid) };
-  if (inflight.stale.length > 0) problems.push({ text: TEXT.staleInflight(inflight.stale), next: agentCommand(root, 'status') });
+  if (inflight.stale.length > 0) problems.push({ text: TEXT.staleInflight(inflight.stale), next: agentCommand(root, 'run') });
 
   const bin = attempt(problems, root, () => binOf(root, binSourceOf(root)), null);
   if (bin !== null) problems.push(...binProblems(root, bin));

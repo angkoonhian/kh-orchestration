@@ -5,7 +5,7 @@
 // shared state directory goes only with --state. A dry run unless --yes, and --yes is the owner's
 // alone (decision 13, after Task 9's review): it refuses inside a Claude Code session, since
 // removing the hooks switches the commit gate off. Exit 0 done, 1 refused, 2 usage. The logic is scripts/lib/install.mjs's.
-import { TEXT, applyUninstall, ownerRefusal, parseArguments, print, refuse, runCommand, uninstallLines, uninstallPlan, usageError } from './lib/install.mjs';
+import { TEXT, applyUninstall, ownerRefusal, parseArguments, print, refuse, runCommand, uninstallLines, uninstallPlan, uninstalledLines, usageError } from './lib/install.mjs';
 
 function main(argv) {
   const args = parseArguments(argv, ['--yes', '--state']);
@@ -28,7 +28,7 @@ function main(argv) {
   }
   const result = applyUninstall(planned.root, planned);
   if (result.refusal !== null) return refuse([result.refusal]);
-  print([TEXT.uninstalled(planned.root)]);
+  print(uninstalledLines(planned.root));
   return 0;
 }
 

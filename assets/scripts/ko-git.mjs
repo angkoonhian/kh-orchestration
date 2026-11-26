@@ -4,6 +4,12 @@ import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+// The characters that can make a terminal show other text than a name or a path from git holds:
+// every control (C0, C1, DEL), format (the zero-width and bidi characters among them), line and
+// paragraph separator, and U+2065, unassigned in the bidi block. The one definition: the gate's and
+// ko.mjs's texts show them as \u{…} (ko-gate's `visible`), and so does the session brief.
+export const UNSHOWABLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u2065]/gu;
+
 export const SPAWN_FAILED = 'git could not be started.';
 export const OUTPUT_TOO_LARGE = 'git produced more output than can be read.';
 export const notBlobMessage = (path) => `${path} is in the tree but is not a file.`;

@@ -61,6 +61,7 @@ const refused = (clause) => `kh-orchestration is installed here, but ${clause}, 
 const unchecked = (clause) => `kh-orchestration is installed here, but ${clause}, so git does not run the commit gate here and commits are NOT being checked; only the owner can fix this (ask them to run the plugin's apply).`;
 const unsure = (clause) => `kh-orchestration is installed here, but ${clause}. ${FIX}`;
 const SCRIPTS_MISSING = `kh-orchestration is installed here, but its approved scripts are missing from the git directory, so commits may be refused. ${FIX}`;
+const BIN_MISSING = `kh-orchestration is installed here, but its approved scripts are missing from the git directory, so every commit here will be refused. ${FIX}`;
 const CONTRACT = 'kh-harness\'s contract with this plugin does not hold here';
 const OFF = 'kh-orchestration is switched off for this repository by its owner: commits here are not being checked.';
 
@@ -198,14 +199,14 @@ test('a problem that makes the gate refuse is said to refuse, and the commit is 
   }
 });
 
-test('with bin/ gone the brief says the approved scripts are missing, imports nothing, and the commit is refused', () => {
+test('with bin/ gone the brief says the approved scripts are missing and every commit will be refused, imports nothing, and the commit is refused', () => {
   const repo = installed();
   rmSync(join(stateDir(repo.root), 'bin'), { recursive: true });
-  check(repo.root, SCRIPTS_MISSING);
+  check(repo.root, BIN_MISSING);
   const committed = commitOf(repo.root);
   assert.equal(committed.status, 1);
   assert.ok(committed.stderr.includes(REFUSED_TEXT), committed.stderr);
-  // Only the approved copy is missing; the same sentence, whatever else is in bin/.
+  // Only the approved copy of ko-cli.mjs is missing: commits may be refused, whatever else is in bin/.
   const other = installed();
   rmSync(join(stateDir(other.root), 'bin', 'ko-cli.mjs'));
   check(other.root, SCRIPTS_MISSING);
