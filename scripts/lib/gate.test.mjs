@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXTENSION_MODULE, KIT_VERSION, installGate, makeRepo, testEnv } from './test-repo.mjs';
+import { envPath } from './install.mjs';
 import {
   OFFICERS_PATH, approve, approveTree, commit, gitIn, head, headOrNull, installed, ko, officersFile, owner, repos, runAndApprove, stage, subject,
 } from './gate-fixture.mjs';
@@ -562,12 +563,7 @@ const ALLOWED = [
   'PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_PREFIX', 'GIT_EXEC_PATH', 'GIT_EDITOR',
   'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE', 'GIT_REFLOG_ACTION', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
 ];
-const ENV_PATH = (() => {
-  for (const dir of (process.env.PATH ?? '').split(':')) {
-    if (dir.startsWith('/') && existsSync(join(dir, 'env'))) return join(dir, 'env');
-  }
-  return '/usr/bin/env';
-})();
+const ENV_PATH = envPath();
 const startNode = (hook) => `'${ENV_PATH}' -i ${ALLOWED.map((name) => `\${${name}+"${name}=$${name}"}`).join(' ')} '${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" ${hook} "$PPID"`;
 const HOOK_COMMENT = [
   '# Node starts through env -i with only these variables, each passed only if set: PATH, HOME, TMPDIR,',
