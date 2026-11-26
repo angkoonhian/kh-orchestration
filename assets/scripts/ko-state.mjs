@@ -337,8 +337,9 @@ const PREFLIGHT_TIMEOUT_MS = 30_000;
 // Whether the copy in `dir` loads, before it becomes bin/ (after Task 7's second review): an
 // approved script that does not parse, or a missing sibling, would otherwise stop the hooks and the
 // owner's commands at once, with approve itself among them. Each check runs this process's Node, in
-// `dir`, with an empty environment. Throws binPreflightMessage(<the script>) on the first failure.
-function preflight(dir, names) {
+// `dir`, with an empty environment. Throws a StateError of failedMessage(<the script>) on the first
+// failure.
+function preflight(dir, names, failedMessage) {
   const run = (argv) => spawnSync(process.execPath, argv, { cwd: dir, env: {}, encoding: 'utf8', timeout: PREFLIGHT_TIMEOUT_MS });
   const loaded = run(['--input-type=module', '-e', PREFLIGHT, dir, ...names.filter((name) => !ENTRIES.includes(name))]);
   let report;
@@ -347,23 +348,19 @@ function preflight(dir, names) {
   } catch {
     report = {};
   }
-  if (loaded.status !== 0 || typeof report.gateText !== 'string') throw new StateError(binPreflightMessage(report.failed ?? 'ko-gate.mjs'));
+  if (loaded.status !== 0 || typeof report.gateText !== 'string') throw new StateError(failedMessage(report.failed ?? 'ko-gate.mjs'));
   const help = run([join(dir, 'ko.mjs'), '--help']);
-  if (help.status !== 0 || !help.stdout.startsWith('usage: ') || help.stderr !== '') throw new StateError(binPreflightMessage('ko.mjs'));
+  if (help.status !== 0 || !help.stdout.startsWith('usage: ') || help.stderr !== '') throw new StateError(failedMessage('ko.mjs'));
   const gate = run([join(dir, 'gate.mjs'), 'not-a-hook', '1']);
-  if (gate.status !== 1 || gate.stdout !== '' || gate.stderr !== report.gateText) throw new StateError(binPreflightMessage('gate.mjs'));
+  if (gate.status !== 1 || gate.stdout !== '' || gate.stderr !== report.gateText) throw new StateError(failedMessage('gate.mjs'));
 }
 
 /**
  * Replaces <state>/bin/ with the scripts of `tree` (decision 19): every `.mjs` file directly in
  * `.claude/kh-orchestration/scripts/`, each read from the object store and verified against its
- * object id. The new directory is written beside bin/ in full and checked to load (preflight),
- * then renamed into place, so a hook never finds a bin/ holding some files of one tree and some
- * of another, nor one that cannot start: it finds the old bin/, the new one, or (for the instant
- * between the two renames, or after a kill there) none, which the hooks refuse on. A tree without
- * gate.mjs or ko.mjs, an entry that is not a regular file, a blob that does not hash to its id, or
- * a copy that does not load leaves bin/ as it was and throws a StateError; a failed read throws
- * what ko-git throws. Called by `approve`, and by `apply` (Task 9), which so gets the same check.
+ * object id, written as replaceBin writes. A tree without gate.mjs or ko.mjs, an entry that is not
+ * a regular file, a blob that does not hash to its id, or a copy that does not load leaves bin/ as
+ * it was and throws a StateError; a failed read throws what ko-git throws. Called by `approve`.
  */
 export function refreshBin(root, tree) {
   const scripts = binEntriesOf(root, tree);
@@ -373,7 +370,20 @@ export function refreshBin(root, tree) {
   const blobs = readBlobs(root, scripts.map((entry) => entry.oid));
   const mismatch = scripts.find((entry) => !hashesTo(entry.oid, blobs.get(entry.oid)));
   if (mismatch !== undefined) throw new StateError(objectMismatchMessage(mismatch.path));
+  replaceBin(root, scripts.map((entry) => ({ name: entry.path.slice(SCRIPTS_DIR.length), bytes: blobs.get(entry.oid) })), binPreflightMessage);
+}
 
+/**
+ * Replaces <state>/bin/ with `files`, `[{ name, bytes }]`, which must hold gate.mjs and ko.mjs.
+ * The new directory is written beside bin/ in full and checked to load (preflight), then renamed
+ * into place, so a hook never finds a bin/ holding some files of one copy and some of another, nor
+ * one that cannot start: it finds the old bin/, the new one, or (for the instant between the two
+ * renames, or after a kill there) none, which the hooks refuse on. A copy that does not load leaves
+ * bin/ as it was and throws a StateError of failedMessage(<the script>); one that cannot be
+ * written, a StateError of writeFailedMessage. Called by refreshBin, and by apply (Task 9) with the
+ * plugin's own scripts, which so get the same check.
+ */
+export function replaceBin(root, files, failedMessage) {
   const dir = stateDir(root);
   const bin = join(dir, BIN);
   const stem = join(dir, `${BIN}.${process.pid}.${randomUUID()}`);
@@ -383,13 +393,13 @@ export function refreshBin(root, tree) {
     mkdirSync(dir, { recursive: true });
     for (const name of readdirSync(dir).filter((entry) => BIN_LEFTOVER.test(entry))) rmSync(join(dir, name), { recursive: true, force: true });
     mkdirSync(fresh);
-    for (const entry of scripts) writeFileSync(join(fresh, entry.path.slice(SCRIPTS_DIR.length)), blobs.get(entry.oid));
+    for (const file of files) writeFileSync(join(fresh, file.name), file.bytes);
   } catch {
     rmSync(fresh, { recursive: true, force: true });
     throw new StateError(writeFailedMessage(BIN));
   }
   try {
-    preflight(fresh, scripts.map((entry) => entry.path.slice(SCRIPTS_DIR.length)).sort());
+    preflight(fresh, files.map((file) => file.name).sort(), failedMessage);
   } catch (error) {
     rmSync(fresh, { recursive: true, force: true });
     throw error;

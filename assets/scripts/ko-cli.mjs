@@ -81,7 +81,7 @@ const APPLY = (root) => repairCommand(shellWord(root));
 // path, quoted for a shell, so it runs from whatever directory the person is in (a subdirectory, a
 // linked worktree). COMMANDS stays root-relative for the gate's own texts, which a hook prints
 // with its working directory at the worktree's top, and for the extension's.
-const agentCommand = (root, words) => `node ${shellWord(join(root, SCRIPTS, 'ko.mjs'))} ${words}`;
+export const agentCommand = (root, words) => `node ${shellWord(join(root, SCRIPTS, 'ko.mjs'))} ${words}`;
 const AGENT_WORDS = new Map(Object.values(COMMANDS).map((command) => [command, command.slice(KO.length + 1)]));
 // A next line from the gate's texts, in that rule when it is one of COMMANDS.
 const localNext = (root, next) => (AGENT_WORDS.has(next) ? agentCommand(root, AGENT_WORDS.get(next)) : next);
@@ -500,7 +500,8 @@ function binProblems(root, bin) {
 }
 
 // The effective core.hooksPath across every level, `{ value, scope }`, or null when it is not set.
-function hooksPathOf(root) {
+// apply (Task 9) refuses on it with the same unset command.
+export function hooksPathOf(root) {
   const result = git(root, ['config', '--show-scope', '--get', 'core.hooksPath']);
   if (result.status === 1) return null;
   if (result.status !== 0) throw new GitError(gitFailedMessage('read the git configuration'));
@@ -510,10 +511,11 @@ function hooksPathOf(root) {
 }
 
 const UNSET_BY_SCOPE = { local: '--local', global: '--global', system: '--system', worktree: '--worktree' };
-const hooksPathNext = (scope) => (Object.hasOwn(UNSET_BY_SCOPE, scope) ? `git config ${UNSET_BY_SCOPE[scope]} --unset core.hooksPath` : 'git config --show-origin --get core.hooksPath');
+export const hooksPathNext = (scope) => (Object.hasOwn(UNSET_BY_SCOPE, scope) ? `git config ${UNSET_BY_SCOPE[scope]} --unset core.hooksPath` : 'git config --show-origin --get core.hooksPath');
 
-function gitVersion(root) {
-  const result = git(root, ['version']);
+// `{ version, supported }` of the git that runs in `cwd`; version null when it cannot be read.
+export function gitVersion(cwd) {
+  const result = git(cwd, ['version']);
   const match = result.status === 0 ? result.stdout.match(/^git version (\d+)\.(\d+)(\S*)/) : null;
   if (match === null) return { version: null, supported: false };
   const [major, minor] = [Number(match[1]), Number(match[2])];

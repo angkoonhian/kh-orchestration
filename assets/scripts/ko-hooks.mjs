@@ -35,24 +35,28 @@ const HOOK_COMMENT = [
   '# them. Nothing else reaches node: no NODE_*, no LD_*, no BASH_*.',
 ];
 const REFUSED_LINE = 'echo "kh-orchestration: the commit gate did not allow this commit." >&2';
-const GATE = '"$d/kh-orchestration/bin/gate.mjs"';
+const gateAt = (dir) => `"$${dir}/kh-orchestration/bin/gate.mjs"`;
 
 // A word sh reads as itself, in single quotes.
 const shQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
 const unquote = (word) => word.slice(1, -1).replaceAll("'\\''", "'");
 const QUOTED = "'[^']*'(?:\\\\''[^']*')*";
 
+// The pieces both forms share, for a common directory held in the variable `dir`: the builtin read
+// that refuses a gate that cannot be opened, and node started through env -i with the allowlist.
+const readGate = (dir) => `{ read -r _ < ${gateAt(dir)}; } 2>/dev/null`;
+const startNode = (hook, { env, node }, dir) => `${shQuote(env)} -i ${HOOK_ENV.map((name) => `\${${name}+"${name}=$${name}"}`).join(' ')} ${shQuote(node)} ${gateAt(dir)} ${hook} "$PPID"`;
+
 /**
  * The exact text of hook `hook` (one of HOOK_NAMES) for the kit `version`, starting node through
  * the absolute `env` and the absolute `node` given.
  */
 export function hookText(hook, { env, node, version }) {
-  const allowlist = HOOK_ENV.map((name) => `\${${name}+"${name}=$${name}"}`).join(' ');
   const gate = [
     '# A gate that cannot be read refuses here, before node could print a trace; read, a builtin no',
     '# function can replace under sh -p, fails on a directory where a bare redirection would not.',
-    `{ read -r _ < ${GATE}; } 2>/dev/null || { ${REFUSED_LINE}; exit 1; }`,
-    `if out=$(${shQuote(env)} -i ${allowlist} ${shQuote(node)} ${GATE} ${hook} "$PPID"); then`,
+    `${readGate('d')} || { ${REFUSED_LINE}; exit 1; }`,
+    `if out=$(${startNode(hook, { env, node }, 'd')}); then`,
     "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
     'fi',
     REFUSED_LINE,
@@ -72,6 +76,21 @@ export function hookText(hook, { env, node, version }) {
     'done',
     ...gate,
   ].join('\n');
+}
+
+/**
+ * The one line that runs the gate as hook `hook` would, for a hook file that is someone else's
+ * (apply, Task 9, prints it when it finds one): added directly after that file's first line, it
+ * refuses (exit 1, the fixed line) unless the gate allows, and otherwise lets the rest of the file
+ * run. It must stand in <git-common-dir>/hooks/, as the hooks do. Its variables are prefixed ko_ so
+ * that it changes none of the file's own; for reference-transaction it starts node only in the
+ * prepared state of a git process that has an in-flight record, and must come before anything that
+ * reads standard input.
+ */
+export function hookLine(hook, { env, node }) {
+  const check = `${readGate('ko_d')} && ko_out=$(${startNode(hook, { env, node }, 'ko_d')}) && case $ko_out in 'kh-orchestration: allowed') ;; *) (exit 1) ;; esac || { ${REFUSED_LINE}; exit 1; }`;
+  if (hook !== 'reference-transaction') return `ko_d=\${0%/hooks/*}; ${check}`;
+  return `case $1 in prepared) ko_d=\${0%/hooks/*}; for ko_f in "$ko_d/kh-orchestration/inflight-$PPID".jso[n]; do case $ko_f in *'.jso[n]') ;; *) ${check} ;; esac; done ;; esac`;
 }
 
 const HEADER = /^#!\/bin\/sh -p\n# kh-orchestration (\S+) (\S+)\. Do not edit\.\n/;

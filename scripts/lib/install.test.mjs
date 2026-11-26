@@ -1,0 +1,607 @@
+// The installer's logic (Task 9) called in-process, as the three commands call it: what `plan`
+// refuses and proposes, what `applyPlan` writes and records, how it shares the extensions file
+// (Review Focus 4), what it keeps, a kill after each of its writes, and its self-test. The
+// commands themselves, end to end through real git, are lifecycle.test.mjs's.
+import { test, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { KIT_VERSION, installKhHarness, isolateProcessEnv, makeRepo, testEnv } from './test-repo.mjs';
+import {
+  ATTRIBUTES_LINE, EXTENSIONS_PATH, OFFICERS_PATH, SCRIPTS_DIR, SCRIPT_NAMES, TEXT, applyCommand, applyPlan, applyUninstall, coverageOf, envPath, khHarnessApply,
+  plan, shippedScripts, uninstallPlan,
+} from './install.mjs';
+import { MANIFEST_PATH, readManifest } from './manifest.mjs';
+import { HOOK_NAMES, hookLine, hookText } from '../../assets/scripts/ko-hooks.mjs';
+import { TEXT as KO_TEXT } from '../../assets/scripts/ko-cli.mjs';
+import { checkContract1, lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
+import { ownEntry } from '../../assets/scripts/ko-contract.mjs';
+import { stateDir, writeInflight } from '../../assets/scripts/ko-state.mjs';
+import { shellWord } from '../../assets/scripts/extension.mjs';
+
+isolateProcessEnv();
+// The in-process calls run git with this process's environment: no user or system configuration.
+process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+process.env.GIT_CONFIG_NOSYSTEM = '1';
+const repos = [];
+const scratch = [];
+after(() => {
+  for (const repo of repos) repo.cleanup();
+  for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+});
+
+// A repository with kh-harness installed and committed, as an owner has it before installing kh-orchestration.
+function fresh({ baseBranch = 'main', files = {} } = {}) {
+  const repo = makeRepo({ baseBranch, files });
+  repos.push(repo);
+  installKhHarness(repo.root);
+  repo.commitAll('kh-harness');
+  return repo;
+}
+const hooksDir = (root) => join(root, '.git', 'hooks');
+const read = (root, path) => readFileSync(join(root, path), 'utf8');
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const entryOf = () => {
+  const bytes = shippedScripts().find((script) => script.name === 'extension.mjs').bytes;
+  return { id: 'kh-orchestration', version: KIT_VERSION, module: `${SCRIPTS_DIR}/extension.mjs`, sha256: lfSha256(bytes), onFailure: 'block' };
+};
+const OTHER = { id: 'other-plugin', version: '2.0.0', module: '.claude/other/ext.mjs', sha256: 'a'.repeat(64), onFailure: 'block' };
+
+// Everything under `dir` and its bytes, so a run can be shown to have written nothing.
+function listing(dir) {
+  if (!existsSync(dir)) return {};
+  const walk = (relative) => readdirSync(join(dir, relative), { withFileTypes: true }).flatMap((entry) => {
+    const path = relative === '' ? entry.name : `${relative}/${entry.name}`;
+    if (entry.isDirectory()) return [[`${path}/`, ''], ...walk(path)];
+    const stat = lstatSync(join(dir, path));
+    return [[path, `${(stat.mode & 0o777).toString(8)} ${entry.isSymbolicLink() ? 'link' : sha256(readFileSync(join(dir, path)))}`]];
+  });
+  return Object.fromEntries(walk(''));
+}
+const everything = (root) => ({ tree: listing(root), common: listing(join(root, '.git')) });
+
+const refusalsOf = (dir) => plan(dir).refusals;
+
+// Leaves an install as an older kit (0.0.9) would have: every script stamped 0.0.9 with other
+// bytes and recorded as written so, and the extension entry naming that module, changed in the
+// extensions file where it stands.
+function ageInstall(root) {
+  const manifest = readManifest(root).manifest;
+  for (const name of SCRIPT_NAMES) {
+    const path = join(root, SCRIPTS_DIR, name);
+    const older = readFileSync(path, 'utf8').replace(`kh-orchestration ${KIT_VERSION}.`, 'kh-orchestration 0.0.9.');
+    writeFileSync(path, `${older}// 0.0.9\n`);
+    manifest.files.find((file) => file.path === `${SCRIPTS_DIR}/${name}`).sha256 = sha256(readFileSync(path));
+  }
+  const oldEntry = { ...entryOf(), version: '0.0.9', sha256: lfSha256(readFileSync(join(root, SCRIPTS_DIR, 'extension.mjs'))) };
+  const extensions = join(root, EXTENSIONS_PATH);
+  writeFileSync(extensions, readFileSync(extensions, 'utf8').replace(entryOf().sha256, oldEntry.sha256).replace(new RegExp(`("version":\\s*)"${KIT_VERSION.replaceAll('.', '\\.')}"`), '$1"0.0.9"'));
+  manifest.extensionEntry.sha256 = oldEntry.sha256;
+  manifest.kitVersion = '0.0.9';
+  writeFileSync(join(root, MANIFEST_PATH), `${JSON.stringify(manifest, null, 2)}\n`);
+  return oldEntry;
+}
+
+test('the installed scripts are the fourteen files of assets/scripts, each stamped once with this kit\'s version', () => {
+  const assets = readdirSync(new URL('../../assets/scripts/', import.meta.url)).filter((name) => name.endsWith('.mjs')).sort();
+  assert.deepEqual([...SCRIPT_NAMES].sort(), assets);
+  assert.equal(SCRIPT_NAMES.length, 14);
+  for (const { name, bytes } of shippedScripts()) {
+    const text = bytes.toString('utf8');
+    const [first, second] = text.split('\n');
+    assert.equal(first, `// Generated by kh-orchestration ${KIT_VERSION}. Do not edit.`, name);
+    assert.ok(!second.startsWith('// Generated by kh-orchestration'), `${name} is stamped once`);
+  }
+});
+
+test('envPath is the first of /usr/bin/env and /bin/env that is an executable file, never one found through PATH', () => {
+  const expected = ['/usr/bin/env', '/bin/env'].find((path) => spawnSync('test', ['-x', path]).status === 0 && statSync(path).isFile());
+  assert.equal(envPath(), expected ?? null);
+});
+
+test('plan refuses, before anything is written, a directory that is not a directory or not inside a git working tree', () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ko-install-')));
+  scratch.push(dir);
+  const missing = join(dir, 'missing');
+  assert.deepEqual(refusalsOf(missing), [{ text: TEXT.notADirectory(missing), next: TEXT.usage('apply') }]);
+  assert.deepEqual(refusalsOf(dir), [{ text: TEXT.notARepository(dir), next: `git -C ${shellWord(dir)} init` }]);
+  assert.equal(TEXT.notARepository('/x'), '/x is not inside a git working tree, so there is nothing to install kh-orchestration into.');
+});
+
+test('plan refuses without a kh-harness contract file, with a contract other than 1, and when contract 1 would not hold once the entry is written', () => {
+  const bare = makeRepo();
+  repos.push(bare);
+  assert.deepEqual(refusalsOf(bare.root), [{ text: TEXT.noContract, next: khHarnessApply(bare.root) }]);
+  assert.equal(TEXT.noContract, '.claude/kh-harness/contract.json is missing: kh-orchestration relies on kh-harness contract 1, so kh-harness 0.3.0 or later must be installed first.');
+
+  const repo = fresh();
+  const contractPath = join(repo.root, '.claude/kh-harness/contract.json');
+  const contract = readFileSync(contractPath, 'utf8');
+  writeFileSync(contractPath, `${JSON.stringify({ ...JSON.parse(contract), contract: 2 }, null, 2)}\n`);
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.wrongContract('2'), next: khHarnessApply(repo.root) }]);
+  writeFileSync(contractPath, contract);
+
+  // The PreToolUse registration missing: a problem that does not go away once the entry is written.
+  const settingsPath = join(repo.root, '.claude/settings.json');
+  const settings = readFileSync(settingsPath, 'utf8');
+  writeFileSync(settingsPath, `${JSON.stringify({ ...JSON.parse(settings), hooks: {} }, null, 2)}\n`);
+  const problem = '.claude/settings.json does not register .claude/scripts/dispatch-pre-tool.mjs on PreToolUse for every tool call, as apply writes it';
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.contractWouldFail(problem), next: khHarnessApply(repo.root) }]);
+  // Registered, but not exactly: a timeout on the hook object.
+  const loose = JSON.parse(settings);
+  loose.hooks.PreToolUse[0].hooks[0].timeout = 5;
+  writeFileSync(settingsPath, `${JSON.stringify(loose, null, 2)}\n`);
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.contractWouldFail(problem), next: khHarnessApply(repo.root) }]);
+  writeFileSync(settingsPath, settings);
+
+  // A kh-harness script changed since its contract file was written.
+  writeFileSync(join(repo.root, '.claude/scripts/harness-dispatch.mjs'), '// changed\n');
+  assert.deepEqual(refusalsOf(repo.root), [{
+    text: TEXT.contractWouldFail('.claude/scripts/harness-dispatch.mjs is not the file contract 1 speaks for'), next: khHarnessApply(repo.root),
+  }]);
+  assert.equal(TEXT.contractWouldFail('x'), 'kh-harness contract 1 would not hold for kh-orchestration\'s extension even once its entry is written: x. kh-orchestration relies on the extension, so nothing is installed.');
+});
+
+test('plan refuses a .claude that is a link, an extensions file it cannot read, and one that lists eight entries without kh-orchestration\'s', () => {
+  const repo = fresh();
+  const elsewhere = join(repo.root, '..', 'elsewhere');
+  cpSync(join(repo.root, '.claude'), elsewhere, { recursive: true });
+  rmSync(join(repo.root, '.claude'), { recursive: true });
+  symlinkSync(elsewhere, join(repo.root, '.claude'));
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.isLink('.claude'), next: `ls -ld ${shellWord(join(repo.root, '.claude'))}` }]);
+  rmSync(join(repo.root, '.claude'));
+  cpSync(elsewhere, join(repo.root, '.claude'), { recursive: true });
+
+  const extensions = join(repo.root, EXTENSIONS_PATH);
+  const malformed = [
+    ['﻿[]\n', 'it is not JSON'],
+    ['{}\n', 'it is not a JSON array'],
+    [`${JSON.stringify([{ ...OTHER, extra: 1 }])}\n`, 'entry 1 is not an extension entry as docs/CONTRACT.md describes one'],
+    [`${JSON.stringify([OTHER, OTHER])}\n`, 'two entries share an id'],
+    [`${JSON.stringify([OTHER, { ...OTHER, id: 'other-two', module: OTHER.module.toUpperCase().replace('.CLAUDE', '.claude').replace('.MJS', '.mjs') }])}\n`, 'two entries share a module'],
+    [`${JSON.stringify([{ ...OTHER, module: '.claude/scripts/x.mjs' }])}\n`, 'entry 1 names a module under .claude/scripts/, where the kit keeps its own hooks'],
+    [`${JSON.stringify(Array.from({ length: 9 }, (_, index) => ({ ...OTHER, id: `p${index}`, module: `.claude/p${index}.mjs` })))}\n`, 'it lists more than 8 extensions'],
+    [`[${' '.repeat(65536)}]`, 'it is larger than 65536 bytes'],
+  ];
+  for (const [text, problem] of malformed) {
+    writeFileSync(extensions, text);
+    assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.extensionsMalformed(problem), next: `cat ${shellWord(extensions)}` }], problem);
+  }
+  rmSync(extensions);
+  mkdirSync(extensions);
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.extensionsMalformed('it is not a regular file'), next: `cat ${shellWord(extensions)}` }]);
+  rmSync(extensions, { recursive: true });
+
+  const eight = Array.from({ length: 8 }, (_, index) => ({ ...OTHER, id: `p${index}`, module: `.claude/p${index}.mjs` }));
+  writeFileSync(extensions, `${JSON.stringify(eight, null, 2)}\n`);
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.extensionsFull, next: `cat ${shellWord(extensions)}` }]);
+  assert.equal(TEXT.extensionsFull, '.claude/kh-harness/extensions.json lists 8 extensions already, the most kh-harness runs, and kh-orchestration never drops another plugin\'s entry to make room. Remove a plugin that registered one first.');
+});
+
+test('plan refuses an effective core.hooksPath at the local, global and worktree level, naming the level and the unset command, and changes no configuration', () => {
+  const repo = fresh();
+  assert.equal(repo.git('config', '--local', 'core.hooksPath', '/tmp/hooks-elsewhere').status, 0);
+  assert.deepEqual(refusalsOf(repo.root), [{
+    text: TEXT.hooksPath('/tmp/hooks-elsewhere', 'local'), next: `git -C ${shellWord(repo.root)} config --local --unset core.hooksPath`,
+  }]);
+  assert.equal(repo.git('config', '--local', 'core.hooksPath').stdout, '/tmp/hooks-elsewhere\n');
+  assert.equal(repo.git('config', '--local', '--unset', 'core.hooksPath').status, 0);
+
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'ko-home-')));
+  scratch.push(home);
+  writeFileSync(join(home, '.gitconfig'), '[core]\n\thooksPath = /dev/null\n');
+  const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+  process.env.HOME = home;
+  delete process.env.GIT_CONFIG_GLOBAL;
+  try {
+    assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.hooksPath('/dev/null', 'global'), next: `git -C ${shellWord(repo.root)} config --global --unset core.hooksPath` }]);
+  } finally {
+    process.env.HOME = saved.HOME;
+    if (saved.GIT_CONFIG_GLOBAL !== undefined) process.env.GIT_CONFIG_GLOBAL = saved.GIT_CONFIG_GLOBAL;
+  }
+
+  const worktree = repo.addWorktree('side');
+  assert.equal(repo.git('config', 'extensions.worktreeConfig', 'true').status, 0);
+  assert.equal(spawnSync('git', ['config', '--worktree', 'core.hooksPath', '.hooks'], { cwd: worktree, env: testEnv() }).status, 0);
+  assert.deepEqual(refusalsOf(worktree), [{ text: TEXT.hooksPath('.hooks', 'worktree'), next: `git -C ${shellWord(worktree)} config --worktree --unset core.hooksPath` }]);
+  assert.deepEqual(refusalsOf(repo.root), [], 'the main worktree has no core.hooksPath of its own');
+  assert.ok(TEXT.hooksPath('/x', 'local').startsWith(KO_TEXT.hooksPath('/x', 'local')));
+});
+
+test('plan refuses a git older than 2.30, a .gitattributes that is not a file, and a /bin/sh that does not accept -p', () => {
+  const repo = fresh();
+  assert.equal(TEXT.oldGit('2.29.0'), KO_TEXT.oldGit('2.29.0'));
+  mkdirSync(join(repo.root, '.gitattributes'));
+  assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.gitattributesNotFile, next: `ls -ld ${shellWord(join(repo.root, '.gitattributes'))}` }]);
+  rmSync(join(repo.root, '.gitattributes'), { recursive: true });
+  // A fake git that reports an old version: the check reads the version git itself prints.
+  const tools = realpathSync(mkdtempSync(join(tmpdir(), 'ko-tools-')));
+  scratch.push(tools);
+  const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  writeFileSync(join(tools, 'git'), `#!/bin/sh\ncase "$*" in *version*) echo "git version 2.29.2"; exit 0 ;; esac\nexec ${realGit} "$@"\n`);
+  chmodSync(join(tools, 'git'), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${tools}:${path}`;
+  try {
+    assert.deepEqual(refusalsOf(repo.root), [{ text: TEXT.oldGit('2.29.2'), next: 'git version' }]);
+  } finally {
+    process.env.PATH = path;
+  }
+});
+
+test('plan on a fresh kh-harness install proposes the scripts, officers.json, the .gitattributes line, the extension entry, bin/ and the three hooks, in that order, and writes nothing', () => {
+  const repo = fresh({ files: { 'package.json': `${JSON.stringify({ scripts: { test: 'node --test', build: 'x', lint: 'eslint .' } })}\n` } });
+  repo.commitAll('package');
+  const before = everything(repo.root);
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.refusals, []);
+  assert.deepEqual(planned.conflicts, []);
+  assert.deepEqual(planned.actions.map((action) => [action.kind, action.path]), [
+    ...SCRIPT_NAMES.map((name) => ['file', `${SCRIPTS_DIR}/${name}`]),
+    ['file', OFFICERS_PATH],
+    ['patch', '.gitattributes'],
+    ['extension-entry', EXTENSIONS_PATH],
+    ['state-copy', join(stateDir(repo.root), 'bin')],
+    ...HOOK_NAMES.map((name) => ['git-hook', join(hooksDir(repo.root), name)]),
+  ]);
+  assert.deepEqual(everything(repo.root), before, 'the plan wrote nothing');
+  const officers = JSON.parse(planned.actions.find((action) => action.path === OFFICERS_PATH).bytes.toString('utf8'));
+  assert.deepEqual(officers, {
+    schema: 1,
+    baseBranch: 'main',
+    protected: [],
+    officers: ['lint', 'test'].map((id) => ({ id, rule: null, argv: ['npm', 'run', id], appliesTo: ['**'] })),
+  });
+  assert.deepEqual(planned.notes.slice(0, 2), [TEXT.baseBranchMain, TEXT.officersFound(['lint', 'test'])]);
+});
+
+test('officers.json names the base branch main, else master, else the current branch, and holds no officer without a package.json or with an unreadable one', () => {
+  const master = fresh({ baseBranch: 'master' });
+  const planned = plan(master.root);
+  assert.equal(JSON.parse(planned.actions.find((action) => action.path === OFFICERS_PATH).bytes).baseBranch, 'master');
+  assert.deepEqual(planned.notes.slice(0, 2), [TEXT.baseBranchMaster, TEXT.noPackageJson]);
+
+  const trunk = fresh({ baseBranch: 'trunk', files: { 'package.json': '{ not json' } });
+  const onTrunk = plan(trunk.root);
+  const officers = JSON.parse(onTrunk.actions.find((action) => action.path === OFFICERS_PATH).bytes);
+  assert.equal(officers.baseBranch, 'trunk');
+  assert.deepEqual(officers.officers, []);
+  assert.deepEqual(onTrunk.notes.slice(0, 2), [TEXT.baseBranchCurrent('trunk'), TEXT.packageJsonUnreadable]);
+  assert.equal(TEXT.baseBranchCurrent('trunk'), 'officers.json names trunk, the current branch, as the base branch: the repository has no branch main or master. Change baseBranch in .claude/kh-orchestration/officers.json before approving if another branch is the base.');
+
+  const owned = fresh();
+  owned.write(OFFICERS_PATH, '{"mine": true}\n');
+  const kept = plan(owned.root);
+  assert.equal(kept.actions.some((action) => action.path === OFFICERS_PATH), false, 'an existing officers.json is never touched');
+  assert.equal(read(owned.root, OFFICERS_PATH), '{"mine": true}\n');
+});
+
+test('.gitattributes gains the line .claude/** -text: created when absent, appended after a final newline or after the newline it lacked, left alone when present', () => {
+  const cases = [
+    [null, `${ATTRIBUTES_LINE}\n`],
+    ['*.png binary\n', `*.png binary\n${ATTRIBUTES_LINE}\n`],
+    ['*.png binary', `*.png binary\n${ATTRIBUTES_LINE}\n`],
+    [`*.png binary\n${ATTRIBUTES_LINE}\n`, `*.png binary\n${ATTRIBUTES_LINE}\n`],
+    [`${ATTRIBUTES_LINE}\r\n*.sh text\n`, `${ATTRIBUTES_LINE}\r\n*.sh text\n`],
+  ];
+  for (const [before, expected] of cases) {
+    const repo = fresh(before === null ? {} : { files: { '.gitattributes': before } });
+    const planned = plan(repo.root);
+    assert.equal(planned.actions.some((action) => action.kind === 'patch'), before === null || !before.includes(ATTRIBUTES_LINE), JSON.stringify(before));
+    applyPlan(repo.root, planned);
+    assert.equal(read(repo.root, '.gitattributes'), expected, JSON.stringify(before));
+    applyUninstall(repo.root, uninstallPlan(repo.root, { state: true }));
+    assert.equal(existsSync(join(repo.root, '.gitattributes')) ? read(repo.root, '.gitattributes') : null, before, `uninstall restores ${JSON.stringify(before)}`);
+  }
+});
+
+test('applyPlan writes what the plan says, records every write in the manifest, and a second plan proposes nothing', () => {
+  const repo = fresh();
+  const planned = plan(repo.root);
+  const result = applyPlan(repo.root, planned);
+  assert.equal(result.refusal, null);
+  for (const { name, bytes } of shippedScripts()) {
+    const path = join(repo.root, SCRIPTS_DIR, name);
+    assert.deepEqual(readFileSync(path), bytes, name);
+    assert.equal(lstatSync(path).mode & 0o777, 0o644, name);
+  }
+  const entry = entryOf();
+  assert.deepEqual(JSON.parse(read(repo.root, EXTENSIONS_PATH)), [entry]);
+  assert.equal(read(repo.root, EXTENSIONS_PATH), `${JSON.stringify([entry], null, 2)}\n`);
+  assert.deepEqual(ownEntry(repo.root), entry);
+  assert.deepEqual(checkContract1(repo.root, entry), { problems: [], warnings: [] });
+  for (const name of HOOK_NAMES) {
+    const path = join(hooksDir(repo.root), name);
+    assert.equal(readFileSync(path, 'utf8'), hookText(name, { env: envPath(), node: process.execPath, version: KIT_VERSION }), name);
+    assert.equal(lstatSync(path).mode & 0o777, 0o755, name);
+  }
+  const bin = join(stateDir(repo.root), 'bin');
+  assert.deepEqual(readdirSync(bin).sort(), [...SCRIPT_NAMES].sort());
+  for (const { name, bytes } of shippedScripts()) assert.deepEqual(readFileSync(join(bin, name)), bytes, name);
+
+  const manifest = readManifest(repo.root).manifest;
+  assert.deepEqual(manifest, result.manifest);
+  assert.equal(manifest.schema, 1);
+  assert.equal(manifest.kitVersion, KIT_VERSION);
+  assert.match(manifest.installedAt, /^\d{4}-\d\d-\d\dT/);
+  const hash = (path) => sha256(readFileSync(join(repo.root, path)));
+  assert.deepEqual(manifest.files, [...SCRIPT_NAMES.map((name) => `${SCRIPTS_DIR}/${name}`), OFFICERS_PATH].map((path) => ({ path, sha256: hash(path) })));
+  assert.deepEqual(manifest.patches, [{ file: '.gitattributes', kind: 'create', detail: ATTRIBUTES_LINE }]);
+  assert.deepEqual(manifest.extensionEntry, { id: 'kh-orchestration', sha256: entry.sha256 });
+  assert.deepEqual(manifest.gitHooks, HOOK_NAMES.map((name) => ({ name, sha256: sha256(readFileSync(join(hooksDir(repo.root), name))) })));
+  assert.equal(manifest.stateDir, true);
+  assert.deepEqual(Object.keys(manifest), ['schema', 'kitVersion', 'installedAt', 'files', 'patches', 'extensionEntry', 'gitHooks', 'stateDir']);
+
+  const before = everything(repo.root);
+  const again = plan(repo.root);
+  assert.deepEqual([again.refusals, again.actions, again.conflicts], [[], [], []]);
+  applyPlan(repo.root, again);
+  assert.deepEqual(everything(repo.root), before, 'a second apply writes nothing');
+});
+
+test('another plugin\'s entry stays byte for byte in place through install, update and uninstall, and the file goes only when no entry is left (Review Focus 4)', () => {
+  for (const layout of ['canonical', 'compact']) {
+    const repo = fresh();
+    const extensions = join(repo.root, EXTENSIONS_PATH);
+    const third = { ...OTHER, id: 'third-plugin', module: '.claude/third/ext.mjs' };
+    const original = layout === 'canonical' ? `${JSON.stringify([OTHER, third], null, 2)}\n` : `[${JSON.stringify(OTHER)},\n ${JSON.stringify(third)}]`;
+    writeFileSync(extensions, original);
+    const others = (text) => {
+      const list = JSON.parse(text);
+      return [list.findIndex((entry) => entry.id === OTHER.id), list.findIndex((entry) => entry.id === third.id)];
+    };
+    applyPlan(repo.root, plan(repo.root));
+    const installed = readFileSync(extensions, 'utf8');
+    assert.deepEqual(JSON.parse(installed), [OTHER, third, entryOf()], layout);
+    assert.deepEqual(others(installed), [0, 1]);
+    assert.ok(installed.startsWith(original.slice(0, original.lastIndexOf('}') + 1)), `${layout}: the two entries' text is kept as it was`);
+
+    // An update from an older kit's install.
+    const oldEntry = ageInstall(repo.root);
+    assert.deepEqual(JSON.parse(readFileSync(extensions, 'utf8')), [OTHER, third, oldEntry], `${layout}: fixture`);
+    applyPlan(repo.root, plan(repo.root));
+    assert.equal(readFileSync(extensions, 'utf8'), installed, `${layout}: the update restores the entry in its place and leaves the others`);
+
+    const uninstalled = uninstallPlan(repo.root, { state: true });
+    applyUninstall(repo.root, uninstalled);
+    assert.equal(readFileSync(extensions, 'utf8'), original, `${layout}: uninstall leaves the file as it was before`);
+    writeFileSync(extensions, `${JSON.stringify([OTHER], null, 2)}\n`);
+  }
+
+  const alone = fresh();
+  applyPlan(alone.root, plan(alone.root));
+  applyUninstall(alone.root, uninstallPlan(alone.root, { state: true }));
+  assert.equal(existsSync(join(alone.root, EXTENSIONS_PATH)), false, 'removed when kh-orchestration\'s entry was the last');
+});
+
+test('an existing hook that is not kh-orchestration\'s is a conflict: none of the three hooks is written, and the line printed to add runs the gate', () => {
+  const repo = fresh();
+  const preCommit = join(hooksDir(repo.root), 'pre-commit');
+  writeFileSync(preCommit, '#!/bin/sh\necho owner-hook >&2\n');
+  chmodSync(preCommit, 0o755);
+  const planned = plan(repo.root);
+  const line = hookLine('pre-commit', { env: envPath(), node: process.execPath });
+  assert.deepEqual(planned.conflicts, [{ text: TEXT.hookConflict('pre-commit', preCommit, line), next: applyCommand(repo.root) }]);
+  assert.equal(planned.actions.some((action) => action.kind === 'git-hook'), false);
+  const result = applyPlan(repo.root, planned);
+  assert.equal(result.refusal, null);
+  assert.equal(readFileSync(preCommit, 'utf8'), '#!/bin/sh\necho owner-hook >&2\n');
+  for (const name of ['pre-merge-commit', 'reference-transaction']) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
+  assert.deepEqual(readManifest(repo.root).manifest.gitHooks, []);
+  assert.match(TEXT.hookConflict('pre-commit', '/h/pre-commit', 'L'), /^The pre-commit hook at \/h\/pre-commit is not kh-orchestration's, so none of the three hooks is written\. To run the commit gate from it, add this line directly after its first line:\n {4}L$/);
+
+  // The line, added after the first line, runs the gate: the commit is refused with the gate's own text.
+  writeFileSync(preCommit, `#!/bin/sh\n${line}\necho owner-hook >&2\n`);
+  repo.git('add', '-A');
+  const commit = repo.git('commit', '-q', '-m', 'work');
+  assert.equal(commit.status, 1);
+  assert.match(commit.stderr, /^kh-orchestration: /);
+  assert.ok(commit.stderr.endsWith('kh-orchestration: the commit gate did not allow this commit.\n'), commit.stderr);
+  assert.ok(!commit.stderr.includes('owner-hook'), 'the hook stopped at the refusal');
+});
+
+test('the line for reference-transaction starts no node outside the prepared state of a git process with an in-flight record', () => {
+  const line = hookLine('reference-transaction', { env: '/nonexistent/env', node: '/nonexistent/node' });
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ko-line-')));
+  scratch.push(dir);
+  mkdirSync(join(dir, 'hooks'));
+  const hook = join(dir, 'hooks', 'reference-transaction');
+  writeFileSync(hook, `#!/bin/sh\n${line}\necho after\n`);
+  chmodSync(hook, 0o755);
+  for (const state of ['prepared', 'committed', 'aborted']) {
+    const result = spawnSync(hook, [state], { encoding: 'utf8', env: {} });
+    assert.deepEqual([result.status, result.stdout, result.stderr], [0, 'after\n', ''], state);
+  }
+});
+
+test('an owner-edited or unstamped installed script is kept and reported, the hooks are not written, and the rest is installed', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const edited = join(repo.root, SCRIPTS_DIR, 'ko-officers.mjs');
+  writeFileSync(edited, `${readFileSync(edited, 'utf8')}// the owner's note\n`);
+  const unstamped = join(repo.root, SCRIPTS_DIR, 'ko-verdict.mjs');
+  writeFileSync(unstamped, 'export const mine = 1;\n');
+  for (const name of HOOK_NAMES) rmSync(join(hooksDir(repo.root), name));
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.conflicts, [
+    { text: TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), next: applyCommand(repo.root) },
+    { text: TEXT.scriptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`), next: applyCommand(repo.root) },
+    { text: TEXT.hooksStopped, next: applyCommand(repo.root) },
+  ]);
+  assert.equal(planned.actions.some((action) => action.kind === 'git-hook'), false);
+  applyPlan(repo.root, planned);
+  assert.ok(read(repo.root, `${SCRIPTS_DIR}/ko-officers.mjs`).endsWith('// the owner\'s note\n'));
+  assert.equal(read(repo.root, `${SCRIPTS_DIR}/ko-verdict.mjs`), 'export const mine = 1;\n');
+  for (const name of HOOK_NAMES) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
+  assert.equal(TEXT.scriptEdited('p'), 'p is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. Restore it (git checkout -- p) or remove it, then run apply again to take this version.');
+
+  // An edited extension.mjs: kept, and its entry is not written over the kept bytes; nothing is refused.
+  const module = join(repo.root, SCRIPTS_DIR, 'extension.mjs');
+  const shippedModule = readFileSync(module);
+  writeFileSync(module, `${shippedModule}// the owner's note\n`);
+  const extensions = readFileSync(join(repo.root, EXTENSIONS_PATH));
+  rmSync(join(repo.root, EXTENSIONS_PATH));
+  const keptModule = plan(repo.root);
+  assert.deepEqual(keptModule.refusals, []);
+  assert.deepEqual(keptModule.conflicts.map((conflict) => conflict.text), [
+    TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), TEXT.scriptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`), TEXT.scriptEdited(`${SCRIPTS_DIR}/extension.mjs`), TEXT.extensionSkipped, TEXT.hooksStopped,
+  ]);
+  assert.equal(keptModule.actions.some((action) => action.kind === 'extension-entry'), false);
+  writeFileSync(module, shippedModule);
+  writeFileSync(join(repo.root, EXTENSIONS_PATH), extensions);
+
+  // The uninstall keeps them too, and says so.
+  const uninstalled = uninstallPlan(repo.root, { state: true });
+  assert.deepEqual(uninstalled.kept, [TEXT.keptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), TEXT.keptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`)]);
+  applyUninstall(repo.root, uninstalled);
+  assert.deepEqual(readdirSync(join(repo.root, SCRIPTS_DIR)).sort(), ['ko-officers.mjs', 'ko-verdict.mjs']);
+});
+
+test('an install whose scripts carry an older version stamp is updated in place, and the extension entry\'s hash follows', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const oldEntry = ageInstall(repo.root);
+  assert.deepEqual(JSON.parse(read(repo.root, EXTENSIONS_PATH)), [oldEntry], 'fixture');
+
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.conflicts, []);
+  assert.deepEqual(planned.actions.filter((action) => action.kind === 'file').map((action) => action.detail), SCRIPT_NAMES.map((name) => TEXT.updateScript(`${SCRIPTS_DIR}/${name}`, '0.0.9')));
+  applyPlan(repo.root, planned);
+  for (const { name, bytes } of shippedScripts()) assert.deepEqual(readFileSync(join(repo.root, SCRIPTS_DIR, name)), bytes, name);
+  assert.deepEqual(JSON.parse(read(repo.root, EXTENSIONS_PATH)), [entryOf()]);
+  assert.equal(readManifest(repo.root).manifest.kitVersion, KIT_VERSION);
+  assert.deepEqual(checkContract1(repo.root, entryOf()), { problems: [], warnings: [] });
+});
+
+test('a hook that names kh-orchestration but is not this version\'s exact text is rewritten; status of stale in-flight records is cleared', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const preCommit = join(hooksDir(repo.root), 'pre-commit');
+  writeFileSync(preCommit, hookText('pre-commit', { env: envPath(), node: '/moved/node', version: '0.0.9' }));
+  const merge = join(hooksDir(repo.root), 'pre-merge-commit');
+  writeFileSync(merge, readFileSync(merge, 'utf8').replace('exit 1\n', 'exit 0\n'));
+  chmodSync(join(hooksDir(repo.root), 'reference-transaction'), 0o644);
+  writeInflight(repo.root, '999999999', { tree: 'a'.repeat(40), base: 'none' });
+  const planned = plan(repo.root);
+  assert.deepEqual(planned.conflicts, []);
+  assert.deepEqual(planned.actions.map((action) => [action.kind, action.detail]), [
+    ['git-hook', TEXT.rewriteHook(preCommit)],
+    ['git-hook', TEXT.rewriteHook(merge)],
+    ['git-hook', TEXT.rewriteHook(join(hooksDir(repo.root), 'reference-transaction'))],
+    ['inflight', TEXT.removeInflight(['999999999'])],
+  ]);
+  applyPlan(repo.root, planned);
+  for (const name of HOOK_NAMES) {
+    assert.equal(readFileSync(join(hooksDir(repo.root), name), 'utf8'), hookText(name, { env: envPath(), node: process.execPath, version: KIT_VERSION }), name);
+    assert.equal(lstatSync(join(hooksDir(repo.root), name)).mode & 0o777, 0o755);
+  }
+  assert.equal(existsSync(join(stateDir(repo.root), 'inflight-999999999.json')), false);
+});
+
+test('the self-test after the hooks are written removes them and refuses when the recorded Node does not start', () => {
+  const repo = fresh();
+  const planned = plan(repo.root);
+  const result = applyPlan(repo.root, { ...planned, node: join(repo.root, '..', 'no-such-node') });
+  assert.deepEqual(result.refusal, { text: TEXT.selfTestRemoved(TEXT.gateDidNotAnswer), next: applyCommand(repo.root) });
+  for (const name of HOOK_NAMES) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
+  assert.deepEqual(readManifest(repo.root).manifest.gitHooks, []);
+  assert.equal(TEXT.selfTestRemoved('x'), 'The hooks just written could not start the commit gate (x), so they were removed: hooks that cannot run the gate would refuse every commit.');
+  // A run with the real Node completes what was left.
+  applyPlan(repo.root, plan(repo.root));
+  assert.equal(readManifest(repo.root).manifest.gitHooks.length, 3);
+});
+
+test('the coverage note says per officer which files the digest covers and what is not locked', () => {
+  const repo = fresh({ files: { 'tools/check.mjs': 'process.exit(0);\n', 'tests/a.test.mjs': '\n' } });
+  repo.write(OFFICERS_PATH, `${JSON.stringify({
+    schema: 1,
+    baseBranch: 'main',
+    protected: [],
+    officers: [
+      { id: 'lint', rule: null, argv: ['npm', 'run', 'lint'], appliesTo: ['**'] },
+      { id: 'check', rule: null, argv: ['node', './tools/check.mjs', '--config=tools/check.mjs'], appliesTo: ['**'] },
+      { id: 'tests', rule: null, argv: ['node', '--test', 'tests'], appliesTo: ['**'] },
+    ],
+  })}\n`);
+  assert.deepEqual(coverageOf(repo.root), [
+    { id: 'lint', command: 'npm run lint', covered: [], notLocked: [TEXT.packageJsonNotLocked] },
+    { id: 'check', command: 'node ./tools/check.mjs --config=tools/check.mjs', covered: ['tools/check.mjs'], notLocked: [] },
+    { id: 'tests', command: 'node --test tests', covered: [], notLocked: [TEXT.directoryNotLocked('tests')] },
+  ]);
+  assert.equal(TEXT.packageJsonNotLocked, 'package.json is not protected: add it to "protected" in .claude/kh-orchestration/officers.json to lock it');
+  repo.write(OFFICERS_PATH, `${JSON.stringify({ schema: 1, baseBranch: 'main', protected: ['package.json'], officers: [{ id: 'lint', rule: null, argv: ['npm', 'run', 'lint'], appliesTo: ['**'] }] })}\n`);
+  repo.write('package.json', '{}\n');
+  assert.deepEqual(coverageOf(repo.root), [{ id: 'lint', command: 'npm run lint', covered: ['package.json'], notLocked: [] }]);
+});
+
+test('the manifest is refused when it cannot be read or records a path kh-orchestration never writes, and nothing is written over it', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const path = join(repo.root, MANIFEST_PATH);
+  const manifest = JSON.parse(readFileSync(path, 'utf8'));
+  for (const bad of ['{ cut', JSON.stringify({ ...manifest, schema: 2 }), JSON.stringify({ ...manifest, files: [{ path: 'src/index.mjs', sha256: 'a'.repeat(64) }] }), JSON.stringify({ ...manifest, gitHooks: [{ name: 'post-checkout', sha256: 'a'.repeat(64) }] })]) {
+    writeFileSync(path, bad);
+    const next = `git -C ${shellWord(repo.root)} checkout -- ${MANIFEST_PATH}`;
+    assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.manifestCorrupt, next }], bad);
+    assert.deepEqual(uninstallPlan(repo.root, { state: false }).refusals, [{ text: TEXT.manifestCorrupt, next }], bad);
+  }
+});
+
+// The kill tests: a run stopped right after its nth write (`onWrite` throws, and nothing after it
+// runs, as when the process is killed), then a fresh run of apply or of uninstall.
+const KILLED = 'killed here';
+function killedAfter(root, count) {
+  let writes = 0;
+  assert.throws(() => applyPlan(root, plan(root), {
+    onWrite: () => {
+      writes += 1;
+      if (writes === count) throw new Error(KILLED);
+    },
+  }), { message: KILLED });
+}
+
+// What an install leaves, the manifest's installation time aside, to compare two runs.
+function installState(root) {
+  const { installedAt, ...manifest } = readManifest(root).manifest;
+  const tree = listing(join(root, '.claude/kh-orchestration'));
+  return { tree, extensions: read(root, EXTENSIONS_PATH), manifest, hooks: listing(hooksDir(root)), bin: listing(join(stateDir(root), 'bin')), attributes: read(root, '.gitattributes') };
+}
+const porcelain = (root) => spawnSync('git', ['status', '--porcelain', '-uall'], { cwd: root, env: testEnv(), encoding: 'utf8' }).stdout;
+
+test('a kill after each write of apply --yes leaves a state that apply completes and that uninstall --state cleans', () => {
+  // The number of writes a full run makes, and what it leaves.
+  const counting = fresh();
+  let total = 0;
+  applyPlan(counting.root, plan(counting.root), { onWrite: () => { total += 1; } });
+  assert.ok(total > 20, `a full run makes ${total} writes`);
+  const finished = installState(counting.root);
+  for (let count = 1; count <= total; count += 1) {
+    const repo = fresh();
+    assert.equal(porcelain(repo.root), '');
+    const hooksBefore = listing(hooksDir(repo.root));
+    killedAfter(repo.root, count);
+    // The same killed state twice: apply is run on one, uninstall on the other.
+    const copy = realpathSync(mkdtempSync(join(tmpdir(), 'ko-killed-')));
+    scratch.push(copy);
+    cpSync(repo.root, join(copy, 'repo'), { recursive: true, verbatimSymlinks: true });
+    const other = join(copy, 'repo');
+
+    const completed = plan(repo.root);
+    assert.deepEqual([completed.refusals, completed.conflicts], [[], []], `after write ${count}`);
+    assert.equal(applyPlan(repo.root, completed).refusal, null, `after write ${count}`);
+    assert.deepEqual(plan(repo.root).actions, [], `after write ${count}: apply completed it`);
+    assert.deepEqual(installState(repo.root), finished, `after write ${count}`);
+
+    const uninstalled = uninstallPlan(other, { state: true });
+    assert.deepEqual([uninstalled.refusals, uninstalled.kept], [[], []], `after write ${count}`);
+    applyUninstall(other, uninstalled);
+    assert.equal(porcelain(other), '', `after write ${count}: uninstall leaves the tree as it was`);
+    assert.deepEqual(listing(hooksDir(other)), hooksBefore, `after write ${count}`);
+    assert.equal(existsSync(join(other, '.git', 'kh-orchestration')), false, `after write ${count}`);
+    repo.cleanup();
+    rmSync(copy, { recursive: true, force: true });
+  }
+});
