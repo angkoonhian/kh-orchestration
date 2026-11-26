@@ -8,7 +8,7 @@ import {
   StateError, appendJournal, corruptMessage, invalidValueMessage, invalidVerdictKeyMessage, isOff, readApprovals, readExemptions, readInflight, readState, removeInflight, removeStaleInflight, shapeMessage, stateDir,
   invalidPidMessage, stateUnreadableMessage, unknownNameMessage, writeInflight, verdictName, writeFailedMessage, writeState,
   binIncompleteMessage, binEntryMessage, listInflight, readProposals, readWaivers, refreshBin, switchOff, switchOn,
-  invalidCommitMessage, ownerCommand, readAccepted, writeAccepted, binPreflightMessage,
+  invalidCommitMessage, ownerCommand, readAccepted, writeAccepted, binPreflightMessage, approvalStanding,
 } from '../../assets/scripts/ko-state.mjs';
 import { objectMismatchMessage } from '../../assets/scripts/ko-digest.mjs';
 
@@ -533,5 +533,42 @@ test('a write whose directory is a file throws the fixed StateError, not the err
     writeFileSync(join(stateDir(repo.root), 'accepted'), 'a file where the directory goes\n');
     const name = `accepted/${'e'.repeat(40)}.json`;
     assert.throws(() => writeAccepted(repo.root, 'e'.repeat(40), INFLIGHT), { name: 'StateError', message: writeFailedMessage(name) });
+  });
+});
+
+// approvalStanding's truth table (after the whole-branch review: approvals are ordered). D is the
+// tree's digest, B its base tree's; the list is approvals.json in append order.
+test('approvalStanding: a digest is accepted when approved and equal to the base\'s, or approved later than the base\'s, or the base imposes no order', () => {
+  const [D, B, X] = ['d', 'b', 'x'].map((letter) => letter.repeat(64));
+  const at = (digest) => ({ digest, approvedAt: 'x', branch: 'main' });
+  const rows = [
+    // [approvals, base digest, standing, why]
+    [[], B, 'unapproved', 'D never approved'],
+    [[at(B)], B, 'unapproved', 'only the base approved'],
+    [[], null, 'unapproved', 'never approved, base none or not computable'],
+    [[at(D)], D, 'approved', 'equal to the base digest'],
+    [[at(D), at(B)], D, 'approved', 'equal to the base digest, whatever the order'],
+    [[at(B), at(D)], B, 'approved', 'approved after the base digest'],
+    [[at(D), at(B)], B, 'older', 'approved before the base digest'],
+    [[at(D), at(B), at(D)], B, 'approved', 'approved again after the base digest: the latest approval counts'],
+    [[at(B), at(D), at(B)], B, 'older', 'the base digest approved again after it'],
+    [[at(D), at(X)], B, 'approved', 'the base digest never approved: no order'],
+    [[at(D), at(B)], null, 'approved', 'base none, or its digest not computable: no order'],
+  ];
+  for (const [approvals, baseDigest, standing, why] of rows) {
+    assert.equal(approvalStanding(approvals, D, () => baseDigest), standing, why);
+  }
+  let asked = false;
+  assert.equal(approvalStanding([at(B)], D, () => { asked = true; return B; }), 'unapproved');
+  assert.equal(asked, false, 'the base digest is computed only for an approved digest');
+});
+
+test('readApprovals keeps a digest approved more than once, every record in the order written', () => {
+  withRepo((repo) => {
+    const digests = [
+      { digest: DIGEST, approvedAt: '1', branch: 'main' }, { digest: 'b'.repeat(64), approvedAt: '2', branch: 'main' }, { digest: DIGEST, approvedAt: '3', branch: 'main' },
+    ];
+    writeState(repo.root, 'approvals.json', { digests });
+    assert.deepEqual(readApprovals(repo.root), digests);
   });
 });

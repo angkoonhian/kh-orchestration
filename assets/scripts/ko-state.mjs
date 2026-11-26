@@ -35,7 +35,9 @@ export const shapeMessage = (name) =>
 // approved (64 lower-case hexadecimal digits), the tree approve read it from (a full object id; a
 // record written before approve kept it has no `tree` key and is still valid), when (an ISO time),
 // and the branch it was approved on (null on a detached HEAD). Absent, nothing is approved. Read
-// through readApprovals. `approve` diffs against the last record of its branch that has a tree.
+// through readApprovals. Records are appended, a digest approved again included, and their order
+// is meaningful: approvalStanding reads each digest's latest record. `approve` diffs against the
+// last record of its branch that has a tree.
 // waivers.json is `{ waivers: [{ rule, branch, reason, at }] }`: an officer's rule (a rule id as
 // RULES.md writes one) the owner waived on a branch, by exact name, why (non-empty) and when.
 // Absent, nothing is waived. Read through readWaivers; `run` passes a branch's waivers to the
@@ -171,6 +173,31 @@ const proposalHasShape = (entry) => isText(entry) && isAbsolute(entry);
 
 // The approvals, `[{ digest, tree?, approvedAt, branch }]`. Throws a StateError for a file that cannot be read or is of another shape.
 export const readApprovals = (root) => readList(root, 'approvals.json', 'digests', approvalHasShape);
+
+/**
+ * Whether a tree's protected-files `digest` is accepted, given `approvals` (readApprovals, in the
+ * order they were appended) and `baseDigest`, a function giving the digest of the tree's base's
+ * tree, or null when the base is `none` or that digest cannot be computed (after the whole-branch
+ * review: approvals are ordered). The one rule the gate, verify-branch, status, run and approve
+ * apply:
+ *   'unapproved' — `digest` was never approved;
+ *   'approved'   — it was, and it equals the base's digest, or the base's digest is null or was
+ *                  never approved (no order), or its latest approval comes after the base digest's
+ *                  latest approval;
+ *   'older'      — it was, but before the base's digest was last approved: an earlier approved
+ *                  version of the checks than the base's, which needs the owner's approval again.
+ * Order is position in approvals.json, never a clock. `baseDigest` is called only for an approved
+ * digest, so an unapproved one costs no second digest.
+ */
+export function approvalStanding(approvals, digest, baseDigest) {
+  const latest = (wanted) => approvals.findLastIndex((entry) => entry.digest === wanted);
+  const at = latest(digest);
+  if (at === -1) return 'unapproved';
+  const base = baseDigest();
+  if (base === null || base === digest) return 'approved';
+  const baseAt = latest(base);
+  return baseAt === -1 || at > baseAt ? 'approved' : 'older';
+}
 
 // The exemptions, `[{ name, reason, at }]`. Throws a StateError for a file that cannot be read or is of another shape.
 export const readExemptions = (root) => readList(root, 'exemptions.json', 'branches', exemptionHasShape);

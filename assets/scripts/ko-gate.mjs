@@ -35,9 +35,9 @@ import { dirname, join } from 'node:path';
 import { COMMANDS, shellWord } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
 import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
-import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommitId } from './ko-git.mjs';
+import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommit, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { FILE_MODES, StateError, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, STAGE_INSTALL_NOTE, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
+import { FILE_MODES, StateError, approvalStanding, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, STAGE_INSTALL_NOTE, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
@@ -114,6 +114,7 @@ export const REASONS = Object.freeze({
   contract: (problem) => `kh-harness contract 1 does not hold in this working directory, so the extension that guards the commit gate may not be running: ${sentence(problem)} Repair the install outside Claude Code, then commit again.`,
   undigestable: (problem) => `The protected files of this tree cannot be checked: ${sentence(problem)} Fix it, stage the fix, and run the officers.`,
   unapproved: (digest) => `The protected files of this tree (digest ${digest.slice(0, 12)}) are not approved. The owner reviews and approves them in their own terminal.`,
+  olderApproval: (digest) => `The protected files of this tree (digest ${digest.slice(0, 12)}) are an earlier approved version than its base's: the owner approved them before the base's, so going back to them needs the owner's approval again. The owner reviews and approves them in their own terminal.`,
   noVerdict: (tree, base) => `No verdict is recorded for this tree (${shortId(tree)}) against its base (${shortId(base)}). Run the officers on the staged tree.`,
   digestDiffers: 'The verdict for this tree records other protected files than the tree holds, so it is not trusted. Run the officers again.',
   otherOfficers: 'The verdict for this tree lists other officers than the tree\'s officers file, so it is not trusted. Run the officers again.',
@@ -336,9 +337,18 @@ function contractOnPrivateCopy(root, live) {
   }
 }
 
-// 6. Whether the owner approved this digest. Approval is by content: an approval's `branch` is a
-// record of where it was given, and a digest approved anywhere is approved on every branch.
-const approved = (root, digest) => readApprovals(root).some((entry) => entry.digest === digest);
+// 6. The digest of the protected files of `base`'s tree, for approvalStanding (ko-state.mjs), which
+// decides step 6: null for the base `none`, and for a base tree whose protected files cannot be
+// digested (a base from before the install). A base commit that cannot be read throws, so the gate
+// refuses rather than impose no order. Approval is by content and by order: an approval's `branch`
+// is a record of where it was given, and a digest approved anywhere counts on every branch, unless
+// the base's digest was approved after it. verify-branch, status, run and approve use it too.
+export function baseDigestOf(root, base) {
+  const tree = treeOfCommit(root, base);
+  if (tree === null) return null;
+  const digest = digestOfTree(root, tree);
+  return digest.problem === undefined ? digest.digest : null;
+}
 
 // The tree's entries under the live paths, sorted by path.
 const liveEntries = (root, tree) => listEntries(root, tree).filter((entry) => isLive(entry.path)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -364,7 +374,8 @@ function verdictRefusal(verdict, { tree, base }, digest, officers) {
  * decides: `{ allow, reason, next }`, `next` the exact command to run ('' on an allow). Nothing from
  * the repository is EXECUTED before the owner's approval of those exact bytes is established:
  *   1 off switch, 2 exempt branch, 3 install in the tree, 4 live files equal the tree (compared
- *   in this process), 5 RULES.md and the digest, 6 digest approved, 7 contract 1: the project env
+ *   in this process), 5 RULES.md and the digest, 6 digest approved and not older than the
+ *   base's (approvalStanding), 7 contract 1: the project env
  *   (no NODE_*, LD_*, DYLD_*), checkContract1 on the working directory, then the probe on a
  *   private copy of the approved tree (the one step that runs repository code, and only approved
  *   bytes), 8 a passing verdict for this tree and base.
@@ -397,7 +408,8 @@ export function judge(root, { tree, base, branch }, { honourSwitches = true, pro
   if (liveProblem !== null) return liveProblem;
   const digest = digestOfTree(root, tree);
   if (digest.problem !== undefined) return refuse(REASONS.undigestable(digest.problem), COMMANDS.run);
-  if (!approved(root, digest.digest)) return refuse(REASONS.unapproved(digest.digest), ownerCommand(root, 'approve'));
+  const standing = approvalStanding(readApprovals(root), digest.digest, () => baseDigestOf(root, base));
+  if (standing !== 'approved') return refuse(standing === 'older' ? REASONS.olderApproval(digest.digest) : REASONS.unapproved(digest.digest), ownerCommand(root, 'approve'));
   const verdict = readVerdict(root, tree, base);
   const envProblem = projectEnvRefusal(root);
   if (envProblem !== null) return envProblem;

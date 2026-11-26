@@ -28,14 +28,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { COMMANDS, shellWord } from './extension.mjs';
 import { STAMP, contractHolds, ownEntry } from './ko-contract.mjs';
 import { agentRuleChanges, digestOfTree, hashesTo } from './ko-digest.mjs';
-import { REASONS, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
+import { REASONS, baseDigestOf, exemptionOf, installOf, judge, liveFilesRefusal, plainText, readNoFollow, shownText, visible } from './ko-gate.mjs';
 import {
   GitError, baseOf, changedPaths, commonDir, currentBranch, git, gitFailedMessage, headBaseOf, headCommit, headTree, indexTree, isPinned, listEntries, pinTree, repoRoot, tidy, treeOfCommit, unpinTree,
 } from './ko-git.mjs';
 import { HOOK_NAMES, hookParts, hookText, hostedParts } from './ko-hooks.mjs';
 import { officersOfTree } from './ko-officers.mjs';
 import {
-  RULE_ID, StateError, appendJournal, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
+  RULE_ID, StateError, appendJournal, approvalStanding, binEntriesOf, isOff, listInflight, ownerCommand, readAccepted, readApprovals, readExemptions, readProposals, readWaivers,
   refreshBin, removeStaleInflight, stateDir, switchOff, switchOn, verdictName, writeState,
 } from './ko-state.mjs';
 import { passing, produceVerdict, readVerdict, writeVerdict } from './ko-verdict.mjs';
@@ -153,6 +153,7 @@ export const TEXT = Object.freeze({
     : `Exemption in force: ${shownName(exemption.name)} (${shownText(exemption.reason)}); the gate lets its commits through unchecked.`),
   passingApproved: (tree) => `Passing: the staged tree ${short(tree)} may be committed; its protected files are approved.`,
   passingUnapproved: (digest) => `Passing, but the protected files of this tree (digest ${short(digest)}) are not approved, so the commit gate refuses it until the owner approves them in their own terminal.`,
+  passingOlder: (digest) => `Passing, but the protected files of this tree (digest ${short(digest)}) are an earlier approved version than the base's, so the commit gate refuses it until the owner approves them again in their own terminal.`,
   failing: (ids) => `Failing: these officers did not pass: ${named(ids)}. Fix what they report, stage the fix, and run the officers again.`,
 
   noHead: 'HEAD names no commit yet, so there is no branch head to verify.',
@@ -175,7 +176,8 @@ export const TEXT = Object.freeze({
   newlyCovered: (paths) => `Newly covered, their content unchanged since that tree: ${named(paths)}.`,
   noEarlierApproval: 'No earlier approval records a tree to compare with, so read these files in full before approving.',
   earlierTreeGone: (tree, branch) => `The tree of the last approval on ${branchWords(branch)} (${short(tree)}) is no longer in the object store.`,
-  alreadyApproved: 'This digest is approved already; approving again refreshes bin/ from this tree and closes this worktree for proposals.',
+  alreadyApproved: 'This digest is approved already; approving again records it once more, refreshes bin/ from this tree and closes this worktree for proposals.',
+  approvesOlder: (digest, baseDigest) => `These protected files (digest ${short(digest)}) are an earlier approved state, approved before the base's (digest ${short(baseDigest)}), so the commit gate refuses them: going back to an older version of the checks needs approving again. Approving records a new approval, later than the base's.`,
   prompt: 'Type approve and press Enter to approve; anything else cancels: ',
   notApproved: 'Nothing was approved: the answer was not the word approve.',
   pinFailed: 'The approved tree could not be pinned with a ref under refs/kh-orchestration/approved/, so it could be pruned later and nothing is approved (bin/ already holds its scripts; the gate refuses them until approved). Check that the git directory can be written, then approve again.',
@@ -204,6 +206,7 @@ export const TEXT = Object.freeze({
   contractProblem: (problem) => `kh-harness contract 1 does not hold in this working directory: ${sentence(problem)}`,
   undigestable: (problem) => `The protected files of the staged tree cannot be checked: ${sentence(problem)}`,
   unapproved: (digest) => `The protected files of the staged tree (digest ${short(digest)}) are not approved.`,
+  olderApproval: (digest) => `The protected files of the staged tree (digest ${short(digest)}) are an earlier approved version than the base's: the owner must approve again.`,
   indexFailing: (ids) => `The verdict for the staged tree is failing: ${named(ids)} did not pass.`,
   indexStale: 'The verdict for the staged tree records other officers or other protected files than the tree holds, so the gate does not trust it.',
   verdictDamaged: (name) => `The shared state file ${name} exists but is not a verdict kh-orchestration can use; the gate treats it as no verdict.`,
@@ -429,10 +432,9 @@ async function run(root) {
     print([TEXT.failing(failedIds(verdict)), nextLine(agentCommand(root, 'run'))]);
     return 1;
   }
-  const approvedAlready = readApprovals(root).some((entry) => entry.digest === verdict.digest);
-  print(approvedAlready
-    ? [TEXT.passingApproved(tree), nextLine('git commit')]
-    : [TEXT.passingUnapproved(verdict.digest), nextLine(ownerCommand(root, 'approve'))]);
+  const standing = approvalStanding(readApprovals(root), verdict.digest, () => baseDigestOf(root, base));
+  if (standing === 'approved') print([TEXT.passingApproved(tree), nextLine('git commit')]);
+  else print([standing === 'older' ? TEXT.passingOlder(verdict.digest) : TEXT.passingUnapproved(verdict.digest), nextLine(ownerCommand(root, 'approve'))]);
   return 0;
 }
 
@@ -664,8 +666,10 @@ export function statusOf(root) {
       problems.push({ text: TEXT.undigestable(digested.problem), next: agentCommand(root, 'status') });
     } else {
       digest = digested.digest;
-      digestApproved = approvals === null ? null : approvals.some((entry) => entry.digest === digest);
-      if (digestApproved === false) problems.push({ text: TEXT.unapproved(digest), next: approveNext });
+      const standing = approvals === null ? null : attempt(problems, root, () => approvalStanding(approvals, digest, () => (base === null ? null : baseDigestOf(root, base))), null);
+      digestApproved = standing === null ? null : standing === 'approved';
+      if (standing === 'unapproved') problems.push({ text: TEXT.unapproved(digest), next: approveNext });
+      if (standing === 'older') problems.push({ text: TEXT.olderApproval(digest), next: approveNext });
     }
     if (officers !== null && base !== null && digest !== null) {
       const judged = attempt(problems, root, () => verdictState(root, tree, base, officers, digest), { state: 'none', failed: [] });
@@ -755,7 +759,7 @@ function statusLines(root, status) {
     `  install in the staged tree: ${status.install === null ? 'unknown' : status.install.present ? 'present' : 'absent'}`,
     `  contract 1 (by its files): ${status.contract.ok ? 'holds' : 'does not hold'}`,
     `  live files: ${status.liveFiles === null ? 'unknown' : status.liveFiles.equal ? 'equal to the staged tree' : 'differ from the staged tree'}`,
-    `  digest: ${short(status.digest)}, ${yesNo(status.digestApproved, 'approved', 'not approved')}`,
+    `  digest: ${short(status.digest)}, ${yesNo(status.digestApproved, 'approved', 'not accepted by the gate (see the problems)')}`,
     `  verdict for the staged tree: ${status.verdict}; for HEAD's tree: ${status.headVerdict ?? '(no commit yet)'}${status.headAccepted ? ' (recorded as accepted by the gate)' : ''}`,
     `  this worktree: ${yesNo(status.openForProposals, 'open for proposals', 'closed for proposals')}`,
     `  ${status.exemptions === null ? 'Exempt branches: unknown (see the problems).' : TEXT.exemptions(status.exemptions)}`,
@@ -901,7 +905,12 @@ function approvalPreview(root, { tree, digest, branch }) {
       if (newly.length > 0) lines.push(TEXT.newlyCovered(newly));
     }
   }
-  if (approvals.some((entry) => entry.digest === digest.digest)) lines.push(TEXT.alreadyApproved);
+  const read = officersOfTree(root, tree);
+  const base = read.problem === undefined ? baseOf(root, read.baseBranch) : null;
+  const baseDigest = base === null ? null : baseDigestOf(root, base);
+  const standing = approvalStanding(approvals, digest.digest, () => baseDigest);
+  if (standing === 'older') lines.push(TEXT.approvesOlder(digest.digest, baseDigest));
+  else if (standing === 'approved') lines.push(TEXT.alreadyApproved);
   return lines;
 }
 
@@ -939,10 +948,10 @@ function approve(root) {
     throw error;
   }
   try {
-    // Read and written together; no lock (see the header). A digest approved again moves to the end
-    // with this tree, so the last record is always the tree bin/ was refreshed from.
-    const others = readApprovals(root).filter((entry) => entry.digest !== digest.digest);
-    writeState(root, 'approvals.json', { digests: [...others, { digest: digest.digest, tree, approvedAt: new Date().toISOString(), branch }] });
+    // Read and written together; no lock (see the header). Every approval is a new record at the
+    // end, a digest approved again included (approvals are ordered: approvalStanding reads each
+    // digest's latest), so the last record is always the tree bin/ was refreshed from.
+    writeState(root, 'approvals.json', { digests: [...readApprovals(root), { digest: digest.digest, tree, approvedAt: new Date().toISOString(), branch }] });
   } catch (error) {
     if (!pinnedBefore) {
       try {

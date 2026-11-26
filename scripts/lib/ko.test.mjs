@@ -332,7 +332,7 @@ test('approve shows the covered files, reads the word approve, records the index
 
   const again = approveAnswer(repo.root);
   assert.ok(again.stdout.includes(`${TEXT.alreadyApproved}\n`));
-  assert.equal(readApprovals(repo.root).length, 1, 'no duplicate digest');
+  assert.deepEqual(readApprovals(repo.root).map((entry) => entry.digest), [digest.digest, digest.digest], 'approvals are ordered: approving again appends a record');
 });
 
 test('approve with any other answer, or no answer, records nothing and leaves bin/ alone', () => {
@@ -920,7 +920,7 @@ test('I4: approve falls back to the most recent approved tree of any branch, and
   assert.equal(TEXT.newlyCovered(['a', 'b']), 'Newly covered, their content unchanged since that tree: a, b.');
 });
 
-test('approving a digest again moves its record to the end, with this tree: the last record is what bin/ holds', () => {
+test('approving a digest again appends a record with this tree, the earlier ones kept: the last record is what bin/ holds', () => {
   const repo = installed();
   assert.equal(approveAnswer(repo.root).status, 0);
   const first = readApprovals(repo.root)[0];
@@ -932,7 +932,7 @@ test('approving a digest again moves its record to the end, with this tree: the 
   stage(repo);
   assert.equal(approveAnswer(repo.root).status, 0);
   const records = readApprovals(repo.root);
-  assert.deepEqual(records.map((record) => record.digest), [records[0].digest, first.digest]);
+  assert.deepEqual(records.map((record) => record.digest), [first.digest, records[1].digest, first.digest]);
   assert.equal(records.at(-1).tree, indexTree(repo.root));
   assert.deepEqual(statusJson(repo.root).bin.differs, []);
 });
