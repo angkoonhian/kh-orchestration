@@ -14,7 +14,10 @@ Every command below is the working copy's `ko.mjs`, run from anywhere in the rep
 - `run`: runs the officers on the staged tree. A commit needs a passing run of exactly what is staged, so run it again after any change.
 - `verify-branch`: checks that the branch's head passes, before merging. Say what it printed; do not call a branch ready unless it said so.
 - `status`: shows the switch, the branch, the verdicts and, under "Problems", what will refuse a commit and the next command for each.
+- `unwaive <rule>`: ends the owner's waiver of a rule on the current branch, when the person asks for it; ending a waiver only tightens.
+
+If `run` says the working tree changed while the officers ran, an officer changed files (a lint that fixes them, say): show the person what changed, stage only what they want, and run again. If it refuses because index entries are flagged assume-unchanged or skip-worktree, clear the flags with the command it prints.
 
 When a commit is refused, read the refusal: it names the command to run next.
 
-These are the owner's alone, run in their own terminal outside Claude Code, and you must never run them: `approve`, `propose`, `waive`, `exempt`, `off`, `on`, and the plugin's `apply` and `uninstall --yes`. When one is needed, tell the person the exact command and ask them to run it. Do not edit the protected files unless `status` shows this worktree is open for proposals.
+These are the owner's alone, run in their own terminal outside Claude Code, and you must never run them: `approve`, `propose` (and `propose --close`), `waive`, `exempt`, `off`, `on`, and the plugin's `apply` and `uninstall --yes`. When one is needed, tell the person the exact command and ask them to run it. Do not edit the protected files unless `status` shows this worktree is open for proposals.

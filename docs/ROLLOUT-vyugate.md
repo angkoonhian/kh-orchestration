@@ -228,7 +228,7 @@ Optionally, mark any rule you consider minor with a line `- approval: agent`. An
    Next: git commit
    ```
 
-   `migrations-append-only` is skipped because `db.py` did not change. If a tool officer fails, its first output lines are shown under it: fix the cause (or the officer), stage, and run again. If it says `Passing, but the protected files of this tree … are not approved`, something protected was staged after you approved: approve again.
+   `migrations-append-only` is skipped because `db.py` did not change. If a tool officer fails, its first output lines are shown under it: fix the cause (or the officer), stage, and run again. If it says `Passing, but the protected files of this tree … are not approved`, something protected was staged after you approved: approve again. If it exits 1 with `The working tree changed while the officers ran, so no verdict is recorded…`, an officer changed files as it ran (an `npm run lint` that fixes what it finds, or a test that leaves a file git does not ignore): look at `git status --short`, stage what you want, add what it writes to `.gitignore`, and run again. A lint that fixes files is better given its check-only form in `package.json`.
 
 4. Commit:
 
@@ -262,8 +262,9 @@ git restore --staged --worktree products/vision/backend/src/vyugate_api/db.py
 
 ```
 kh-orchestration: These officers did not pass on this tree: … migrations-append-only. Fix what they report, stage the fix, and run the officers again.
-Next: node .claude/kh-orchestration/scripts/ko.mjs run
+Next: node /home/you/projects/vyugate/.claude/kh-orchestration/scripts/ko.mjs run
 kh-orchestration: the commit gate did not allow this commit.
+kh-orchestration: for the cause, run kh-orchestration's status command (ko.mjs status); if it cannot run, ask the owner to run kh-orchestration's apply.
 ```
 
 The last command puts the file back.
@@ -278,19 +279,21 @@ The last command puts the file back.
 cd <the worktree>
 node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs approve
 node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs propose
+node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs propose --close
 node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs waive V8 --reason "<why, in a few words>"
 node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs exempt <branch> --reason "<why>"
 ```
 
 - `approve`: when a change touches a protected file (a rule, `officers.json`, an officer script, kh-harness's files, `.claude/settings.json`). Read the diff it shows before typing `approve`. The verdict the agent already took stays valid, so the agent then only commits.
-- `propose`: when an agent should edit `officers.json` or an officer script itself. It opens that worktree, and only that one, until the next `approve` closes it. `.claude/settings.local.json` and the git directory stay closed.
-- `waive V8 --reason …`: for a branch whose logic change really needs no doc change. It applies to the current branch from the next `run`, and the reason is shown in every verdict and in `verify-branch`'s report.
+- `propose`: when an agent should edit `officers.json` or an officer script itself. It opens that worktree, and only that one, until the next `approve` closes it, or `propose --close` closes it without approving. `.claude/settings.local.json` and the git directory stay closed.
+- `approve` of protected files that equal an earlier approved state (an `officers.json` checked out from an older commit, a merge conflict resolved by taking the older side): the gate refuses them, since you approved the base's newer version after them, and `run` says `…are an earlier approved version than the base's…`. `approve` says the same before it asks; approving records a new approval.
+- `waive V8 --reason …`: for a branch whose logic change really needs no doc change. It applies to the current branch from the next `run`, and the reason is shown in every verdict and in `verify-branch`'s report. An agent, or you, ends it with `node .claude/kh-orchestration/scripts/ko.mjs unwaive V8` on that branch.
 - `exempt <branch> --reason …`: lets that branch's commits through unchecked (step 9). `verify-branch` still fails such a branch.
 
-**Before every merge into `main`.** In the branch's worktree, with a clean tree:
+**Before every merge into `main`.** In the branch's worktree, ON the branch (run on `main` after the merge it judges only the last commit against its parent), with a clean tree, from the approved copy rather than the working copy, whose scripts a session may have changed:
 
 ```sh
-node .claude/kh-orchestration/scripts/ko.mjs verify-branch
+node ~/projects/vyugate/.git/kh-orchestration/bin/ko.mjs verify-branch
 ```
 
 It runs the officers on the branch's head and ends with `Pass: HEAD's tree has a passing verdict against its base, its protected files are approved and contract 1 holds.` (exit 0), or `Fail: …` with the next command. Its report lists any exemption, the waivers in force and every rule an agent reworded since the base. Then merge in the main worktree:
@@ -390,7 +393,7 @@ The dry run lists what it would remove. `--yes --state` removes the scripts, the
 
    For a wrong hash or a missing module it writes the pair back as this plugin ships it, and the next tool call is allowed.
 
-2. If instead it exits 1 saying `.claude/kh-orchestration/scripts/extension.mjs is kept as it is: it was changed since kh-orchestration wrote it…`, the module was changed, and apply never overwrites a change it did not make. Restore BOTH files from `HEAD`, together, then run apply again:
+2. If instead it exits 1 saying `.claude/kh-orchestration/scripts/extension.mjs is kept as it is: it is not the file kh-orchestration wrote…`, the module was changed, and apply never overwrites a change it did not make. It has taken kh-orchestration's entry out of `extensions.json`, so tool calls work again, but every commit is refused until the pair is whole. Restore BOTH files from `HEAD`, together, then run apply again (the lines its `Next:` printed):
 
    ```sh
    git -C <the worktree> restore --source=HEAD --staged --worktree -- .claude/kh-orchestration/scripts/extension.mjs .claude/kh-harness/extensions.json
@@ -419,4 +422,8 @@ Its `Problems:` list names each cause with its next command. The common ones: No
 - **A clone of vyugate has no gate** until you run `apply --yes` in it: the hooks and the state live in the git directory, which a clone does not copy. `git push --mirror` (and a mirror clone) sends the refs under `refs/kh-orchestration/approved/`; an ordinary push does not.
 - **Some harmless commands are blocked in a session:** inline code that mentions a guarded word (`node -e "…git commit -n…"`), test-name patterns behind a runner (`npx jest -t …`), `git commit --author "$A"` (glue it: `--author="$A"`), a `PATH=` or `HOME=` assignment in a line that also runs git, and any write into the git directory except `rm -f .git/index.lock`. Each message says what to do instead.
 - **The extension does not see everything:** a script written to disk and then run, `eval`, variables holding flags, or an encoded payload piped to a shell. The gate, the digest and `verify-branch` are the backstop.
-- **Each commit costs about 140 ms**, a rebase about 15 ms more per rebased commit, and each tool call about 10 ms.
+- **An officer that changes files as it runs** (a lint that fixes, a test that writes an unignored file) gets no verdict: `run` names what it changed. A file it changes and puts back is not seen, and files `.gitignore` hides (`.env`, build output) count in the verdict though no commit holds them.
+- **A sparse checkout, or a file flagged `git update-index --assume-unchanged` or `--skip-worktree`,** makes `run` and `verify-branch` refuse until the flags are cleared.
+- **Approvals are ordered:** going back to an older approved version of the checks needs your approval again (step 8).
+- **Other writing tools:** the extension judges Bash and the edit tools only; an MCP tool that writes files is not judged, and the gate is then the check. Keep your kh-orchestration checkout (`~/projects/kh-orchestration`) out of the sessions' reach: it is not protected.
+- **Each commit costs about 140 ms**, a rebase about 15 ms more per rebased commit, and each tool call about 8 ms.

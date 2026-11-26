@@ -8,6 +8,68 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+What the whole-branch review of stage 1 found, fixed.
+
+### Added
+
+- `ko.mjs unwaive <rule>` ends a waiver on the current branch; like
+  `unexempt` it only tightens, so a session may run it.
+- `ko.mjs propose --close` (the owner's) closes this worktree's proposal
+  without approving; `propose` and `approve` drop the proposals of
+  worktrees that no longer exist.
+- A refused commit's hook prints one more line after its refusal: run
+  kh-orchestration's `status` for the cause, or ask the owner to run its
+  `apply`. `apply` rewrites installed hooks of the earlier text.
+
+### Changed
+
+- Approvals are ordered. A tree's digest counts when it is approved and
+  either equals its base tree's digest or was last approved after it (a
+  base of `none`, from before the install, or never approved imposes no
+  order). Going back to an older approved version of the rules, the
+  officers file or an officer script needs the owner's approval again;
+  approving a digest again records a new approval at the end of
+  `approvals.json`, and `approve` says when the staged files are such an
+  earlier state. The gate, `verify-branch`, `status` and `run` apply one
+  rule.
+- The gate's next lines name the working copy's `ko.mjs` by its absolute,
+  shell-quoted path, so they run pasted from a subdirectory; the
+  extension's messages say to run it from the repository's top directory.
+- `exempt`, and `status` on a branch without the install, name `unexempt`
+  through the approved copy in `bin/`, the one that runs there.
+- `du` is a reading command for the extension (`du -sh .git`).
+- apply's dry run lists the manifest among what it writes; `uninstall
+  --yes` of a committed install prints the command that commits the
+  removal and says what other worktrees keep until they take it.
+- The session brief says every commit will be refused when `bin/` is
+  missing.
+- `run` removes the in-flight records of git processes that have ended,
+  as the gate does, which is what `status` names as their next step.
+
+### Fixed
+
+- An officer that changed the working tree or the index as it ran (an
+  autofixing lint) got a passing verdict for a tree it never passed on.
+  `run` and `verify-branch` now check, after the officers, that the tree
+  is still tidy and the index still holds the tree judged, and record no
+  verdict otherwise, naming the changed paths. A change made and put back
+  during the run is a stated limit.
+- Any earlier approval stayed valid for ever, so restoring an older
+  officers file (`git checkout HEAD~1 -- …/officers.json`) passed the
+  gate with checks the owner had since made stricter.
+- An index entry flagged assume-unchanged or skip-worktree hid a failing
+  staged file behind a passing working copy. `run` and `verify-branch`
+  refuse while any is flagged, with the commands that clear the flags;
+  the extension blocks `git update-index --assume-unchanged` and
+  `--skip-worktree`.
+- `apply --yes` with a changed `extension.mjs` kept the module beside its
+  stale entry, so kh-harness went on blocking every tool call. It now
+  takes the entry out (tool calls work; commits are refused) and prints
+  the two-file restore from `HEAD` then `apply --yes`; `status` names the
+  same repair first.
+- Six tests failed when the temporary directory's path was long; the
+  suite passes with one of 124 and of 171 characters.
+
 ## 0.1.0 - 2026-11-26
 
 The first release: the officer runner, the commit gate and the approval
