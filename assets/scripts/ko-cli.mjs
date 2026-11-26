@@ -208,8 +208,11 @@ export const TEXT = Object.freeze({
   binMissing: (bin) => `There is no ${shownName(bin)}/, so the hooks find no gate and every commit is refused.`,
   binNoGate: (bin) => `${shownName(bin)}/ holds no gate.mjs, so the hooks find no gate and every commit is refused.`,
   binBaselineApproved: (tree) => `the scripts of the last approved tree (${short(tree)})`,
-  binBaselineWorking: 'the installed scripts of the working copy (no approval records a tree yet)',
-  binDiffers: (bin, baseline, names) => `${shownName(bin)}/ differs from ${baseline}: ${named(names)}. The hooks and the owner's commands run bin/; kh-orchestration's apply restores it from the approved tree.`,
+  binBaselineHead: (tree) => `HEAD's tree (${short(tree)}), whose protected files have the last approved digest`,
+  binBaselineBase: (branch, tree) => `the tree of the base branch ${shownName(branch)} (${short(tree)}), whose protected files have the last approved digest`,
+  binBaselineWorking: 'the installed scripts of the working copy (nothing is approved yet)',
+  binDiffers: (bin, baseline, names) => `${shownName(bin)}/ differs from ${baseline}: ${named(names)}. The hooks and the owner's commands run bin/; kh-orchestration's apply restores it from there.`,
+  binUnverifiable: (digest) => `No tree whose protected files have the last approved digest (${short(digest)}) is in the object store, so bin/ cannot be checked against approved scripts. The owner can let bin/ hold kh-orchestration's own scripts with apply --yes --bin-from-plugin, keeping every approval, then approve again.`,
   hookMissing: (name, path) => `The ${name} hook is not installed at ${shownName(path)}, so git does not run the commit gate there.`,
   raceHookMissing: (path) => `The reference-transaction hook is not installed at ${shownName(path)}, so a change to the index in the instant after the gate allows a commit is not caught: verify-branch is then the remedy.`,
   hookMisplaced: (name, path) => `The ${name} hook at ${shownName(path)} holds kh-orchestration's line, but not where it runs first, so a command before it can skip the gate. Put the line directly after the #!/bin/sh line, with only blank or comment lines between.`,
@@ -469,19 +472,56 @@ function hookProblems(root, hook) {
 
 const raceHookWorks = (hook) => hook.present && (hook.matches || hook.hosted) && hook.executable;
 
-// bin/ against what it should hold: the scripts of the last approval that records its tree (the
-// tree approve last refreshed bin/ from), or before any such approval the working copy's
-// installed scripts. `{ present, gate, baseline: { kind, tree }, differs, missing, extra }`.
-function binOf(root, approvals) {
+/**
+ * Where bin/'s scripts should come from (after Task 9's second re-review), one answer for status and
+ * for apply: `{ kind: 'tree', tree, from, branch }` for a tree holding the approved scripts — the
+ * last approval's own tree (`from: 'approved'`; approve pins it with a ref), else HEAD's tree
+ * ('head') or the base branch's ('base', with `branch`) when its protected-files digest is the last
+ * approved digest, since the scripts are in the digest; `{ kind: 'shipped' }` when nothing is
+ * approved; `{ kind: 'none', digest }` when approvals exist but no such tree is reachable;
+ * `{ kind: 'unreadable', reason }` when the approvals cannot be read. Executes nothing.
+ */
+export function binSourceOf(root) {
+  let approvals;
+  try {
+    approvals = readApprovals(root);
+  } catch (error) {
+    return { kind: 'unreadable', reason: failureReason(error) };
+  }
+  const last = approvals.at(-1);
+  if (last === undefined) return { kind: 'shipped' };
+  if (last.tree !== undefined && treeExists(root, last.tree)) return { kind: 'tree', tree: last.tree, from: 'approved', branch: null };
+  let head = null;
+  try {
+    head = headTree(root);
+  } catch {
+    head = null;
+  }
+  const approved = (tree) => tree !== null && digestOfTree(root, tree).digest === last.digest;
+  if (approved(head)) return { kind: 'tree', tree: head, from: 'head', branch: null };
+  const branch = (head === null ? undefined : officersOfTree(root, head).baseBranch) ?? 'main';
+  const named = git(root, ['rev-parse', '--verify', '-q', '--end-of-options', `refs/heads/${branch}^{tree}`]);
+  const base = named.status === 0 ? named.stdout.trim() : null;
+  if (base !== head && approved(base)) return { kind: 'tree', tree: base, from: 'base', branch };
+  return { kind: 'none', digest: last.digest };
+}
+
+// bin/ against what it should hold, by binSourceOf: a tree's scripts; before any approval the
+// working copy's installed scripts (status cannot read the plugin's own); nothing to compare with
+// when no approved tree is reachable. `{ present, gate, baseline: { kind, tree, branch? }, digest?,
+// differs, missing, extra }`.
+function binOf(root, source) {
   const bin = join(stateDir(root), 'bin');
   const stat = statOrNull(bin);
   if (stat === null || !stat.isDirectory()) return { present: false, gate: false, baseline: null, differs: [], missing: [], extra: [] };
-  const last = (approvals ?? []).filter((entry) => entry.tree !== undefined).at(-1);
   const expected = new Map();
   let baseline;
-  if (last !== undefined && treeExists(root, last.tree)) {
-    baseline = { kind: 'approved', tree: last.tree };
-    for (const entry of binEntriesOf(root, last.tree)) expected.set(basename(entry.path), (bytes) => hashesTo(entry.oid, bytes));
+  if (source.kind === 'tree') {
+    baseline = { kind: source.from, tree: source.tree, ...(source.from === 'base' ? { branch: source.branch } : {}) };
+    for (const entry of binEntriesOf(root, source.tree)) expected.set(basename(entry.path), (bytes) => hashesTo(entry.oid, bytes));
+  } else if (source.kind !== 'shipped') {
+    const present = readdirSync(bin).sort();
+    return { present: true, gate: present.includes('gate.mjs'), baseline: { kind: 'none', tree: null }, digest: source.digest ?? null, differs: [], missing: [], extra: [] };
   } else {
     baseline = { kind: 'working', tree: null };
     const scripts = join(root, SCRIPTS);
@@ -507,10 +547,17 @@ function binProblems(root, bin) {
   const directory = join(stateDir(root), 'bin');
   const next = APPLY(root);
   if (!bin.present) return [{ text: TEXT.binMissing(directory), next }];
+  if (bin.baseline.kind === 'none') return bin.digest === null ? [] : [{ text: TEXT.binUnverifiable(bin.digest), next: askOwner(`node <kh-orchestration>/scripts/apply.mjs ${shellWord(root)} --yes --bin-from-plugin`) }];
   if (!bin.gate) return [{ text: TEXT.binNoGate(directory), next }];
   const names = [...bin.differs, ...bin.missing, ...bin.extra].sort();
   if (names.length === 0) return [];
-  const baseline = bin.baseline.kind === 'approved' ? TEXT.binBaselineApproved(bin.baseline.tree) : TEXT.binBaselineWorking;
+  const BASELINES = {
+    approved: () => TEXT.binBaselineApproved(bin.baseline.tree),
+    head: () => TEXT.binBaselineHead(bin.baseline.tree),
+    base: () => TEXT.binBaselineBase(bin.baseline.branch, bin.baseline.tree),
+    working: () => TEXT.binBaselineWorking,
+  };
+  const baseline = BASELINES[bin.baseline.kind]();
   return [{ text: TEXT.binDiffers(directory, baseline, names), next }];
 }
 
@@ -638,7 +685,7 @@ export function statusOf(root) {
   const inflight = { live: records.filter((record) => record.live).map((record) => record.pid), stale: records.filter((record) => !record.live).map((record) => record.pid) };
   if (inflight.stale.length > 0) problems.push({ text: TEXT.staleInflight(inflight.stale), next: agentCommand(root, 'status') });
 
-  const bin = attempt(problems, root, () => binOf(root, approvals), null);
+  const bin = attempt(problems, root, () => binOf(root, binSourceOf(root)), null);
   if (bin !== null) problems.push(...binProblems(root, bin));
   const hooks = HOOK_NAMES.map((name) => inspectHook(root, name));
   for (const hook of hooks) problems.push(...hookProblems(root, hook));
@@ -679,7 +726,8 @@ const yesNo = (value, yes, no) => (value === null ? 'unknown (see the problems)'
 
 function statusLines(root, status) {
   const hookWord = (hook) => (!hook.present ? 'missing' : hook.misplaced ? 'holds the line, but not where it runs first' : !hook.ours && !hook.hosted ? 'not ours' : (hook.matches || hook.hosted) && hook.executable && hook.envExists && hook.nodeExists ? (hook.hosted ? 'ok (its line in a hook of another)' : 'ok') : 'broken');
-  const binWord = (bin) => (bin === null ? 'unknown' : !bin.present ? 'missing' : binProblems(root, bin).length === 0 ? `equal to ${bin.baseline.kind === 'approved' ? 'the last approved tree' : 'the working copy'}` : 'differs');
+  const EQUAL_TO = { approved: 'the last approved tree', head: 'HEAD\'s tree, of the approved digest', base: 'the base branch\'s tree, of the approved digest', working: 'the working copy' };
+  const binWord = (bin) => (bin === null ? 'unknown' : !bin.present ? 'missing' : bin.baseline.kind === 'none' ? 'cannot be checked against an approved tree' : binProblems(root, bin).length === 0 ? `equal to ${EQUAL_TO[bin.baseline.kind]}` : 'differs');
   return [
     TEXT.statusHeader(root),
     `  switch: ${status.off ? 'off' : 'on'}`,

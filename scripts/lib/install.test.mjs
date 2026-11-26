@@ -4,7 +4,8 @@
 // install-kill.test.mjs's; the commands, end to end through real git, are lifecycle.test.mjs's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import childProcess, { spawnSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -654,8 +655,11 @@ test('with no reachable tree of the approved digest, or an approved copy that do
   assert.equal(failing.refusals[0].next, fromPlugin(repo.root));
   assert.ok(failing.refusals[0].text.startsWith(TEXT.approvedBinFails(broken, '').split(':')[0]), failing.refusals[0].text);
   assert.equal(existsSync(join(repo.root, SCRIPTS_DIR, 'ko-git.mjs')), false);
+  // detect runs nothing (after Task 9's second re-review): it reports the restore apply would make
+  // and that apply checks the copy loads; apply's dry run is what refuses.
   const report = detect(repo.root);
-  assert.equal(report.next, fromPlugin(repo.root), 'detect\'s next step is the same');
+  assert.equal(report.next, TEXT.askOwner(applyCommand(repo.root)));
+  assert.ok(report.apply.notes.includes(TEXT.loadCheckedByApply));
   assert.equal(applyPlan(repo.root, plan(repo.root, { binFromPlugin: true })).refusal, null);
   assert.ok(existsSync(join(bin, 'gate.mjs')));
 });
@@ -761,4 +765,83 @@ test('the text left after uninstall for a hosted line says what that line does f
   assert.equal(TEXT.hostedRemains('pre-commit', '/h'), 'The pre-commit hook at /h is not kh-orchestration\'s and is left as it is, but it still holds kh-orchestration\'s line, which refuses every commit once kh-orchestration is gone: remove that line from it by hand.');
   assert.ok(TEXT.hostedRemains('pre-merge-commit', '/h').includes('refuses every merge commit'));
   assert.ok(TEXT.hostedRemains('reference-transaction', '/h').includes('starts nothing once no commit is gated'));
+});
+
+// detect executes nothing but git (after Task 9's second re-review), even when bin/ must be
+// restored from an approved tree: it reports, and apply checks that the copy loads.
+test('detect starts no process but git, even with bin/ to be restored from an approved tree; apply\'s dry run still checks the copy loads', () => {
+  const { repo, tree, bin } = approvedOlderInstall();
+  rmSync(bin, { recursive: true });
+  const started = [];
+  const original = { spawnSync: childProcess.spawnSync, spawn: childProcess.spawn };
+  childProcess.spawnSync = (file, ...rest) => {
+    started.push(file);
+    return original.spawnSync(file, ...rest);
+  };
+  childProcess.spawn = (file, ...rest) => {
+    started.push(file);
+    return original.spawn(file, ...rest);
+  };
+  syncBuiltinESMExports();
+  let report;
+  let planned;
+  let dryRunStarted;
+  try {
+    report = detect(repo.root);
+    const detectStarted = [...started];
+    started.length = 0;
+    planned = plan(repo.root);
+    dryRunStarted = [...started];
+    started.length = 0;
+    assert.deepEqual([...new Set(detectStarted)], ['git'], 'detect');
+  } finally {
+    Object.assign(childProcess, original);
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(report.apply.actions.filter((action) => action.kind === 'state-copy').map((action) => action.detail), [TEXT.restoreBin(bin, tree)]);
+  assert.ok(report.apply.notes.includes(TEXT.loadCheckedByApply));
+  assert.ok(dryRunStarted.includes(process.execPath), 'the dry run runs the pre-flight');
+  assert.equal(planned.actions[0].detail, TEXT.restoreBin(bin, tree));
+});
+
+test('the dry run refuses to check an approved copy in a temporary directory inside the repository', () => {
+  const { repo, bin } = approvedOlderInstall();
+  rmSync(bin, { recursive: true });
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = join(repo.root, 'tmp-inside');
+  mkdirSync(process.env.TMPDIR);
+  try {
+    assert.deepEqual(plan(repo.root).refusals, [{ text: TEXT.scratchInside, next: 'export TMPDIR=/tmp' }]);
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
+});
+
+// apply and status agree about bin/ (after Task 9's second re-review): with approvals but no
+// reachable approved tree, neither rewrites nor calls bin/ good; both name --bin-from-plugin.
+test('with approvals but no reachable approved tree, apply leaves a differing bin/ with a note naming --bin-from-plugin, and status says the same', () => {
+  const repo = fresh();
+  applyPlan(repo.root, plan(repo.root));
+  const bin = join(stateDir(repo.root), 'bin');
+  writeState(repo.root, 'approvals.json', approval('a'.repeat(64)));
+  writeFileSync(join(bin, 'ko-verdict.mjs'), `${readFileSync(join(bin, 'ko-verdict.mjs'), 'utf8')}// other\n`);
+  const planned = plan(repo.root);
+  assert.equal(planned.actions.some((action) => action.kind === 'state-copy'), false);
+  assert.ok(planned.notes.includes(KO_TEXT.binUnverifiable('a'.repeat(64))), planned.notes.join('\n'));
+  const status = statusOf(repo.root);
+  assert.equal(status.bin.baseline.kind, 'none');
+  assert.deepEqual(status.problems.filter((problem) => problem.text === KO_TEXT.binUnverifiable('a'.repeat(64))), [
+    { text: KO_TEXT.binUnverifiable('a'.repeat(64)), next: TEXT.askOwner(`node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes --bin-from-plugin`) },
+  ]);
+});
+
+test('status checks bin/ against the same source apply restores it from: HEAD\'s tree when the approved one was pruned', () => {
+  const { repo, bin } = approvedThenPruned();
+  const head = repo.git('rev-parse', 'HEAD^{tree}').stdout.trim();
+  writeFileSync(join(bin, 'ko-gate.mjs'), 'export const broken = true;\n');
+  const status = statusOf(repo.root);
+  assert.deepEqual(status.bin.baseline, { kind: 'head', tree: head });
+  assert.ok(status.problems.some((problem) => problem.text === KO_TEXT.binDiffers(bin, KO_TEXT.binBaselineHead(head), ['ko-gate.mjs'])), JSON.stringify(status.problems));
+  assert.equal(plan(repo.root).actions[0].detail, TEXT.restoreBinFromHead(bin, head));
 });

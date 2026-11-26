@@ -1,10 +1,10 @@
 // The shared state directory: <git-common-dir>/kh-orchestration/, the same
 // directory from every linked worktree.
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { shellWord } from './extension.mjs';
 import { hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { commonDir, listEntries, readBlobs } from './ko-git.mjs';
@@ -392,13 +392,44 @@ export function treeScripts(root, tree) {
 }
 
 /**
- * Whether `files` (`[{ name, bytes }]`) load as a bin/ would: the same pre-flight, run on a copy in
- * a temporary directory outside the repository, which is removed. Throws a StateError of
- * failedMessage(<the script>) when they do not. apply (Task 9) checks an approved copy with it in
- * its dry run, so a copy that would fail is refused before anything is written.
+ * A fresh private directory under the system's temporary directory, `{ dir }`, or `{ problem }`:
+ * 'relative' when TMPDIR is a relative path, 'unusable' when no directory can be made there,
+ * 'inside' when it lies inside the repository `root` (where a copy could be changed or committed;
+ * the directory is then removed). The gate's private copy and apply's pre-flight use it alike.
  */
-export function checkLoads(files, failedMessage) {
-  const dir = mkdtempSync(join(tmpdir(), 'ko-bin-check-'));
+export function privateDir(root, prefix) {
+  const base = tmpdir();
+  if (!isAbsolute(base)) return { problem: 'relative' };
+  let dir;
+  try {
+    dir = realpathSync(mkdtempSync(join(realpathSync(base), prefix)));
+  } catch {
+    return { problem: 'unusable' };
+  }
+  const repository = realpathSync(root);
+  if (dir === repository || dir.startsWith(`${repository}${sep}`)) {
+    rmSync(dir, { recursive: true, force: true });
+    return { problem: 'inside' };
+  }
+  return { dir };
+}
+export const SCRATCH_MESSAGES = Object.freeze({
+  relative: 'TMPDIR names a relative path, so where a private copy is made depends on the directory a command runs in. Set TMPDIR to an absolute directory outside the repository.',
+  unusable: 'The temporary directory (TMPDIR, or /tmp when it is not set) does not exist or cannot be written. Set TMPDIR to a directory outside the repository that can be.',
+  inside: 'The temporary directory (TMPDIR) lies inside the repository, where a private copy could be changed or committed. Set TMPDIR to a directory outside it.',
+});
+
+/**
+ * Whether `files` (`[{ name, bytes }]`) load as a bin/ would: the same pre-flight, run on a copy in
+ * a private directory outside the repository `root` (privateDir), which is removed. Throws a
+ * StateError of failedMessage(<the script>) when they do not, or of SCRATCH_MESSAGES when no such
+ * directory can be made. apply (Task 9) checks an approved copy with it in its dry run, so a copy
+ * that would fail is refused before anything is written.
+ */
+export function checkLoads(root, files, failedMessage) {
+  const made = privateDir(root, 'ko-bin-check-');
+  if (made.problem !== undefined) throw new StateError(SCRATCH_MESSAGES[made.problem]);
+  const { dir } = made;
   try {
     for (const file of files) writeFileSync(join(dir, file.name), file.bytes);
     preflight(dir, files.map((file) => file.name).sort(), failedMessage);

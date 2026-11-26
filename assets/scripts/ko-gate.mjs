@@ -30,15 +30,14 @@
 // (a script on disk, a command git runs from configuration before the hook, such as core.fsmonitor
 // inside git commit itself) can write a verdict or an approval. The extension blocks the one-line
 // ways, and verify-branch, which re-runs the officers, is the remedy.
-import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, constants, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, sep } from 'node:path';
+import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, constants, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { COMMANDS, shellWord } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
 import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
 import { GitError, baseOf, currentBranch, indexTree, listEntries, ownIndexEntry, readBlobs, repoRoot, treeEntry, treeOfCommitId } from './ko-git.mjs';
 import { officersOfTree } from './ko-officers.mjs';
-import { FILE_MODES, StateError, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, removeStaleInflight, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
+import { FILE_MODES, StateError, isOff, ownerCommand, readApprovals, readExemptions, readInflight, removeInflight, privateDir, removeStaleInflight, stageInstall, writeAccepted, writeInflight } from './ko-state.mjs';
 import { passing, readVerdict } from './ko-verdict.mjs';
 
 const COMMIT_HOOKS = ['pre-commit', 'pre-merge-commit'];
@@ -316,19 +315,12 @@ function projectEnvRefusal(root) {
 // ends, a throw included. `{ holds }` (contractHolds's answer), or `{ problem }` when TMPDIR is
 // relative, the directory cannot be made or lies inside the repository, or a blob does not hash to
 // its id. Throws what readBlobs throws.
+const PRIVATE_DIR_REASONS = { relative: REASONS.probeDirRelative, unusable: REASONS.probeDirUnusable, inside: REASONS.probeDirInside };
 function contractOnPrivateCopy(root, live) {
-  const base = tmpdir();
-  if (!isAbsolute(base)) return { problem: REASONS.probeDirRelative };
-  let dir;
+  const made = privateDir(root, 'ko-probe-');
+  if (made.problem !== undefined) return { problem: PRIVATE_DIR_REASONS[made.problem] };
+  const { dir } = made;
   try {
-    dir = mkdtempSync(join(realpathSync(base), 'ko-probe-'));
-  } catch {
-    return { problem: REASONS.probeDirUnusable };
-  }
-  try {
-    const real = realpathSync(dir);
-    const repository = realpathSync(root);
-    if (real === repository || real.startsWith(`${repository}${sep}`)) return { problem: REASONS.probeDirInside };
     const blobs = readBlobs(root, live.map((entry) => entry.oid));
     for (const entry of live) {
       const bytes = blobs.get(entry.oid);

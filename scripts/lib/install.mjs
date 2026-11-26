@@ -1,12 +1,13 @@
 // The installer (Task 9, with its review and re-review): what `apply`, `detect` and `uninstall` do,
 // as functions the three commands in scripts/ call. It runs from the PLUGIN and imports only the
 // plugin's own shipped copies in assets/scripts/, never a target's installed copies, which may be
-// damaged or hostile. git reads the target; the programs started are /bin/sh, the plugin's own
-// scripts (the hooks' self-test, bin/'s pre-flight) and, only when bin/ must be restored from an
-// approved tree, that tree's approved scripts, loaded by the same pre-flight in a temporary
-// directory before anything is written.
+// damaged or hostile. git reads the target. apply (its dry run included) also starts /bin/sh, the
+// plugin's own scripts (the hooks' self-test, bin/'s pre-flight) and, only when bin/ must be
+// restored from an approved tree, that tree's approved scripts, loaded by the same pre-flight in a
+// private directory outside the repository before anything is written. detect starts nothing but
+// git (plan with `execute: false`): it reports what apply would do and what apply would check.
 //
-// `plan(dir, { downgrade, binFromPlugin })` is the dry run, as data: `{ root, env, node, refusals,
+// `plan(dir, { downgrade, binFromPlugin, execute })` is the dry run, as data: `{ root, env, node, refusals,
 // actions, conflicts, notes }`. Refusals and conflicts are `{ text, next }`, fixed text and the
 // command to run next; an action is `{ kind, path, detail, ... }`, `detail` the line printed for it.
 // It writes nothing (what the contract check, the self-test and the pre-flight need is copied into
@@ -49,16 +50,14 @@ import {
   writeManifest, writeWhole,
 } from './manifest.mjs';
 import { COMMANDS, PROTECTED_FILES, PROTECTED_PREFIXES, matchesGlob, readOfficers, shellWord } from '../../assets/scripts/extension.mjs';
-import { OWNER_VARIABLES, TEXT as KO_TEXT, agentCommand, askOwner, gitVersion, statusOf } from '../../assets/scripts/ko-cli.mjs';
+import { OWNER_VARIABLES, TEXT as KO_TEXT, agentCommand, askOwner, binSourceOf, gitVersion, statusOf } from '../../assets/scripts/ko-cli.mjs';
 import { EXTENSION_ID, MODULE, STAMP, entryOf } from '../../assets/scripts/ko-contract.mjs';
 import { hashesTo } from '../../assets/scripts/ko-digest.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
-import { APPROVED_REFS, GitError, commonDir, currentBranch, git, headTree, repoRoot } from '../../assets/scripts/ko-git.mjs';
-import { officersOfTree } from '../../assets/scripts/ko-officers.mjs';
-import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
+import { APPROVED_REFS, GitError, commonDir, currentBranch, git, repoRoot } from '../../assets/scripts/ko-git.mjs';
 import { HOOK_NAMES, REFUSED_TEXT, hookLine, hookParts, hookText, hostedParts } from '../../assets/scripts/ko-hooks.mjs';
 import {
-  INSTALL_PATHS, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stageInstall, stateDir, treeScripts,
+  INSTALL_PATHS, SCRATCH_MESSAGES, StateError, binEntriesOf, checkLoads, listInflight, ownerCommand, readApprovals, refreshBin, removeStaleInflight, replaceBin, stageInstall, stateDir, treeScripts,
 } from '../../assets/scripts/ko-state.mjs';
 import { checkContract1 } from '../../assets/scripts/verify-contract-1.mjs';
 
@@ -70,7 +69,6 @@ export const EXTENSIONS_PATH = '.claude/kh-harness/extensions.json';
 const CONTRACT_PATH = '.claude/kh-harness/contract.json';
 const ENV_CANDIDATES = ['/usr/bin/env', '/bin/env'];
 const SHELL = '/bin/sh';
-const MIN_GIT = '2.30';
 // kh-harness's limits for the extensions file (CONTRACT.md, "The extensions file").
 const EXTENSIONS_MAX_BYTES = 65536;
 const ENTRIES_MAX = 8;
@@ -219,6 +217,8 @@ export const TEXT = Object.freeze({
   approvedBinFails: (tree, reason) => `The scripts of the last approved tree (${tree.slice(0, 12)}) do not load here: ${reason} So bin/ is not restored from them, and nothing is written. The owner can let bin/ hold kh-orchestration's own scripts, keeping every approval, verdict and record, then approve again.`,
   scriptDoesNotLoad: (script) => `${script} does not load (a syntax error, a missing file, or a script it imports that is missing or damaged).`,
   binFromPluginAction: (path) => `replace ${path}/ with kh-orchestration ${KIT_VERSION}'s own scripts (--bin-from-plugin), keeping every approval, verdict and record`,
+  loadCheckedByApply: 'apply checks that these scripts load, in a private directory outside the repository, before it writes anything; detect does not run them.',
+  scratchInside: SCRATCH_MESSAGES.inside,
   binFromPlugin: `bin/ now holds kh-orchestration ${KIT_VERSION}'s own scripts, which nobody approved in this repository: the owner approves again (stage the install, then approve) to put an approved copy there.`,
   approvalsUnreadable: (reason) => `The approvals cannot be read (${reason.replace(/\.$/, '')}), so it is not known which scripts bin/ should hold; nothing is written.`,
 
@@ -564,55 +564,19 @@ function readBin(root) {
   return new Map(readdirSync(bin).map((name) => [name, readRegular(join(bin, name), MAX_SCRIPT_BYTES).bytes]));
 }
 
-const treeExists = (root, tree) => {
-  const type = git(root, ['cat-file', '-t', '--end-of-options', tree]);
-  return type.status === 0 && type.stdout.trim() === 'tree';
+
+// What apply says it restores bin/ from, for binSourceOf's answer.
+const RESTORE_DETAIL = {
+  approved: (path, source) => TEXT.restoreBin(path, source.tree),
+  head: (path, source) => TEXT.restoreBinFromHead(path, source.tree),
+  base: (path, source) => TEXT.restoreBinFromBase(path, source.branch, source.tree),
 };
-
-// The id of the tree a branch names, or null.
-function branchTree(root, branch) {
-  const result = git(root, ['rev-parse', '--verify', '-q', '--end-of-options', `refs/heads/${branch}^{tree}`]);
-  return result.status === 0 ? result.stdout.trim() : null;
-}
-
-/**
- * What bin/ should hold (after Task 9's review and re-review): `{ kind: 'shipped' }` before any
- * approval; `{ kind: 'tree', tree, detail }` for the scripts of a tree whose bytes are the approved
- * ones — the last approval's own tree when the object store still has it (approve pins it with a
- * ref), else HEAD's tree, else the base branch's, when its protected-files digest is the last
- * approved digest (the scripts are in the digest); `{ kind: 'none', digest }` when no such tree is
- * reachable; `{ kind: 'unreadable', reason }` when the approvals cannot be read.
- */
-function binSource(root) {
-  let approvals;
-  try {
-    approvals = readApprovals(root);
-  } catch (error) {
-    return { kind: 'unreadable', reason: error instanceof StateError ? error.message : TEXT.statusUnreadable };
-  }
-  const last = approvals.at(-1);
-  if (last === undefined) return { kind: 'shipped' };
-  if (last.tree !== undefined && treeExists(root, last.tree)) return { kind: 'tree', tree: last.tree, detail: (path) => TEXT.restoreBin(path, last.tree) };
-  let head = null;
-  try {
-    head = headTree(root);
-  } catch {
-    head = null;
-  }
-  const approved = (tree) => tree !== null && digestOfTree(root, tree).digest === last.digest;
-  if (approved(head)) return { kind: 'tree', tree: head, detail: (path) => TEXT.restoreBinFromHead(path, head) };
-  const read = head === null ? null : officersOfTree(root, head);
-  const branch = read?.baseBranch ?? 'main';
-  const base = branchTree(root, branch);
-  if (base !== head && approved(base)) return { kind: 'tree', tree: base, detail: (path) => TEXT.restoreBinFromBase(path, branch, base) };
-  return { kind: 'none', digest: last.digest };
-}
 
 // Why the scripts of `tree` would not make a working bin/ (fixed text), or null when they would:
 // read and verified from the object store, then loaded by the pre-flight in a temporary directory.
 function treeFailsToLoad(root, tree) {
   try {
-    checkLoads(treeScripts(root, tree), TEXT.scriptDoesNotLoad);
+    checkLoads(root, treeScripts(root, tree), TEXT.scriptDoesNotLoad);
     return null;
   } catch (error) {
     return error instanceof StateError || error instanceof GitError ? error.message : TEXT.statusUnreadable;
@@ -798,9 +762,11 @@ const refused = (root, refusals) => ({ root, refusals, actions: [], conflicts: [
 
 /**
  * The dry run of `apply` for the repository `dir` is in: `{ root, env, node, refusals, actions,
- * conflicts, notes }`. With a refusal there are no actions. Writes nothing.
+ * conflicts, notes }`. With a refusal there are no actions. Writes nothing. `downgrade` and
+ * `binFromPlugin` are apply's two owner flags; with `execute` false (detect) the self-test and the
+ * pre-flight are skipped and a note says apply runs them.
  */
-export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
+export function plan(dir, { downgrade = false, binFromPlugin = false, execute = true } = {}) {
   const resolved = resolveRoot(dir, 'apply');
   if (resolved.refusal !== undefined) return refused(null, [resolved.refusal]);
   const { root } = resolved;
@@ -906,7 +872,7 @@ export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
   // anything else is written, and is refused in the dry run when that tree's scripts do not load.
   const binPath = join(stateDir(root), 'bin');
   const bin = readBin(root);
-  const source = binSource(root);
+  const source = binSourceOf(root);
   if (source.kind === 'unreadable') return stop(TEXT.approvalsUnreadable(source.reason), agentCommand(root, 'status'));
   const fromPluginNext = askOwner(`${applyCommand(root)} --bin-from-plugin`);
   const shippedExpected = new Map(shippedScripts().map((script) => [script.name, (bytes) => sameBytes(bytes, script.bytes)]));
@@ -919,16 +885,23 @@ export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
     notes.push(TEXT.binFromPlugin);
   };
   if (source.kind === 'none') {
+    // Nothing to check bin/ against: it is left, and said so (status says the same), unless the
+    // owner asks for the plugin's own scripts.
     if (binFromPlugin) fromPlugin();
     else if (bin === null || !bin.has('gate.mjs')) return stop(TEXT.noApprovedSource(source.digest), fromPluginNext);
+    else if (differs.length > 0) notes.push(KO_TEXT.binUnverifiable(source.digest));
   } else if (bin === null || differs.length > 0) {
     if (source.kind === 'shipped') {
       actions.push({ kind: 'state-copy', path: binPath, detail: bin === null ? TEXT.createBin(binPath) : TEXT.replaceBin(binPath, differs), tree: null });
     } else {
-      const reason = treeFailsToLoad(root, source.tree);
+      // apply (its dry run included) checks the copy loads before anything is written; detect
+      // executes nothing and only reports.
+      const reason = execute ? treeFailsToLoad(root, source.tree) : null;
+      if (!execute) notes.push(TEXT.loadCheckedByApply);
+      if (reason !== null && Object.values(SCRATCH_MESSAGES).includes(reason)) return stop(reason, 'export TMPDIR=/tmp');
       if (reason !== null && !binFromPlugin) return stop(TEXT.approvedBinFails(source.tree, reason), fromPluginNext);
       if (reason !== null) fromPlugin();
-      else actions.unshift({ kind: 'state-copy', path: binPath, detail: source.detail(binPath), tree: source.tree });
+      else actions.unshift({ kind: 'state-copy', path: binPath, detail: RESTORE_DETAIL[source.from](binPath, source), tree: source.tree });
     }
   } else if (manifest?.stateDir !== true) {
     actions.push({ kind: 'record', path: stateDir(root), detail: TEXT.record(stateDir(root)), stateDir: true });
@@ -972,7 +945,7 @@ export function plan(dir, { downgrade = false, binFromPlugin = false } = {}) {
   // run writes it), or while the hooks would not start the gate.
   const problems = contractAfter(root, entry, plannedText);
   if (problems.length > 0) return refused(root, problems.map((problem) => ({ text: TEXT.contractWouldFail(problem), next: khHarnessApply(root) })));
-  if (actions.some((action) => action.kind === 'git-hook')) {
+  if (execute && actions.some((action) => action.kind === 'git-hook')) {
     const failed = selfTest({ env, node, binFiles: shippedScripts() });
     if (failed === TEXT.noShP) return stop(TEXT.noShP, `${SHELL} -p -c 'exit 0'`);
     if (failed !== null) return stop(TEXT.selfTestFailed(failed), detectCommand(root));
@@ -1338,8 +1311,9 @@ const HOOK_WORDS = {
 /**
  * What `detect` reports for the repository `dir` is in, as one object (the shape `--json`
  * prints): `{ schema: 1, root, plugin, install, files, officers, gitattributes, extensionEntry,
- * hooks, coverage, status, statusError, apply }`, or `{ refusal }` when there is no repository.
- * Executes nothing from the repository: git reads it, and statusOf runs no probe.
+ * hooks, coverage, status, statusError, apply, next }`, or `{ refusal }` when there is no
+ * repository. Starts no process but git: statusOf runs no probe, and the dry run inside it skips the
+ * self-test and the pre-flight (after Task 9's second re-review), saying that apply checks them.
  */
 export function detect(dir) {
   const resolved = resolveRoot(dir, 'detect');
@@ -1371,7 +1345,7 @@ export function detect(dir) {
     statusError = error instanceof GitError || error instanceof StateError ? error.message : TEXT.statusUnreadable;
   }
   const attributes = readRegular(join(root, ATTRIBUTES_FILE), MAX_SMALL_FILE_BYTES);
-  const planned = plan(root);
+  const planned = plan(root, { execute: false });
   return {
     schema: 1,
     root,
