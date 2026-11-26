@@ -41,7 +41,9 @@ import {
 import { passing, produceVerdict, readVerdict, writeVerdict } from './ko-verdict.mjs';
 import { checkContract1 } from './verify-contract-1.mjs';
 
-const OWNER_VARIABLES = ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID'];
+// The variables a Claude Code session sets (decision 13): an owner's command refuses while either is
+// set. The installer's writing runs (apply --yes, uninstall --yes) read the same list.
+export const OWNER_VARIABLES = Object.freeze(['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID']);
 const NAMED_AT_MOST = 10;
 const OUTPUT_LINES = 10;
 const MAX_REASON = 500;
@@ -72,10 +74,12 @@ function named(items) {
 const withReason = (entries, label) => entries.map((entry) => `${shownName(entry[label])} (${shownText(entry.reason)})`).join(', ');
 const branchWords = (branch) => (branch === null ? 'a detached HEAD' : shownName(branch));
 const KO = COMMANDS.status.slice(0, -' status'.length);
-// The repair for a missing or damaged bin/: kh-orchestration's apply, from the plugin. ko.mjs and
-// gate.mjs can only print literals, so they print it for the word <repository>; a test holds the
-// three texts to this one.
-export const repairCommand = (rootWord) => `node <kh-orchestration>/scripts/apply.mjs ${rootWord} --yes`;
+// A command only the owner runs, as a next line a session may read (after Task 9's review).
+export const askOwner = (command) => `ask the owner to run, in their own terminal outside Claude Code: ${command}`;
+// The repair for a missing or damaged bin/: kh-orchestration's apply, from the plugin, the owner's
+// to run. ko.mjs and gate.mjs can only print literals, so they print it for the word <repository>;
+// a test holds the three texts to this one.
+export const repairCommand = (rootWord) => askOwner(`node <kh-orchestration>/scripts/apply.mjs ${rootWord} --yes`);
 const APPLY = (root) => repairCommand(shellWord(root));
 // The one rule for an agent's command ko.mjs prints: the working copy's ko.mjs by its absolute
 // path, quoted for a shell, so it runs from whatever directory the person is in (a subdirectory, a

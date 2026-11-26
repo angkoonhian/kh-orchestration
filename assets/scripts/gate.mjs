@@ -15,7 +15,7 @@ const ALLOWED_TOKEN = 'kh-orchestration: allowed';
 // commands run from this same bin/, so the repair is kh-orchestration's apply, run from the plugin,
 // which copies the approved tree's scripts into bin/ again.
 const UNLOADABLE = 'kh-orchestration: the gate could not decide: a script in <git-common-dir>/kh-orchestration/bin/ is missing, out of date or cannot be loaded. The commit is refused.\n'
-  + 'Next: node <kh-orchestration>/scripts/apply.mjs <repository> --yes\n';
+  + 'Next: ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes\n';
 const UNEXPECTED = 'kh-orchestration: the gate could not decide: an unexpected error stopped the check. The commit is refused.\n'
   + 'Next: node .claude/kh-orchestration/scripts/ko.mjs status\n';
 

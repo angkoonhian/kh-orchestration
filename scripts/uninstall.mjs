@@ -3,11 +3,9 @@
 // Removes what apply recorded in the repository <repository> is in, in the reverse of apply's
 // order, each only if it is what was written; what the owner changed is kept and reported. The
 // shared state directory goes only with --state. A dry run unless --yes, and --yes is the owner's
-// alone (decision 13): it refuses inside a Claude Code session, since removing the hooks switches
-// the commit gate off. Exit 0 done, 1 refused, 2 usage. The logic is scripts/lib/install.mjs's.
-import { TEXT, applyUninstall, parseArguments, print, refuse, runCommand, uninstallLines, uninstallPlan, usageError } from './lib/install.mjs';
-
-const OWNER_VARIABLES = ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID'];
+// alone (decision 13, after Task 9's review): it refuses inside a Claude Code session, since
+// removing the hooks switches the commit gate off. Exit 0 done, 1 refused, 2 usage. The logic is scripts/lib/install.mjs's.
+import { TEXT, applyUninstall, ownerRefusal, parseArguments, print, refuse, runCommand, uninstallLines, uninstallPlan, usageError } from './lib/install.mjs';
 
 function main(argv) {
   const args = parseArguments(argv, ['--yes', '--state']);
@@ -20,15 +18,16 @@ function main(argv) {
   const state = args.flags.has('--state');
   const planned = uninstallPlan(args.repo, { state });
   if (planned.refusals.length > 0) return refuse(planned.refusals);
-  const variable = OWNER_VARIABLES.find((name) => process.env[name] !== undefined);
-  if (!dryRun && variable !== undefined) return refuse([{ text: TEXT.ownerOnly(variable), next: `${TEXT.uninstallCommand(planned.root, state)}, in the owner's own terminal` }]);
+  const session = dryRun ? null : ownerRefusal('uninstall', TEXT.uninstallCommand(planned.root, state));
+  if (session !== null) return refuse([session]);
   print(uninstallLines(planned, { dryRun }));
   if (planned.actions.length === 0) return 0;
   if (dryRun) {
     print([TEXT.uninstallDryEnd(TEXT.uninstallCommand(planned.root, state))]);
     return 0;
   }
-  applyUninstall(planned.root, planned);
+  const result = applyUninstall(planned.root, planned);
+  if (result.refusal !== null) return refuse([result.refusal]);
   print([TEXT.uninstalled(planned.root)]);
   return 0;
 }

@@ -12,7 +12,7 @@
 const FROM_BIN = import.meta.dirname.endsWith('/kh-orchestration/bin');
 const UNLOADABLE = FROM_BIN
   ? 'kh-orchestration: ko.mjs could not start: the approved copy in <git-common-dir>/kh-orchestration/bin/ is missing a script, or one is damaged or of another version.\n'
-    + 'Next: node <kh-orchestration>/scripts/apply.mjs <repository> --yes\n'
+    + 'Next: ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes\n'
   : 'kh-orchestration: ko.mjs could not start: a script beside it in .claude/kh-orchestration/scripts/ is missing, damaged or of another version.\n'
     + 'Next: git status -- .claude/kh-orchestration/scripts\n';
 const UNEXPECTED = 'kh-orchestration: ko.mjs could not finish: an unexpected error stopped it.\n'

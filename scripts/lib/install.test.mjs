@@ -384,7 +384,7 @@ test('an existing hook that is not kh-orchestration\'s is a conflict: none of th
   chmodSync(preCommit, 0o755);
   const planned = plan(repo.root);
   const line = hookLine('pre-commit', { env: envPath(), node: process.execPath });
-  assert.deepEqual(planned.conflicts, [{ text: TEXT.hookConflict('pre-commit', preCommit, line), next: applyCommand(repo.root) }]);
+  assert.deepEqual(planned.conflicts, [{ text: TEXT.hookConflict('pre-commit', preCommit, line), next: TEXT.askOwner(applyCommand(repo.root)) }]);
   assert.equal(planned.actions.some((action) => action.kind === 'git-hook'), false);
   const result = applyPlan(repo.root, planned);
   assert.equal(result.refusal, null);
@@ -427,9 +427,9 @@ test('an owner-edited or unstamped installed script is kept and reported, the ho
   for (const name of HOOK_NAMES) rmSync(join(hooksDir(repo.root), name));
   const planned = plan(repo.root);
   assert.deepEqual(planned.conflicts, [
-    { text: TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), next: applyCommand(repo.root) },
-    { text: TEXT.scriptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`), next: applyCommand(repo.root) },
-    { text: TEXT.hooksStopped, next: applyCommand(repo.root) },
+    { text: TEXT.scriptEdited(`${SCRIPTS_DIR}/ko-officers.mjs`), next: TEXT.askOwner(applyCommand(repo.root)) },
+    { text: TEXT.scriptNotOurs(`${SCRIPTS_DIR}/ko-verdict.mjs`), next: TEXT.askOwner(applyCommand(repo.root)) },
+    { text: TEXT.hooksStopped, next: TEXT.askOwner(applyCommand(repo.root)) },
   ]);
   assert.equal(planned.actions.some((action) => action.kind === 'git-hook'), false);
   applyPlan(repo.root, planned);
@@ -505,7 +505,7 @@ test('the self-test after the hooks are written removes them and refuses when th
   const repo = fresh();
   const planned = plan(repo.root);
   const result = applyPlan(repo.root, { ...planned, node: join(repo.root, '..', 'no-such-node') });
-  assert.deepEqual(result.refusal, { text: TEXT.selfTestRemoved(TEXT.gateDidNotAnswer), next: applyCommand(repo.root) });
+  assert.deepEqual(result.refusal, { text: TEXT.selfTestRemoved(TEXT.gateDidNotAnswer), next: TEXT.askOwner(applyCommand(repo.root)) });
   for (const name of HOOK_NAMES) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
   assert.deepEqual(readManifest(repo.root).manifest.gitHooks, []);
   assert.equal(TEXT.selfTestRemoved('x'), 'The hooks just written could not start the commit gate (x), so they were removed: hooks that cannot run the gate would refuse every commit.');
@@ -604,4 +604,33 @@ test('a kill after each write of apply --yes leaves a state that apply completes
     repo.cleanup();
     rmSync(copy, { recursive: true, force: true });
   }
+});
+
+test('applyPlan and applyUninstall refuse inside a Claude Code session and write nothing; plan and uninstallPlan stay open (after Task 9\'s review)', () => {
+  const repo = fresh();
+  const planned = plan(repo.root);
+  const before = everything(repo.root);
+  for (const variable of ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID']) {
+    process.env[variable] = '1';
+    try {
+      assert.deepEqual(plan(repo.root).refusals, []);
+      assert.deepEqual(applyPlan(repo.root, planned).refusal, { text: TEXT.ownerOnly('apply', variable), next: TEXT.askOwner(applyCommand(repo.root)) });
+      assert.deepEqual(everything(repo.root), before, variable);
+    } finally {
+      delete process.env[variable];
+    }
+  }
+  applyPlan(repo.root, planned);
+  const installed = everything(repo.root);
+  const uninstalled = uninstallPlan(repo.root, { state: true });
+  process.env.CLAUDECODE = '1';
+  try {
+    assert.deepEqual(uninstallPlan(repo.root, { state: true }).refusals, []);
+    assert.deepEqual(applyUninstall(repo.root, uninstalled).refusal, { text: TEXT.ownerOnly('uninstall', 'CLAUDECODE'), next: TEXT.askOwner(TEXT.uninstallCommand(repo.root, true)) });
+    assert.deepEqual(everything(repo.root), installed);
+  } finally {
+    delete process.env.CLAUDECODE;
+  }
+  assert.equal(TEXT.ownerOnly('apply', 'CLAUDECODE'), 'apply --yes is the owner\'s to run in their own terminal, outside Claude Code: CLAUDECODE is set here, so this is a Claude Code session. Nothing was changed.');
+  assert.equal(TEXT.askOwner('x'), 'ask the owner to run, in their own terminal outside Claude Code: x');
 });

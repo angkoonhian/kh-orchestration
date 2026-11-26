@@ -43,7 +43,7 @@ import {
   writeManifest, writeWhole,
 } from './manifest.mjs';
 import { COMMANDS, PROTECTED_FILES, PROTECTED_PREFIXES, matchesGlob, readOfficers, shellWord } from '../../assets/scripts/extension.mjs';
-import { TEXT as KO_TEXT, agentCommand, gitVersion, hooksPathNext, hooksPathOf, statusOf } from '../../assets/scripts/ko-cli.mjs';
+import { OWNER_VARIABLES, TEXT as KO_TEXT, agentCommand, askOwner, gitVersion, hooksPathNext, hooksPathOf, statusOf } from '../../assets/scripts/ko-cli.mjs';
 import { EXTENSION_ID, STAMP } from '../../assets/scripts/ko-contract.mjs';
 import { hashesTo } from '../../assets/scripts/ko-digest.mjs';
 import { REASONS } from '../../assets/scripts/ko-gate.mjs';
@@ -154,7 +154,8 @@ export const TEXT = Object.freeze({
   selfTestRemoved: (what) => `The hooks just written could not start the commit gate (${what}), so they were removed: hooks that cannot run the gate would refuse every commit.`,
   writeFailed: (path) => `${path} could not be written; what was written before it is recorded in ${MANIFEST_PATH}.`,
   binShippedPreflight: (script) => `kh-orchestration's own ${script} does not load with this Node, so bin/ was not replaced. Reinstall the plugin, or run it with Node 22 or later.`,
-  ownerOnly: (variable) => `uninstall --yes is the owner's to run in their own terminal, outside Claude Code: ${variable} is set here, so this is a Claude Code session. Nothing was changed.`,
+  ownerOnly: (command, variable) => `${command} --yes is the owner's to run in their own terminal, outside Claude Code: ${variable} is set here, so this is a Claude Code session. Nothing was changed.`,
+  askOwner,
 
   createScript: (path) => `write ${path} (new)`,
   updateScript: (path, version) => `update ${path} (from kh-orchestration ${version} to ${KIT_VERSION})`,
@@ -191,7 +192,7 @@ export const TEXT = Object.freeze({
   notesHeader: 'Notes:',
   conflictsHeader: 'Conflicts (the install is incomplete while they stand):',
   nothingToDo: (root) => `kh-orchestration ${KIT_VERSION} is installed in ${root} and up to date: nothing to do.`,
-  dryRunEnd: (command) => `Nothing was written. To apply: ${command}`,
+  dryRunEnd: (command) => `Nothing was written. To apply, ${askOwner(command)}`,
   incomplete: 'The install is incomplete: the conflicts above are left as they are, so git does not run the commit gate yet. Resolve them and run apply again.',
   installed: (root) => `kh-orchestration ${KIT_VERSION} is installed in ${root}.`,
   notApprovedYet: 'Nothing is approved yet: the commit gate refuses every commit until the owner approves the protected files.',
@@ -228,7 +229,7 @@ export const TEXT = Object.freeze({
   nothingRecorded: (root) => `No kh-orchestration install is recorded in ${root} (there is no ${MANIFEST_PATH}).`,
   uninstallHeader: (root, dryRun) => `kh-orchestration ${KIT_VERSION} uninstall for ${root}${dryRun ? ' (dry run: nothing is removed)' : ''}`,
   keptHeader: 'Kept (the owner\'s now):',
-  uninstallDryEnd: (command) => `Nothing was removed. To uninstall: ${command}`,
+  uninstallDryEnd: (command) => `Nothing was removed. To uninstall, ${askOwner(command)}`,
   uninstalled: (root) => `kh-orchestration is uninstalled from ${root}.`,
   nothingToRemove: 'Nothing to remove.',
   statusUnreadable: 'an unexpected error stopped it',
@@ -276,6 +277,17 @@ export function usageError(command, reason) {
 }
 
 export const print = (lines) => process.stdout.write(`${lines.join('\n')}\n`);
+
+/**
+ * The refusal of a writing run of `command` ('apply' or 'uninstall') in a Claude Code session, its
+ * next line asking the owner to run `line`; null outside a session (after Task 9's review: both are
+ * the owner's). Read from this process's own environment; the extension blocks the ways a session
+ * could clear it (env -i, env -).
+ */
+export function ownerRefusal(command, line) {
+  const variable = OWNER_VARIABLES.find((name) => process.env[name] !== undefined);
+  return variable === undefined ? null : { text: TEXT.ownerOnly(command, variable), next: askOwner(line) };
+}
 
 // ---- small helpers ----
 
@@ -721,7 +733,7 @@ export function plan(dir) {
   const actions = [];
   const conflicts = [];
   const notes = [];
-  const next = applyCommand(root);
+  const next = askOwner(applyCommand(root));
   const recordedFile = (path) => manifest?.files.find((file) => file.path === path)?.sha256;
 
   // (a) the scripts
@@ -840,6 +852,8 @@ function recordHook(manifest, record) {
  */
 export function applyPlan(root, planned, { onWrite } = {}) {
   const read = readManifest(root);
+  const session = ownerRefusal('apply', applyCommand(root));
+  if (session !== null) return { manifest: read.manifest ?? null, refusal: session };
   const manifest = read.state === 'ok' ? structuredClone(read.manifest) : emptyManifest(KIT_VERSION);
   const wrote = () => onWrite?.();
   const write = (path, action) => {
@@ -916,7 +930,7 @@ export function applyPlan(root, planned, { onWrite } = {}) {
             save();
           }
         }
-        return { manifest, refusal: { text: TEXT.selfTestRemoved(failed), next: applyCommand(root) } };
+        return { manifest, refusal: { text: TEXT.selfTestRemoved(failed), next: askOwner(applyCommand(root)) } };
       }
     }
   } catch (error) {
@@ -978,10 +992,10 @@ export function closingLines(root, planned) {
  */
 export function uninstallPlan(dir, { state }) {
   const resolved = resolveRoot(dir, 'uninstall');
-  if (resolved.refusal !== undefined) return { root: null, refusals: [resolved.refusal], actions: [], kept: [], notes: [] };
+  if (resolved.refusal !== undefined) return { root: null, state, refusals: [resolved.refusal], actions: [], kept: [], notes: [] };
   const { root } = resolved;
   const read = readManifest(root);
-  if (read.state === 'corrupt') return { root, refusals: [{ text: TEXT.manifestCorrupt, next: manifestNext(root) }], actions: [], kept: [], notes: [] };
+  if (read.state === 'corrupt') return { root, state, refusals: [{ text: TEXT.manifestCorrupt, next: manifestNext(root) }], actions: [], kept: [], notes: [] };
   const actions = [];
   const kept = [];
   const notes = [];
@@ -994,7 +1008,7 @@ export function uninstallPlan(dir, { state }) {
   if (read.state === 'absent') {
     notes.push(TEXT.nothingRecorded(root));
     stateAction();
-    return { root, refusals: [], actions, kept, notes };
+    return { root, state, refusals: [], actions, kept, notes };
   }
   const { manifest } = read;
 
@@ -1011,7 +1025,7 @@ export function uninstallPlan(dir, { state }) {
 
   const extensions = readExtensions(root);
   if (extensions.state === 'malformed' && manifest.extensionEntry !== null) {
-    return { root, refusals: [{ text: TEXT.extensionsMalformed(extensions.problem), next: `cat ${shellWord(join(root, EXTENSIONS_PATH))}` }], actions: [], kept: [], notes: [] };
+    return { root, state, refusals: [{ text: TEXT.extensionsMalformed(extensions.problem), next: `cat ${shellWord(join(root, EXTENSIONS_PATH))}` }], actions: [], kept: [], notes: [] };
   }
   const listed = extensions.state === 'ok' ? extensions.entries.find((entry) => entry.id === EXTENSION_ID) : undefined;
   if (listed !== undefined) {
@@ -1046,16 +1060,19 @@ export function uninstallPlan(dir, { state }) {
     else kept.push(TEXT.keptOfficers);
   }
   actions.push({ kind: 'manifest', path: MANIFEST_PATH, detail: kept.length === 0 ? TEXT.removeManifest : TEXT.keepManifest });
-  return { root, refusals: [], actions, kept, notes };
+  return { root, state, refusals: [], actions, kept, notes };
 }
 
 /**
- * Performs `planned` (uninstallPlan's result, with no refusal) in `root`, in order. The manifest
+ * Performs `planned` (uninstallPlan's result, with no refusal) in `root`, in order, and returns
+ * `{ refusal }`: null when done, the session refusal (nothing removed) in a Claude Code session. The manifest
  * is rewritten after each removal, so a run stopped part way leaves a record the next uninstall
  * finishes from; it is removed last, or kept recording only what was kept. The two directories
  * kh-orchestration's files were in are removed when left empty. Never touches kh-harness's files.
  */
 export function applyUninstall(root, planned) {
+  const session = ownerRefusal('uninstall', TEXT.uninstallCommand(root, planned.state));
+  if (session !== null) return { refusal: session };
   const read = readManifest(root);
   const manifest = read.state === 'ok' ? structuredClone(read.manifest) : null;
   const save = () => {
@@ -1092,6 +1109,7 @@ export function applyUninstall(root, planned) {
     const absolute = join(root, path);
     if (isRealDirectory(absolute) && readdirSync(absolute).length === 0) rmSync(absolute, { recursive: true, force: true });
   }
+  return { refusal: null };
 }
 
 /** The lines of the uninstall plan. */

@@ -296,7 +296,7 @@ test('uninstall keeps what the owner changed and reports it, and refuses --yes i
   writeFileSync(hook, `${readFileSync(hook, 'utf8')}# the owner's line\n`);
   const before = { tree: listing(repo.root) };
   const session = run('uninstall', [repo.root, '--yes'], { env: { ...env(), CLAUDECODE: '1' } });
-  assert.deepEqual([session.status, session.stdout, session.stderr], [1, '', `kh-orchestration: ${TEXT.ownerOnly('CLAUDECODE')}\nNext: ${TEXT.uninstallCommand(repo.root, false)}, in the owner's own terminal\n`]);
+  assert.deepEqual([session.status, session.stdout, session.stderr], [1, '', `kh-orchestration: ${TEXT.ownerOnly('uninstall', 'CLAUDECODE')}\nNext: ${TEXT.askOwner(TEXT.uninstallCommand(repo.root, false))}\n`]);
   assert.deepEqual({ tree: listing(repo.root) }, before);
   const done = run('uninstall', [repo.root, '--yes']);
   assert.equal(done.status, 0, done.stderr);
@@ -307,6 +307,17 @@ test('uninstall keeps what the owner changed and reports it, and refuses --yes i
   assert.equal(existsSync(join(repo.root, EXTENSIONS_PATH)), false);
   assert.ok(existsSync(join(repo.root, MANIFEST_PATH)), 'the manifest stays, recording what was kept');
   assert.deepEqual(uninstallPlan(repo.root, { state: false }).kept, [TEXT.keptHook(hook), TEXT.keptOfficers]);
+});
+
+test('apply --yes refuses inside a Claude Code session before printing or writing anything; the dry run and detect stay open', () => {
+  const repo = fresh();
+  const before = { tree: listing(repo.root) };
+  const session = { env: { ...env(), CLAUDE_CODE_SESSION_ID: 'abc' } };
+  const refused = run('apply', [repo.root, '--yes'], session);
+  assert.deepEqual([refused.status, refused.stdout, refused.stderr], [1, '', `kh-orchestration: ${TEXT.ownerOnly('apply', 'CLAUDE_CODE_SESSION_ID')}\nNext: ${TEXT.askOwner(applyCommand(repo.root))}\n`]);
+  assert.equal(run('apply', [repo.root], session).status, 0);
+  assert.equal(run('detect', [repo.root], session).status, 0);
+  assert.deepEqual({ tree: listing(repo.root) }, before);
 });
 
 test('apply --yes and detect take well under a second', () => {

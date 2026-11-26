@@ -566,7 +566,7 @@ test('status reports each hook that is missing, not ours, not executable, or nam
   rmSync(join(hooks, 'reference-transaction'));
   chmodSync(join(hooks, 'pre-commit'), 0o644);
   writeFileSync(join(hooks, 'pre-merge-commit'), '#!/bin/sh\nexit 0\n');
-  const apply = `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
+  const apply = `ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
   const status = statusJson(repo.root);
   assert.deepEqual(hookProblemsOf(status), [
     { text: TEXT.hookNotExecutable('pre-commit', join(hooks, 'pre-commit')), next: `chmod +x ${join(hooks, 'pre-commit')}` },
@@ -578,7 +578,7 @@ test('status reports each hook that is missing, not ours, not executable, or nam
   installGate(moved.root, { node: '/nonexistent/node' });
   const movedStatus = statusJson(moved.root);
   assert.deepEqual(hookProblemsOf(movedStatus), ['pre-commit', 'pre-merge-commit', 'reference-transaction'].map((name) => ({
-    text: TEXT.hookProgramGone(name, 'Node', '/nonexistent/node'), next: `node <kh-orchestration>/scripts/apply.mjs ${moved.root} --yes`,
+    text: TEXT.hookProgramGone(name, 'Node', '/nonexistent/node'), next: `ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs ${moved.root} --yes`,
   })));
   assert.equal(TEXT.hookProgramGone('pre-commit', 'Node', '/n'), 'The pre-commit hook starts Node as /n, which no longer exists, so every commit is refused. Run kh-orchestration\'s apply again to record where it is now.');
 });
@@ -611,7 +611,7 @@ test('status reports a missing pre-commit hook, and one of ours whose text is no
   writeFileSync(join(hooks, 'pre-merge-commit'), `${ours.slice(0, 2).join('\n')}\nexit 0\n`);
   const race = readFileSync(join(hooks, 'reference-transaction'), 'utf8');
   writeFileSync(join(hooks, 'reference-transaction'), race.replace("case $out in 'kh-orchestration: allowed') exit 0 ;; esac", 'exit 0'));
-  const apply = `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
+  const apply = `ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
   const status = statusJson(repo.root);
   assert.deepEqual(hookProblemsOf(status), [
     { text: TEXT.hookMissing('pre-commit', join(hooks, 'pre-commit')), next: apply },
@@ -866,7 +866,7 @@ test('I3: status reports a bin/ file that differs from the last approved tree, o
   assert.deepEqual(binProblems(statusJson(repo.root)), []);
   writeFileSync(join(bin, 'ko-gate.mjs'), `${readFileSync(join(bin, 'ko-gate.mjs'), 'utf8')}// changed\n`);
   writeFileSync(join(bin, 'stray.mjs'), 'export {};\n');
-  const approve = `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
+  const approve = `ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`;
   const changed = statusJson(repo.root);
   assert.deepEqual(changed.bin, { present: true, gate: true, baseline: { kind: 'approved', tree }, differs: ['ko-gate.mjs'], missing: [], extra: ['stray.mjs'] });
   assert.deepEqual(binProblems(changed), [{ text: TEXT.binDiffers(bin, TEXT.binBaselineApproved(tree), ['ko-gate.mjs', 'stray.mjs']), next: approve }]);
@@ -1063,7 +1063,7 @@ test('ko.mjs that cannot start tells the approved copy from the working copy, an
   for (const entry of ['ko.mjs', 'gate.mjs']) {
     assert.ok(readFileSync(join(repo.root, '.claude/kh-orchestration/scripts', entry), 'utf8').includes(`Next: ${repairCommand('<repository>')}\\n`), entry);
   }
-  assert.equal(repairCommand(shellWord(repo.root)), `node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`);
+  assert.equal(repairCommand(shellWord(repo.root)), `ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs ${repo.root} --yes`);
 });
 
 test('every ko.mjs command a refusal or report prints works where the person is: a subdirectory of a linked worktree whose path holds spaces', () => {

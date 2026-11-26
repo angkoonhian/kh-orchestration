@@ -250,7 +250,8 @@ export const MESSAGES = Object.freeze({
   guardedPath: `The git directory (its hooks, its config, the kh-orchestration shared state) is not changed from a session; ls, cat, grep, git log and the like may read it. To record a verdict, run ${RUN}.`,
   gitDirCwd: 'This session\'s working directory is inside a git directory, where only reading commands run. Change to the working tree first (cd to the repository root), then run the command.',
   ownerOnly: (command) => `ko.mjs ${command} is the owner's to run in their own terminal, outside Claude Code, from the approved copy. Ask the owner to run ${OWNER_KO} ${command}.`,
-  sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
+  sessionEnv: 'CLAUDECODE and CLAUDE_CODE_SESSION_ID are not unset or emptied from a session, nor the environment cleared in front of an owner command: the owner-only commands rely on them. Ask the owner to run the command in their own terminal.',
+  installerOwnerOnly: 'kh-orchestration\'s apply --yes and uninstall --yes are the owner\'s to run in their own terminal, outside Claude Code: they change the hooks and the files the commit gate checks. Ask the owner to run it; without --yes it is a dry run, open here.',
   unsplittable: unseen('its quotes or nesting do not balance, or it nests too deeply'),
   feedsScript: unseen('it feeds a script to a shell or an interpreter'),
   runsCode: unseen('it runs a string as code'),
@@ -1011,7 +1012,7 @@ const WRAPPERS = {
 const ENV_VALUED = 'uCaS';
 const ENV_LONG_VALUED = new Set(['--unset', '--chdir', '--argv0', '--split-string']);
 function readEnv(words, from) {
-  const result = { words, next: from, assignments: [], unsets: [], unseen: null };
+  const result = { words, next: from, assignments: [], unsets: [], unseen: null, cleared: false };
   let i = from;
   for (let splits = 0; i < result.words.length;) {
     const word = result.words[i];
@@ -1021,6 +1022,7 @@ function readEnv(words, from) {
       break;
     }
     if (text === '-') {
+      result.cleared = true;
       i++;
       continue;
     }
@@ -1038,6 +1040,8 @@ function readEnv(words, from) {
     if (text.startsWith('--')) {
       const equals = text.indexOf('=');
       option = equals === -1 ? text : text.slice(0, equals);
+      // --ignore-environment, as written or abbreviated as env accepts it.
+      if (option.length > 3 && '--ignore-environment'.startsWith(option)) result.cleared = true;
       if (equals !== -1) value = text.slice(equals + 1);
       else if (ENV_LONG_VALUED.has(option)) {
         value = result.words[i + 1]?.text;
@@ -1045,6 +1049,7 @@ function readEnv(words, from) {
       }
     } else {
       const k = [...text].findIndex((char, index) => index > 0 && ENV_VALUED.includes(char));
+      if (text.slice(1, k === -1 ? undefined : k).includes('i')) result.cleared = true;
       if (k !== -1) {
         option = text[k];
         value = text.slice(k + 1) || result.words[i + 1]?.text;
@@ -1073,7 +1078,7 @@ function readEnv(words, from) {
 // { words, index, word, name, wrappers, envAssignments, unsets, unseen } with `word`
 // undefined when there is none. `words` is the command's words, with env -S strings joined in.
 function resolveCommand(command) {
-  const resolved = { words: command.words, index: 0, word: undefined, name: '', wrappers: [], envAssignments: [], unsets: [], unseen: null };
+  const resolved = { words: command.words, index: 0, word: undefined, name: '', wrappers: [], envAssignments: [], unsets: [], unseen: null, cleared: false };
   let index = 0;
   for (let steps = 0; index < resolved.words.length && steps <= resolved.words.length * 2 + MAX_DEPTH; steps++) {
     const word = resolved.words[index];
@@ -1094,6 +1099,7 @@ function resolveCommand(command) {
       resolved.envAssignments.push(...env.assignments);
       resolved.unsets.push(...env.unsets);
       resolved.unseen ??= env.unseen;
+      resolved.cleared ||= env.cleared;
       resolved.wrappers.push(name);
       index = env.next;
       continue;
@@ -1682,17 +1688,26 @@ function couldBe(word, name) {
   });
 }
 const basenameWord = (word) => (word.text.includes('/') ? { ...word, text: word.text.slice(word.text.lastIndexOf('/') + 1) } : word);
+// A refusal of an owner's command: when env cleared the environment in front of it (env -i, env -),
+// the session's marks were hidden from the command's own check, and the message says so.
+const refuseOwner = (resolved, message) => refuse(resolved.cleared ? MESSAGES.sessionEnv : message);
+// kh-orchestration's installer (after Task 9's review): a word whose basename could be apply.mjs or
+// uninstall.mjs on a path naming kh-orchestration. kh-harness's own apply.mjs is not one.
+const isInstaller = (word) => /kh-orchestration/i.test(word.text) && ['apply.mjs', 'uninstall.mjs'].some((name) => couldBe(basenameWord(word), name));
 
 // Owner-only commands, whatever runs ko.mjs (node, bun, deno, tsx, npx, the file itself): in a
 // command whose command word is not read-only, a word that is not a text value and whose
-// basename could be ko.mjs, followed by an owner-only subcommand.
+// basename could be ko.mjs, followed by an owner-only subcommand; and kh-orchestration's
+// installer with --yes among the command's words.
 function judgeOwner(command, resolved, values, loose) {
   const unsets = [...resolved.unsets, ...(resolved.name === 'unset' ? resolved.words.slice(resolved.index + 1).map((word) => word.text) : [])];
   if ([...command.assignments, ...resolved.envAssignments].some((word) => SESSION_EMPTIED.test(word.text)) || unsets.some((name) => SESSION_NAMES.has(name))) refuse(MESSAGES.sessionEnv);
   if (resolved.word === undefined || READ_ONLY.has(resolved.name)) return;
   for (let at = 0; at < resolved.words.length; at++) {
     const word = resolved.words[at];
-    if (!values.has(word) && !loose.has(word) && couldBe(basenameWord(word), 'ko.mjs')) judgeOwnerSubcommand(resolved, at);
+    if (values.has(word) || loose.has(word)) continue;
+    if (couldBe(basenameWord(word), 'ko.mjs')) judgeOwnerSubcommand(resolved, at);
+    if (isInstaller(word) && resolved.words.some((other) => other.text === '--yes')) refuseOwner(resolved, MESSAGES.installerOwnerOnly);
   }
 }
 
@@ -1715,7 +1730,7 @@ function judgeOwnerSubcommand(resolved, at) {
     }
     seen = true;
     const owner = OWNER_ONLY.find((name) => couldBe(word, name));
-    if (owner !== undefined) refuse(MESSAGES.ownerOnly(owner));
+    if (owner !== undefined) refuseOwner(resolved, MESSAGES.ownerOnly(owner));
     if (!afterOption) return;
     afterOption = false;
   }
@@ -1786,7 +1801,11 @@ const scanned = (message, ...texts) => {
 // their functions is the one-line way to write a verdict, an approval or the switch, or to run
 // an owner command with a forged environment. Scanned in inline code and in fed scripts only, so
 // running, reading, staging or committing those files stays allowed.
-const PLUGIN_MODULES = [/kh-orchestration\/+(?:scripts|bin)(?![a-z0-9_.-])/i, /ko-(?:cli|state|gate)\.mjs/i];
+// And code naming kh-orchestration together with its installer's modules (install.mjs, apply.mjs,
+// uninstall.mjs; after Task 9's review), wherever each stands: the two are looked for apart, so the
+// scan stays linear.
+const NAMES_INSTALLER = { test: (text) => /kh-orchestration/i.test(text) && /(?:install|apply)\.mjs/i.test(text) };
+const PLUGIN_MODULES = [/kh-orchestration\/+(?:scripts|bin)(?![a-z0-9_.-])/i, /ko-(?:cli|state|gate)\.mjs/i, NAMES_INSTALLER];
 const scannedCode = (message, ...texts) => {
   if (holdsAny([...DANGER, ...PLUGIN_MODULES], texts)) refuse(message);
 };

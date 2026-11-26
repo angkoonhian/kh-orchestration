@@ -390,7 +390,7 @@ const refusalText = (reason, next) => `${gateText(reason, next)}${HOOK_LINE}`;
 // Its next command is apply, from the plugin: the owner's commands run from this same bin/.
 const UNLOADABLE = gateText(
   'the gate could not decide: a script in <git-common-dir>/kh-orchestration/bin/ is missing, out of date or cannot be loaded. The commit is refused.',
-  'node <kh-orchestration>/scripts/apply.mjs <repository> --yes',
+  'ask the owner to run, in their own terminal outside Claude Code: node <kh-orchestration>/scripts/apply.mjs <repository> --yes',
 );
 
 // git did not commit: the command failed and HEAD is where it was.

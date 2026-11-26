@@ -917,3 +917,28 @@ test('through the real hook: the contract checks and the probe find no problem a
   assert.equal(denied.status, 0);
   assert.ok(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason.split('\n').includes(`kh-harness extension kh-orchestration: ${MESSAGES.protectedEdit}`));
 });
+
+// The installer's writing runs are the owner's (after Task 9's review): apply.mjs or uninstall.mjs
+// of kh-orchestration with --yes, under any runner; code that names them; and a cleared
+// environment (env -i, env -) in front of them or of an owner-only ko.mjs command, which hides
+// the session from their own check. Dry runs, detect and kh-harness's own installer stay open.
+test('apply --yes and uninstall --yes of kh-orchestration are blocked under any runner, and a cleared environment in front of an owner command is named', () => {
+  const plugin = '/p/kh-orchestration';
+  const rows = [
+    [`env -i PATH="$PATH" node ${plugin}/scripts/uninstall.mjs . --yes --state`, blocked(MESSAGES.sessionEnv)],
+    ['node ~/.claude/plugins/cache/x/kh-orchestration/0.1.0/scripts/apply.mjs . --yes', blocked(MESSAGES.installerOwnerOnly)],
+    [`node ${plugin}/scripts/uninstall.mjs . --yes`, blocked(MESSAGES.installerOwnerOnly)],
+    [`env - node ${plugin}/scripts/apply.mjs . --yes`, blocked(MESSAGES.sessionEnv)],
+    [`setsid -w env -i /usr/bin/node ${plugin}/scripts/uninstall.mjs . --yes`, blocked(MESSAGES.sessionEnv)],
+    [`bun ${plugin}/scripts/uninstall.mjs . --yes --state`, blocked(MESSAGES.installerOwnerOnly)],
+    [`node -e "import('/home/o/.claude/plugins/cache/x/kh-orchestration/0.1.0/scripts/lib/install.mjs').then((m) => m.applyUninstall('.', {}))"`, blocked(MESSAGES.runsCode)],
+    ['env -i PATH=$PATH node .claude/kh-orchestration/scripts/ko.mjs approve', blocked(MESSAGES.sessionEnv)],
+    [`node ${plugin}/scripts/apply.mjs .`, ALLOW],
+    [`node ${plugin}/scripts/detect.mjs . --json`, ALLOW],
+    [`node ${plugin}/scripts/uninstall.mjs .`, ALLOW],
+    ['node /p/kh-harness/scripts/apply.mjs . --yes', ALLOW],
+    ['env -i PATH="$PATH" npm test', ALLOW],
+    [`cat ${plugin}/scripts/lib/install.mjs`, ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+});
