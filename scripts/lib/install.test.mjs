@@ -377,7 +377,7 @@ test('an owner-edited or unstamped installed script is kept and reported, the ho
   assert.ok(read(repo.root, `${SCRIPTS_DIR}/ko-officers.mjs`).endsWith('// the owner\'s note\n'));
   assert.equal(read(repo.root, `${SCRIPTS_DIR}/ko-verdict.mjs`), 'export const mine = 1;\n');
   for (const name of HOOK_NAMES) assert.equal(existsSync(join(hooksDir(repo.root), name)), false, name);
-  assert.equal(TEXT.scriptEdited('p'), 'p is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. Restore it (git checkout -- p) or remove it, then run apply again to take this version.');
+  assert.equal(TEXT.scriptEdited('p'), 'p is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. To take this version, restore it (git checkout -- p), then run apply again.');
 
   // An edited extension.mjs: kept, and its entry is not written over the kept bytes; nothing is refused.
   const module = join(repo.root, SCRIPTS_DIR, 'extension.mjs');

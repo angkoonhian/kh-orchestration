@@ -162,7 +162,8 @@ test('apply --yes in a path with spaces installs a gate that refuses a real comm
   assert.deepEqual(statusJson(root).problems, []);
   const before = { tree: listing(root) };
   const again = run('apply', [root, '--yes']);
-  assert.deepEqual([again.status, again.stdout], [0, `${TEXT.nothingToDo(root)}\n`]);
+  assert.deepEqual([again.status, again.stdout], [0, `${TEXT.nothingToDo(root)}\nNext: ${TEXT.allClear}\n`]);
+  assert.ok(run('detect', [root]).stdout.endsWith(`Next: ${TEXT.allClear}\n`));
   assert.deepEqual({ tree: listing(root) }, before, 'a second apply writes nothing');
 });
 
@@ -250,12 +251,10 @@ test('a foreign hook of each name: the other two hooks are written, the printed 
     const pasted = `#!/bin/sh\n${printed}\necho foreign-hook-ran >&2\nexit 0\n`;
     writeFileSync(foreign, pasted);
     const again = run('apply', [repo.root, '--yes']);
-    assert.deepEqual([again.status, again.stdout], [0, `${TEXT.nothingToDo(repo.root)}\n`], name);
+    assert.deepEqual([again.status, again.stdout], [0, `${TEXT.nothingToDo(repo.root)}\nNext: ${TEXT.stageAndApprove(repo.root)}\n`], name);
     assert.deepEqual(JSON.parse(run('detect', [repo.root, '--json']).stdout).hooks.find((hook) => hook.name === name).state, 'hosted', name);
 
     // The owner's steps land a verdicted commit; an unverdicted one is refused by the gate.
-    const steps = run('apply', [repo.root]).stdout;
-    assert.equal(steps, `${TEXT.nothingToDo(repo.root)}\n`);
     followSteps(repo.root, TEXT.steps(repo.root, ownerCommand(repo.root, 'approve'), agentCommand(repo.root, 'run')).join('\n'));
     assert.deepEqual(statusJson(repo.root).problems, [], name);
     writeFileSync(join(repo.root, 'unverdicted.txt'), 'x\n');
@@ -279,7 +278,8 @@ test('detect reports no install, a fresh install, and each broken state, and --j
   assert.equal(none.status, 0, none.stderr);
   assert.ok(lines(none.stdout).includes('Install: kh-orchestration is not installed here.'));
   const noneJson = JSON.parse(run('detect', [repo.root, '--json']).stdout);
-  assert.deepEqual(Object.keys(noneJson), ['schema', 'root', 'plugin', 'install', 'files', 'officers', 'gitattributes', 'extensionEntry', 'hooks', 'coverage', 'status', 'statusError', 'apply']);
+  assert.deepEqual(Object.keys(noneJson), ['schema', 'root', 'plugin', 'install', 'files', 'officers', 'gitattributes', 'extensionEntry', 'hooks', 'coverage', 'status', 'statusError', 'apply', 'next']);
+  assert.equal(noneJson.next, TEXT.askOwner(applyCommand(repo.root)));
   assert.deepEqual(noneJson.install, { version: null, manifest: { state: 'absent', kitVersion: null, installedAt: null } });
   assert.ok(noneJson.files.every((file) => file.state === 'missing'));
   assert.deepEqual(noneJson.hooks.map((hook) => hook.state), ['missing', 'missing', 'missing']);
@@ -298,6 +298,13 @@ test('detect reports no install, a fresh install, and each broken state, and --j
   assert.deepEqual(fine.gitattributes, { line: true });
   assert.deepEqual(fine.coverage, [{ id: 'test', command: 'npm run test', covered: [], notLocked: [TEXT.packageJsonNotLocked] }]);
   assert.deepEqual(fine.apply, { refusals: [], conflicts: [], actions: [], notes: [] });
+  // One next step for the state found: right after apply, stage the install and approve it; and no
+  // line advises removing a file the install wrote or shares (after Task 9's review).
+  assert.equal(fine.next, TEXT.stageAndApprove(repo.root));
+  const fineText = run('detect', [repo.root]).stdout;
+  assert.ok(fineText.endsWith(`Next: ${TEXT.stageAndApprove(repo.root)}\n`), fineText);
+  assert.ok(!fineText.includes('rm --'), fineText);
+  assert.equal(TEXT.stageAndApprove(repo.root), `stage the install (git -C ${repo.root} add -- .claude/kh-orchestration ${MANIFEST_PATH} .claude/kh-harness/extensions.json .gitattributes), then ask the owner to run, in their own terminal outside Claude Code: cd ${repo.root} && node ${join(stateDir(repo.root), 'bin', 'ko.mjs')} approve`);
   // Nothing is staged yet, so the staged tree holds no officers file and has no digest.
   assert.equal(fine.status.digestApproved, null);
 

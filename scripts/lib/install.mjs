@@ -144,7 +144,7 @@ export const TEXT = Object.freeze({
   noContract: '.claude/kh-harness/contract.json is missing: kh-orchestration relies on kh-harness contract 1, so kh-harness 0.3.0 or later must be installed first.',
   wrongContract: (value) => `.claude/kh-harness/contract.json says contract ${value}; kh-orchestration works with kh-harness contract 1 only.`,
   contractWouldFail: (problem) => `kh-harness contract 1 would not hold for kh-orchestration's extension even once its entry is written: ${problem}. kh-orchestration relies on the extension, so nothing is installed.`,
-  extensionsMalformed: (problem) => `${EXTENSIONS_PATH} cannot be used (${problem}), and kh-orchestration changes only an extensions file it can read. Repair or remove it outside Claude Code.`,
+  extensionsMalformed: (problem) => `${EXTENSIONS_PATH} cannot be used (${problem}), and kh-orchestration changes only an extensions file it can read. Repair it outside Claude Code: other plugins' entries may be in it too.`,
   extensionsFull: `${EXTENSIONS_PATH} lists ${ENTRIES_MAX} extensions already, the most kh-harness runs, and kh-orchestration never drops another plugin's entry to make room. Remove a plugin that registered one first.`,
   hooksPath: (value, scope) => `${KO_TEXT.hooksPath(value, scope)} kh-orchestration changes no configuration of yours: unset it, then run apply again.`,
   gitattributesNotFile: `${ATTRIBUTES_FILE} is not a regular file, so the line ${ATTRIBUTES_LINE} cannot be added to it.`,
@@ -176,8 +176,8 @@ export const TEXT = Object.freeze({
   removeInflight: (pids) => `remove the in-flight records of git processes that have ended: ${pids.join(', ')}`,
   record: (what) => `record ${what} in ${MANIFEST_PATH} (already in place)`,
 
-  scriptNotOurs: (path) => `${path} is kept as it is: it does not begin with kh-orchestration's stamp line, so kh-orchestration did not write it and never overwrites it. Remove it, then run apply again.`,
-  scriptEdited: (path) => `${path} is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. Restore it (git checkout -- ${path}) or remove it, then run apply again to take this version.`,
+  scriptNotOurs: (path) => `${path} is kept as it is: it does not begin with kh-orchestration's stamp line, so kh-orchestration did not write it and never overwrites it. The path is kh-orchestration's own script's: move the file elsewhere to keep it, then run apply again.`,
+  scriptEdited: (path) => `${path} is kept as it is: it was changed since kh-orchestration wrote it, and kh-orchestration never overwrites a change it did not make. To take this version, restore it (git checkout -- ${path}), then run apply again.`,
   hooksStopped: 'The git hooks are not written while an installed script is kept: the install is incomplete until the scripts above are kh-orchestration\'s.',
   extensionSkipped: `kh-orchestration's entry in ${EXTENSIONS_PATH} is not written while ${MODULE} is kept: the entry would register bytes kh-orchestration did not ship.`,
   hookConflict: (name, path, line) => `The ${name} hook at ${path} is not kh-orchestration's, so it is not written over. To run the commit gate from it, add this line directly after its first line:\n    ${line}`,
@@ -244,6 +244,9 @@ export const TEXT = Object.freeze({
   uninstalled: (root) => `kh-orchestration is uninstalled from ${root}.`,
   nothingToRemove: 'Nothing to remove.',
   statusUnreadable: 'an unexpected error stopped it',
+  stageAndApprove: (root) => `stage the install (${stageCommand(root)}), then ${askOwner(`cd ${shellWord(root)} && ${ownerCommand(root, 'approve')}`)}`,
+  approveNext: (root) => askOwner(`cd ${shellWord(root)} && ${ownerCommand(root, 'approve')}`),
+  allClear: 'nothing: the install is complete and the commit gate is on',
   unexpected: (command) => `${command} could not finish: an unexpected error stopped it. What was written before it is recorded in ${MANIFEST_PATH}.`,
   uninstallCommand: (root, state) => `${commandOf('uninstall', root, ' --yes')}${state ? ' --state' : ''}`,
 });
@@ -1166,6 +1169,37 @@ export function uninstallLines(planned, { dryRun }) {
   return lines;
 }
 
+// ---- the one next step ----
+
+/**
+ * The one next step for the install in `root` as it is found (after Task 9's review), given its
+ * dry run `planned` and what the gate sees (`status`, null when it could not be read): what apply
+ * still has to do; else staging the install and approving it while what apply wrote is not staged;
+ * else the approval; else the first problem status reports; else nothing.
+ */
+function nextStep(root, planned, status) {
+  if (planned.refusals.length > 0) return planned.refusals[0].next;
+  if (planned.conflicts.length > 0) return planned.conflicts[0].next;
+  if (planned.actions.length > 0) return askOwner(applyCommand(root));
+  if (status === null) return agentCommand(root, 'status');
+  const unstaged = git(root, ['ls-files', '-z', '--others', '--modified', '--exclude-standard', '--', ...WRITTEN_PATHS]);
+  if (status.install?.present === false || unstaged.status !== 0 || unstaged.stdout !== '') return TEXT.stageAndApprove(root);
+  if (status.digestApproved === false) return TEXT.approveNext(root);
+  if (status.problems.length > 0) return status.problems[0].next;
+  return TEXT.allClear;
+}
+
+/** apply's next step when it has nothing to do: nextStep with what the gate sees now. */
+export function nextAfterApply(root, planned) {
+  let status;
+  try {
+    status = statusOf(root);
+  } catch {
+    status = null;
+  }
+  return nextStep(root, planned, status);
+}
+
 // ---- detect ----
 
 const SCRIPT_WORDS = { current: 'current', older: 'other bytes', edited: 'changed since kh-orchestration wrote it', 'not-ours': 'not kh-orchestration\'s', missing: 'missing' };
@@ -1238,6 +1272,7 @@ export function detect(dir) {
       actions: planned.actions.map(({ kind, path, detail }) => ({ kind, path, detail })),
       notes: planned.notes,
     },
+    next: nextStep(root, planned, status),
   };
 }
 
@@ -1273,5 +1308,6 @@ export function detectLines(report) {
   if (apply.refusals.length > 0) lines.push(...apply.refusals.flatMap((refusal) => [`  - refuse: ${refusal.text}`, `    Next: ${refusal.next}`]));
   else if (apply.actions.length === 0 && apply.conflicts.length === 0) lines.push('  - nothing');
   lines.push(...apply.actions.map((action) => `  - ${action.detail}`), ...apply.conflicts.flatMap((conflict) => [`  - conflict: ${conflict.text}`, `    Next: ${conflict.next}`]));
+  lines.push(`Next: ${report.next}`);
   return lines;
 }

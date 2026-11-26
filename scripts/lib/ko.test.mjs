@@ -662,7 +662,7 @@ test('status reports a live file that differs and a contract problem', () => {
   const repo = installed();
   repo.write('.claude/scripts/extra.mjs', 'x\n');
   const status = statusJson(repo.root);
-  assert.deepEqual(status.liveFiles, { equal: false, reason: REASONS.liveUntracked('.claude/scripts/extra.mjs'), next: 'rm -- .claude/scripts/extra.mjs' });
+  assert.deepEqual(status.liveFiles, { equal: false, reason: REASONS.liveUntracked('.claude/scripts/extra.mjs'), next: 'git add -- .claude/scripts/extra.mjs' });
   rmSync(join(repo.root, '.claude/scripts/extra.mjs'));
   rmSync(join(repo.root, '.claude/kh-harness/extensions.json'));
   const broken = statusJson(repo.root);

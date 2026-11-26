@@ -110,7 +110,8 @@ export const REASONS = Object.freeze({
   liveLineEndings: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings: this checkout converts them (core.autocrlf or a text attribute), and the working copy is what this session's hooks run. Add the line .claude/** -text to .gitattributes, check the file out again as below, then commit again.`,
   liveMode: (path) => `The working copy of ${path} differs from the tree being committed only in its executable bit: this checkout does not keep file modes (core.fileMode false, or a filesystem without them), and the working copy is what this session's hooks run. Set the bit as the tree has it, as below, then commit again.`,
   liveStagedElsewhere: (path) => `${path} is staged with a change this partial commit leaves out, so its working copy, which this session's hooks run, differs from the tree being committed. Commit without a path list, or restore it, then commit again.`,
-  liveUntracked: (path) => `${path} is in the working directory beside the files this session's hooks run but is not in the tree being committed (an editor's swap file or a .DS_Store looks like this too). Remove it as below, or add it and have the owner approve it, then commit again.`,
+  liveUntracked: (path) => `${path} is in the working directory beside the files this session's hooks run but is not in the tree being committed (an editor's swap file or a .DS_Store looks like this too). Add it as below so the owner can approve it, or remove it if it does not belong, then commit again.`,
+  liveUntrackedKept: (path) => `${path} is in the working directory beside the files this session's hooks run but is not in the tree being committed, and it is kh-orchestration's or shared with other plugins. Add it as below so the owner can approve it, then commit again.`,
   contract: (problem) => `kh-harness contract 1 does not hold in this working directory, so the extension that guards the commit gate may not be running: ${sentence(problem)} Repair the install outside Claude Code, then commit again.`,
   undigestable: (problem) => `The protected files of this tree cannot be checked: ${sentence(problem)} Fix it, stage the fix, and run the officers.`,
   unapproved: (digest) => `The protected files of this tree (digest ${digest.slice(0, 12)}) are not approved. The owner reviews and approves them in their own terminal.`,
@@ -213,6 +214,22 @@ function listedUnder(root, dir) {
   return found;
 }
 
+// Whether no message may suggest removing `path` (after Task 9's review): kh-harness's extensions
+// file, shared by every plugin that registers an extension, and any file kh-orchestration's
+// manifest records as written by its installer. A manifest that cannot be read records nothing.
+const SHARED_FILES = ['.claude/kh-harness/extensions.json'];
+const MANIFEST = '.claude/kh-orchestration.manifest.json';
+function keptByAnInstaller(root, path) {
+  if (SHARED_FILES.includes(path)) return true;
+  const read = readNoFollow(join(root, MANIFEST));
+  try {
+    const files = JSON.parse(read.bytes?.toString('utf8'))?.files;
+    return Array.isArray(files) && files.some((file) => file?.path === path);
+  } catch {
+    return false;
+  }
+}
+
 // A differing path's refusal: staged in the repository's own index with other content than the
 // tree's means a partial commit leaves it out, and restoring or removing it would lose the change.
 // `how` says a working copy differs only in its line endings ('lineEndings') or its executable bit
@@ -221,7 +238,7 @@ function differsRefusal(root, path, entry, how) {
   const staged = ownIndexEntry(root, path);
   if (staged !== null && (entry === undefined || staged.oid !== entry.oid || staged.mode !== entry.mode)) return refuse(REASONS.liveStagedElsewhere(path), 'git commit');
   const word = shellWord(path);
-  if (entry === undefined) return refuse(REASONS.liveUntracked(path), `rm -- ${word}`);
+  if (entry === undefined) return refuse(keptByAnInstaller(root, path) ? REASONS.liveUntrackedKept(path) : REASONS.liveUntracked(path), `git add -- ${word}`);
   if (how === 'lineEndings') return refuse(REASONS.liveLineEndings(path), `rm -- ${word} && git restore -- ${word}`);
   if (how === 'mode') return refuse(REASONS.liveMode(path), `chmod ${entry.mode === '100755' ? '+x' : '-x'} -- ${word}`);
   return refuse(REASONS.liveDiffers(path), `git restore -- ${word}`);

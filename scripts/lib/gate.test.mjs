@@ -23,6 +23,7 @@ import { readVerdict, writeVerdict } from '../../assets/scripts/ko-verdict.mjs';
 
 // The git process id the tests stand in for: alive for as long as the test runs.
 const PID = String(process.pid);
+const MANIFEST = '.claude/kh-orchestration.manifest.json';
 const KO_REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // A verdict written as `run` will write one, with the officers' results given.
 function recordVerdict(root, { tree, base, branch }, results, digest = digestOfTree(root, tree).digest) {
@@ -287,14 +288,32 @@ test('live files: a mode change, and a file not in the tree (untracked or ignore
   assert.deepEqual(judge(repo.root, at), refused(REASONS.liveMode('.claude/kh-orchestration/scripts/ko-git.mjs'), 'chmod -x -- .claude/kh-orchestration/scripts/ko-git.mjs'));
   chmodSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs'), 0o644);
   repo.write('.claude/scripts/extra.mjs', 'x\n');
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'rm -- .claude/scripts/extra.mjs'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'git add -- .claude/scripts/extra.mjs'));
   rmSync(join(repo.root, '.claude/scripts/extra.mjs'));
   writeFileSync(join(repo.root, '.git', 'info', 'exclude'), '.claude/kh-harness/*.local\n');
   repo.write('.claude/kh-harness/x.local', 'x\n');
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/kh-harness/x.local'), 'rm -- .claude/kh-harness/x.local'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/kh-harness/x.local'), 'git add -- .claude/kh-harness/x.local'));
+  rmSync(join(repo.root, '.claude/kh-harness/x.local'));
   assert.equal(
     REASONS.liveUntracked('x'),
-    'x is in the working directory beside the files this session\'s hooks run but is not in the tree being committed (an editor\'s swap file or a .DS_Store looks like this too). Remove it as below, or add it and have the owner approve it, then commit again.',
+    'x is in the working directory beside the files this session\'s hooks run but is not in the tree being committed (an editor\'s swap file or a .DS_Store looks like this too). Add it as below so the owner can approve it, or remove it if it does not belong, then commit again.',
+  );
+  // A file that is shared with other plugins, or that kh-orchestration's manifest records, is never
+  // advised to be removed (after Task 9's review).
+  const untracked = (path) => {
+    assert.equal(repo.git('rm', '-q', '--cached', '--', path).status, 0);
+    const tree = subject(repo.root).tree;
+    approveTree(repo.root, tree);
+    recordVerdict(repo.root, { ...at, tree }, [result('check', 'pass')]);
+    return judge(repo.root, { ...at, tree });
+  };
+  assert.deepEqual(untracked('.claude/kh-harness/extensions.json'), refused(REASONS.liveUntrackedKept('.claude/kh-harness/extensions.json'), 'git add -- .claude/kh-harness/extensions.json'));
+  assert.equal(repo.git('add', '-A').status, 0);
+  repo.write(MANIFEST, `${JSON.stringify({ files: [{ path: '.claude/kh-orchestration/scripts/ko-git.mjs' }] })}\n`);
+  assert.deepEqual(untracked('.claude/kh-orchestration/scripts/ko-git.mjs'), refused(REASONS.liveUntrackedKept('.claude/kh-orchestration/scripts/ko-git.mjs'), 'git add -- .claude/kh-orchestration/scripts/ko-git.mjs'));
+  assert.equal(
+    REASONS.liveUntrackedKept('x'),
+    'x is in the working directory beside the files this session\'s hooks run but is not in the tree being committed, and it is kh-orchestration\'s or shared with other plugins. Add it as below so the owner can approve it, then commit again.',
   );
 });
 
@@ -332,7 +351,7 @@ test('liveFilesRefusal is step 4 alone, for status: null while the live files eq
   const { tree } = subject(repo.root);
   assert.equal(liveFilesRefusal(repo.root, tree), null);
   repo.write('.claude/scripts/extra.mjs', 'x\n');
-  assert.deepEqual(liveFilesRefusal(repo.root, tree), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'rm -- .claude/scripts/extra.mjs'));
+  assert.deepEqual(liveFilesRefusal(repo.root, tree), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'git add -- .claude/scripts/extra.mjs'));
 });
 
 test('installOf is step 3 alone, for status: the officers, the missing file, or the officers file\'s problem', () => {
