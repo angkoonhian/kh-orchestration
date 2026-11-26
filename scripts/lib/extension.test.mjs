@@ -973,3 +973,24 @@ test('an installer command whose --yes could hide in an expansion, a pattern or 
   assert.deepEqual(mismatches(rows), []);
   assert.match(MESSAGES.installerHidden, /Write the path and arguments out/);
 });
+
+// An entry and its module restored apart (after Task 9's re-review): after an upgrade, git restore
+// of extensions.json alone put the old hash beside the new module and kh-harness then blocked every
+// tool call. A session may not restore or check out one of the pair without the other.
+test('git restore or checkout of kh-orchestration\'s extension entry or module on its own is blocked; both together, other files and reads stay allowed', () => {
+  const rows = [
+    ['git restore -- .claude/kh-harness/extensions.json', blocked(MESSAGES.restoreExtension)],
+    ['git checkout -- .claude/kh-harness/extensions.json', blocked(MESSAGES.restoreExtension)],
+    ['git restore --source=HEAD~1 ./.claude/kh-orchestration/scripts/extension.mjs', blocked(MESSAGES.restoreExtension)],
+    ['git checkout HEAD~1 -- .claude/kh-harness', blocked(MESSAGES.restoreExtension)],
+    ['git restore .claude/kh-orchestration/scripts', blocked(MESSAGES.restoreExtension)],
+    ['git restore -- .claude', ALLOW],
+    ['git restore .', ALLOW],
+    ['git restore -- .claude/kh-orchestration/scripts/ko-gate.mjs', ALLOW],
+    ['git restore -- .claude/settings.json', ALLOW],
+    ['git checkout main', ALLOW],
+    ['git diff -- .claude/kh-harness/extensions.json', ALLOW],
+    ['git add -- .claude/kh-harness/extensions.json', ALLOW],
+  ];
+  assert.deepEqual(mismatches(rows), []);
+});
