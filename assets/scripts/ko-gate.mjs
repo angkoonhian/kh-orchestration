@@ -12,20 +12,27 @@
 // the instant between the gate's exit and git's re-read remains a STATED LIMIT, with verify-branch
 // as the remedy: the head then has no verdict for its tree.
 //
-// The gate executes only approved bytes, in a clean environment (after Task 6's third re-review).
-// - The hooks unset NODE_*, LD_*, DYLD_* before starting node; every git call runs with
+// The gate starts only approved bytes, in a clean environment (after Task 6's third and fourth
+// re-reviews).
+// - The hooks run under `sh -p`, call no command by name, and start node through env -i with an
+//   allowlist (PATH, HOME, TMPDIR, the locale and the GIT_* variables git exports to a hook), so
+//   no NODE_*, LD_*, DYLD_* or shell function reaches this process. Every git call runs with
 //   core.fsmonitor off, and none reads working-tree content (no filter or monitor runs).
 // - The live files are compared with the tree in this process, byte for byte, as git blobs.
-// - The only repository code the gate runs is kh-harness's entry script in the contract probe, and
-//   it runs a private copy of the approved tree's blobs, outside the repository, never the working
+// - The only repository code the gate starts is kh-harness's entry script in the contract probe,
+//   from a private copy of the approved tree's blobs, outside the repository, never the working
 //   copy; the project env may not set NODE_*, LD_* or DYLD_*.
+// STATED LIMIT: that private copy is written to a temporary directory the same user can write. A
+// background process that rewrites it while the probe runs can make the probe run other bytes than
+// the approved ones. It cannot change that commit's outcome: the approvals and the verdict are read
+// into memory before the probe starts, and the probe only adds a refusal.
 // STATED LIMIT: the shared state is not tamper-proof. Code an agent manages to run OUTSIDE the gate
 // (a script on disk, a command git runs from configuration before the hook, such as core.fsmonitor
 // inside git commit itself) can write a verdict or an approval. The extension blocks the one-line
 // ways, and verify-branch, which re-runs the officers, is the remedy.
 import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, constants, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, sep } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { COMMANDS } from './extension.mjs';
 import { contractHolds } from './ko-contract.mjs';
 import { OFFICERS, digestOfTree, hashesTo, objectMismatchMessage } from './ko-digest.mjs';
@@ -89,7 +96,11 @@ export const REASONS = Object.freeze({
   liveTooLarge: (path) => `${path} is larger than 4 MiB, more than the gate compares; a live file of that size is not part of an install. Remove it from the tree, then commit again.`,
   projectEnv: (file, key) => `${file} sets ${key} under env, which would load code into every hook process of the session. Remove it outside Claude Code, then commit again.`,
   probeDirInside: 'the temporary directory for the private copy of the approved tree lies inside the repository; set TMPDIR to a directory outside it',
+  probeDirRelative: 'TMPDIR names a relative path, so the place of the private copy of the approved tree depends on the directory git runs in; set TMPDIR to an absolute directory outside the repository',
+  probeDirUnusable: 'the temporary directory for the private copy of the approved tree (TMPDIR, or /tmp when it is not set) does not exist or cannot be written; set TMPDIR to a directory outside the repository that can',
   liveDiffers: (path) => `The working copy of ${path} differs from the tree being committed, and the working copy is what this session's hooks run. Stage it for the owner to approve, or restore it as below, then commit again.`,
+  liveLineEndings: (path) => `The working copy of ${path} differs from the tree being committed only in its line endings: this checkout converts them (core.autocrlf or a text attribute), and the working copy is what this session's hooks run. Add the line .claude/** -text to .gitattributes, check the file out again as below, then commit again.`,
+  liveMode: (path) => `The working copy of ${path} differs from the tree being committed only in its executable bit: this checkout does not keep file modes (core.fileMode false, or a filesystem without them), and the working copy is what this session's hooks run. Set the bit as the tree has it, as below, then commit again.`,
   liveStagedElsewhere: (path) => `${path} is staged with a change this partial commit leaves out, so its working copy, which this session's hooks run, differs from the tree being committed. Commit without a path list, or restore it, then commit again.`,
   liveUntracked: (path) => `${path} is in the working directory beside the files this session's hooks run but is not in the tree being committed (an editor's swap file or a .DS_Store looks like this too). Remove it as below, or add it and have the owner approve it, then commit again.`,
   contract: (problem) => `kh-harness contract 1 does not hold in this working directory, so the extension that guards the commit gate may not be running: ${sentence(problem)} Repair the install outside Claude Code, then commit again.`,
@@ -198,10 +209,32 @@ function listedUnder(root, dir) {
 
 // A differing path's refusal: staged in the repository's own index with other content than the
 // tree's means a partial commit leaves it out, and restoring or removing it would lose the change.
-function differsRefusal(root, path, entry) {
+// `how` says a working copy differs only in its line endings ('lineEndings') or its executable bit
+// ('mode'): a checkout that converts line endings or keeps no modes, which restoring does not mend.
+function differsRefusal(root, path, entry, how) {
   const staged = ownIndexEntry(root, path);
   if (staged !== null && (entry === undefined || staged.oid !== entry.oid || staged.mode !== entry.mode)) return refuse(REASONS.liveStagedElsewhere(path), 'git commit');
-  return entry === undefined ? refuse(REASONS.liveUntracked(path), `rm -- ${shellWord(path)}`) : refuse(REASONS.liveDiffers(path), `git restore -- ${shellWord(path)}`);
+  const word = shellWord(path);
+  if (entry === undefined) return refuse(REASONS.liveUntracked(path), `rm -- ${word}`);
+  if (how === 'lineEndings') return refuse(REASONS.liveLineEndings(path), `rm -- ${word} && git restore -- ${word}`);
+  if (how === 'mode') return refuse(REASONS.liveMode(path), `chmod ${entry.mode === '100755' ? '+x' : '-x'} -- ${word}`);
+  return refuse(REASONS.liveDiffers(path), `git restore -- ${word}`);
+}
+
+// Whether `bytes` are the blob `oid` with every line ending turned into CR LF, as a checkout with
+// core.autocrlf or a text attribute writes it.
+const CRLF = Buffer.from('\r\n');
+const LF = Buffer.from('\n');
+function convertedFrom(oid, bytes) {
+  if (!bytes.includes(CRLF)) return false;
+  const parts = [];
+  let at = 0;
+  for (let found = bytes.indexOf(CRLF, at); found !== -1; found = bytes.indexOf(CRLF, at)) {
+    parts.push(bytes.subarray(at, found), LF);
+    at = found + CRLF.length;
+  }
+  parts.push(bytes.subarray(at));
+  return hashesTo(oid, Buffer.concat(parts));
 }
 
 function liveRefusal(root, live) {
@@ -213,7 +246,9 @@ function liveRefusal(root, live) {
   for (const entry of live) {
     const read = entry.type === 'blob' && FILE_MODES.includes(entry.mode) ? readNoFollow(join(root, entry.path)) : { differs: true };
     if (read.tooLarge) return refuse(REASONS.liveTooLarge(entry.path), COMMANDS.status);
-    if (read.differs || !hashesTo(entry.oid, read.bytes) || read.executable !== (entry.mode === '100755')) return differsRefusal(root, entry.path, entry);
+    if (read.differs) return differsRefusal(root, entry.path, entry);
+    if (!hashesTo(entry.oid, read.bytes)) return differsRefusal(root, entry.path, entry, convertedFrom(entry.oid, read.bytes) ? 'lineEndings' : undefined);
+    if (read.executable !== (entry.mode === '100755')) return differsRefusal(root, entry.path, entry, 'mode');
   }
   const present = [
     ...(lstatOrNull(join(root, LIVE_FILE)) === null ? [] : [LIVE_FILE]),
@@ -243,31 +278,38 @@ function projectEnvRefusal(root) {
   return null;
 }
 
-// 7b. A private copy of the approved tree's live files, for the probe to run (rule 4): each blob
-// read from the object store, verified against its id, written with its mode into a fresh 0700
-// directory under the system's temporary directory. `{ dir }`, or `{ problem }` when that
-// directory lies inside the repository. The caller removes it.
-function privateCopy(root, live) {
-  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'ko-probe-'));
-  const real = realpathSync(dir);
-  const repository = realpathSync(root);
-  if (real === repository || real.startsWith(`${repository}${sep}`)) {
-    rmSync(dir, { recursive: true, force: true });
-    return { problem: REASONS.probeDirInside };
+// 7b. Contract 1 with the probe run on a private copy of the approved tree's live files (rule 4):
+// each blob read from the object store, verified against its id, written with its mode into a
+// fresh 0700 directory under the system's temporary directory, which is removed however this
+// ends, a throw included. `{ holds }` (contractHolds's answer), or `{ problem }` when TMPDIR is
+// relative, the directory cannot be made or lies inside the repository, or a blob does not hash to
+// its id. Throws what readBlobs throws.
+function contractOnPrivateCopy(root, live) {
+  const base = tmpdir();
+  if (!isAbsolute(base)) return { problem: REASONS.probeDirRelative };
+  let dir;
+  try {
+    dir = mkdtempSync(join(realpathSync(base), 'ko-probe-'));
+  } catch {
+    return { problem: REASONS.probeDirUnusable };
   }
-  const blobs = readBlobs(root, live.map((entry) => entry.oid));
-  for (const entry of live) {
-    const bytes = blobs.get(entry.oid);
-    if (!hashesTo(entry.oid, bytes)) {
-      rmSync(dir, { recursive: true, force: true });
-      return { problem: objectMismatchMessage(entry.path) };
+  try {
+    const real = realpathSync(dir);
+    const repository = realpathSync(root);
+    if (real === repository || real.startsWith(`${repository}${sep}`)) return { problem: REASONS.probeDirInside };
+    const blobs = readBlobs(root, live.map((entry) => entry.oid));
+    for (const entry of live) {
+      const bytes = blobs.get(entry.oid);
+      if (!hashesTo(entry.oid, bytes)) return { problem: objectMismatchMessage(entry.path) };
+      const target = join(dir, entry.path);
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      writeFileSync(target, bytes, { mode: 0o600 });
+      chmodSync(target, entry.mode === '100755' ? 0o700 : 0o600);
     }
-    const target = join(dir, entry.path);
-    mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
-    writeFileSync(target, bytes, { mode: 0o600 });
-    chmodSync(target, entry.mode === '100755' ? 0o700 : 0o600);
+    return { holds: contractHolds(root, { probeRoot: dir }) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
-  return { dir };
 }
 
 // 6. Whether the owner approved this digest. Approval is by content: an approval's `branch` is a
@@ -324,14 +366,8 @@ export function judge(root, { tree, base, branch }) {
   const verdict = readVerdict(root, tree, base);
   const envProblem = projectEnvRefusal(root);
   if (envProblem !== null) return envProblem;
-  const copy = privateCopy(root, live);
-  if (copy.problem !== undefined) return refuse(REASONS.couldNotDecide(copy.problem), COMMANDS.status);
-  let holds;
-  try {
-    holds = contractHolds(root, { probeRoot: copy.dir });
-  } finally {
-    rmSync(copy.dir, { recursive: true, force: true });
-  }
+  const { holds, problem } = contractOnPrivateCopy(root, live);
+  if (problem !== undefined) return refuse(REASONS.couldNotDecide(problem), COMMANDS.status);
   if (!holds.ok) return refuse(REASONS.contract(holds.problems[0]), COMMANDS.status);
   return verdictRefusal(verdict, { tree, base }, digest.digest, install.officers) ?? allow(REASONS.allowed);
 }
@@ -372,18 +408,22 @@ function parseUpdates(input) {
   return updates;
 }
 
+const movesBranch = (update) => update.ref === 'HEAD' || update.ref.startsWith('refs/heads/');
+
 // Whether a branch or HEAD update keeps to the recorded tree: a deletion (the null id) is not a
 // commit and passes; anything else must be a commit whose tree is `tree`. A symbolic update
 // (`ref:refs/heads/x`) or any non-commit is refused.
 function keepsTree(root, update, tree) {
-  if (update.ref !== 'HEAD' && !update.ref.startsWith('refs/heads/')) return true;
+  if (!movesBranch(update)) return true;
   if (NULL_ID.test(update.next)) return true;
   return OBJECT_ID.test(update.next) && treeOfCommitId(root, update.next) === tree;
 }
 
 // The reference-transaction hook's judgement, in the `prepared` state of git process `pid`'s
 // update: allowed only when every branch or HEAD it moves names a commit of the recorded tree.
-// Other refs (ORIG_HEAD, AUTO_MERGE, tags, remotes) are not judged. A refusal removes the record.
+// Other refs (ORIG_HEAD, AUTO_MERGE, tags, remotes) are not judged. The record is removed on a
+// refusal, and once a transaction that moves a branch or HEAD is allowed: the commit's own update
+// has then been judged, and a later update by the same process has no record to pass.
 function judgeUpdate(root, pid, input) {
   let tree;
   try {
@@ -398,7 +438,7 @@ function judgeUpdate(root, pid, input) {
   const decision = updates === null
     ? refuse(REASONS.couldNotDecide(REASONS.unreadableUpdates), COMMANDS.status)
     : updates.every((update) => keepsTree(root, update, tree)) ? allow(REASONS.updateAllowed) : refuse(REASONS.treeSwapped, COMMANDS.run);
-  if (!decision.allow) removeInflight(root, pid);
+  if (!decision.allow || updates.some(movesBranch)) removeInflight(root, pid);
   return decision;
 }
 

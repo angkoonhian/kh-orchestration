@@ -14,7 +14,7 @@ import {
 import { REASONS, exemptCommand, judge, runGate } from '../../assets/scripts/ko-gate.mjs';
 import { COMMANDS } from '../../assets/scripts/extension.mjs';
 import { digestOfTree } from '../../assets/scripts/ko-digest.mjs';
-import { baseOf, currentBranch, indexTree } from '../../assets/scripts/ko-git.mjs';
+import { baseOf, currentBranch, gitFailedMessage, indexTree } from '../../assets/scripts/ko-git.mjs';
 import { corruptMessage, readInflight, shapeMessage, stateDir, writeInflight, writeState } from '../../assets/scripts/ko-state.mjs';
 import { contractHolds } from '../../assets/scripts/ko-contract.mjs';
 import { lfSha256 } from '../../assets/scripts/verify-contract-1.mjs';
@@ -282,7 +282,7 @@ test('live files: a mode change, and a file not in the tree (untracked or ignore
   approveTree(repo.root, at.tree);
   recordVerdict(repo.root, at, [result('check', 'pass')]);
   chmodSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs'), 0o755);
-  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/kh-orchestration/scripts/ko-git.mjs'), 'git restore -- .claude/kh-orchestration/scripts/ko-git.mjs'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveMode('.claude/kh-orchestration/scripts/ko-git.mjs'), 'chmod -x -- .claude/kh-orchestration/scripts/ko-git.mjs'));
   chmodSync(join(repo.root, '.claude/kh-orchestration/scripts/ko-git.mjs'), 0o644);
   repo.write('.claude/scripts/extra.mjs', 'x\n');
   assert.deepEqual(judge(repo.root, at), refused(REASONS.liveUntracked('.claude/scripts/extra.mjs'), 'rm -- .claude/scripts/extra.mjs'));
@@ -502,48 +502,60 @@ test('Review Focus 1 and Important 3: the hook runs the node recorded at install
   assert.ok(moved.stderr.endsWith(HOOK_LINE), moved.stderr);
 });
 
-// The environment cleaner every hook carries (amended decision 18, rule 1).
-const CLEAN_ENV = [
-  'ko_clean() {',
-  '  unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT',
-  '  while IFS= read -r ko_line; do',
-  "    case $ko_line in 'export '*) ko_name=${ko_line#export } ;; 'declare -x '*) ko_name=${ko_line#declare -x } ;; *) continue ;; esac",
-  '    ko_name=${ko_name%%=*}',
-  "    case $ko_name in *[!A-Za-z0-9_]*|'') ;; NODE_*|LD_*|DYLD_*) unset \"$ko_name\" ;; esac",
-  '  done <<KO_EOF',
-  '$(export -p)',
-  'KO_EOF',
-  '}',
+// The allowlist each hook passes to node through env -i (decision 18, final hook form): the GIT_*
+// names are those git 2.56.1 was seen to export to a hook (the report's experiment), and the three
+// a caller may set to name the repository.
+const ALLOWED = [
+  'PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_PREFIX', 'GIT_EXEC_PATH', 'GIT_EDITOR',
+  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE', 'GIT_REFLOG_ACTION', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+];
+const ENV_PATH = (() => {
+  for (const dir of (process.env.PATH ?? '').split(':')) {
+    if (dir.startsWith('/') && existsSync(join(dir, 'env'))) return join(dir, 'env');
+  }
+  return '/usr/bin/env';
+})();
+const startNode = (hook) => `'${ENV_PATH}' -i ${ALLOWED.map((name) => `\${${name}+"${name}=$${name}"}`).join(' ')} '${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" ${hook} "$PPID"`;
+const HOOK_COMMENT = [
+  '# Node starts through env -i with only these variables, each passed only if set: PATH, HOME, TMPDIR,',
+  '# LANG, LC_ALL; the GIT_* variables git 2.56.1 exports to its hooks (GIT_DIR, GIT_WORK_TREE,',
+  '# GIT_INDEX_FILE, GIT_PREFIX, GIT_EXEC_PATH, GIT_EDITOR, GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL,',
+  '# GIT_AUTHOR_DATE, GIT_REFLOG_ACTION); and GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY and',
+  '# GIT_ALTERNATE_OBJECT_DIRECTORIES, which name the repository git itself uses when a caller sets',
+  '# them. Nothing else reaches node: no NODE_*, no LD_*, no BASH_*.',
 ];
 
-test('installGate writes the three hooks as decision 18 (further amended) words them, naming node by its absolute path', () => {
+test('installGate writes the three hooks in decision 18\'s final form: sh -p, no git call, env -i with the allowlist', () => {
   const repo = installed();
   const hook = (name) => readFileSync(join(repo.root, '.git', 'hooks', name), 'utf8');
   assert.equal(hook('pre-merge-commit'), [
-    '#!/bin/sh',
+    '#!/bin/sh -p',
     `# kh-orchestration ${KIT_VERSION} pre-merge-commit. Do not edit.`,
-    ...CLEAN_ENV,
-    'ko_clean',
-    `d=$(git rev-parse --git-common-dir 2>/dev/null) && out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" pre-merge-commit "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
+    ...HOOK_COMMENT,
+    'd=${0%/hooks/*}',
+    `if out=$(${startNode('pre-merge-commit')}); then`,
+    "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
+    'fi',
     'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
     'exit 1',
     '',
   ].join('\n'));
   assert.equal(hook('reference-transaction'), [
-    '#!/bin/sh',
+    '#!/bin/sh -p',
     `# kh-orchestration ${KIT_VERSION} reference-transaction. Do not edit.`,
-    ...CLEAN_ENV,
-    'd=${0%/hooks/reference-transaction}',
-    '[ "$d" != "$0" ] && [ -d "$d/kh-orchestration" ] || d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 1',
-    'f="$d/kh-orchestration/inflight-$PPID.json"',
-    '[ -e "$f" ] || [ -L "$f" ] || exit 0',
-    'case "$1" in',
-    `prepared) ko_clean; out=$('${process.execPath}' "$d/kh-orchestration/bin/gate.mjs" reference-transaction "$PPID") && [ "$out" = "kh-orchestration: allowed" ] && exit 0`,
-    '  echo "kh-orchestration: the commit gate did not allow this commit." >&2',
-    '  exit 1 ;;',
-    'committed|aborted) while read -r old new ref; do case "$ref" in HEAD|refs/heads/*) rm -rf "$f" ;; esac; done ;;',
-    'esac',
-    'exit 0',
+    ...HOOK_COMMENT,
+    '# Only the prepared state of a git process that has an in-flight record starts node; the record',
+    '# is found by a pattern, so a file, a directory or a dangling link all count, and no command runs.',
+    'case $1 in prepared) ;; *) exit 0 ;; esac',
+    'd=${0%/hooks/*}',
+    'for f in "$d/kh-orchestration/inflight-$PPID".jso[n]; do',
+    "  case $f in *'.jso[n]') exit 0 ;; esac",
+    'done',
+    `if out=$(${startNode('reference-transaction')}); then`,
+    "  case $out in 'kh-orchestration: allowed') exit 0 ;; esac",
+    'fi',
+    'echo "kh-orchestration: the commit gate did not allow this commit." >&2',
+    'exit 1',
     '',
   ].join('\n'));
 });
@@ -759,7 +771,7 @@ test('reference-transaction: an update of a branch or HEAD to a commit of the re
     `${NULL_ID} ${tree} AUTO_MERGE`, `${head} ${NULL_ID} refs/heads/gone`, `${NULL_ID} ${head} refs/tags/v1`, '',
   ].join('\n');
   assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input }), allowed(REASONS.updateAllowed));
-  assert.equal(readInflight(repo.root, PID), tree, 'the hook removes the record once the update is committed');
+  assert.equal(readInflight(repo.root, PID), null, 'the branch update is judged, so the record goes');
 });
 
 test('reference-transaction: a commit of another tree, a non-commit, a symbolic update, an unreadable line or no record is refused, and the record removed', () => {
@@ -992,27 +1004,40 @@ function runReferenceHook(root, state, input) {
   return spawnSync(join(root, '.git', 'hooks', 'reference-transaction'), [state], { cwd: root, env: testEnv(), input, encoding: 'utf8' });
 }
 
-test('the reference-transaction hook removes a record that is a directory or a symlink, and refuses on one in prepared', () => {
+test('the reference-transaction hook: no record starts no node; a record that is a directory or a dangling link is refused and removed', () => {
   const repo = installed();
   const record = join(stateDir(repo.root), `inflight-${PID}.json`);
   const line = `${NULL_ID} ${gitIn(repo.root, ['rev-parse', 'HEAD']).stdout.trim()} refs/heads/main\n`;
-  mkdirSync(join(record, 'inside'), { recursive: true });
-  assert.equal(runReferenceHook(repo.root, 'committed', line).status, 0);
-  assert.equal(existsSync(record), false, 'a directory is removed');
+  assert.deepEqual([runReferenceHook(repo.root, 'prepared', line).status, runReferenceHook(repo.root, 'prepared', line).stderr], [0, '']);
+  for (const state of ['preparing', 'committed', 'aborted']) {
+    mkdirSync(record);
+    assert.equal(runReferenceHook(repo.root, state, line).status, 0, state);
+    rmSync(record, { recursive: true });
+  }
   symlinkSync('/nonexistent', record);
   const prepared = runReferenceHook(repo.root, 'prepared', line);
   assert.equal(prepared.status, 1, 'a dangling symlink is a record that cannot be read, never no record');
   assert.ok(prepared.stderr.endsWith(HOOK_LINE), prepared.stderr);
-  assert.equal(existsSync(record) || lstatOrNull(record) !== null, false, 'and the gate removed it');
-  mkdirSync(record);
+  assert.equal(lstatOrNull(record), null, 'and the gate removed it');
+  mkdirSync(join(record, 'inside'), { recursive: true });
   assert.equal(runReferenceHook(repo.root, 'prepared', line).status, 1);
   assert.equal(lstatOrNull(record), null);
 });
 
-test('a hooks directory named hooks elsewhere (core.hooksPath holding copies) still finds the state: the race is caught', async () => {
+test('the gate removes the record once it has allowed a branch or HEAD update, and keeps it for a transaction of other refs', () => {
+  const repo = installed();
+  const tree = indexTree(repo.root);
+  writeInflight(repo.root, PID, tree);
+  assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${NULL_ID} ${NULL_ID} AUTO_MERGE\n` }), allowed(REASONS.updateAllowed));
+  assert.equal(readInflight(repo.root, PID), tree);
+  const commitId = commitOf(repo.root, tree);
+  assert.deepEqual(runGate(['reference-transaction', PID], repo.root, { input: `${NULL_ID} ${commitId} refs/heads/main\n` }), allowed(REASONS.updateAllowed));
+  assert.equal(readInflight(repo.root, PID), null);
+});
+
+test('a copy of the hooks elsewhere (core.hooksPath) finds no gate there and refuses: hooks live only in <common>/hooks', async () => {
   const repo = installed();
   await runAndApprove(repo.root);
-  racingPreCommit(repo);
   const elsewhere = join(repo.root, '..', 'tools', 'hooks');
   mkdirSync(elsewhere, { recursive: true });
   for (const name of ['pre-commit', 'pre-merge-commit', 'reference-transaction']) {
@@ -1023,7 +1048,7 @@ test('a hooks directory named hooks elsewhere (core.hooksPath holding copies) st
   const before = head(repo.root);
   const outcome = commit(repo.root);
   assertRefused(repo.root, outcome, before);
-  assert.ok(outcome.stderr.includes(gateText(REASONS.treeSwapped, COMMANDS.run)), outcome.stderr);
+  assert.ok(outcome.stderr.endsWith(HOOK_LINE), outcome.stderr);
 });
 
 test('a partial commit while a live file is staged and differs is told to commit without a path list or restore it', async () => {
@@ -1057,28 +1082,182 @@ test('the entry prints its literal text, never undefined, for a decision without
 // commit through: pre-commit writes the in-flight record the third hook needs to start node.
 function envRecordingGate(repo, log) {
   const bin = join(stateDir(repo.root), 'bin');
-  writeFileSync(join(bin, 'gate.mjs'), `import { appendFileSync, writeFileSync } from 'node:fs';
+  writeFileSync(join(bin, 'gate.mjs'), `import { appendFileSync, rmSync, writeFileSync } from 'node:fs';
 const [hook, pid] = process.argv.slice(2);
-const seen = Object.keys(process.env).filter((name) => /^(NODE_|LD_|DYLD_)/.test(name)).sort();
-appendFileSync(${JSON.stringify(log)}, JSON.stringify({ hook, seen }) + '\\n');
-if (hook === 'pre-commit') writeFileSync(${JSON.stringify(join(stateDir(repo.root), 'inflight-'))} + pid + '.json', '{}');
+appendFileSync(${JSON.stringify(log)}, JSON.stringify({ hook, seen: Object.keys(process.env).sort() }) + '\\n');
+// As the gate does: the record is written on pre-commit and removed once the branch update is judged.
+const record = ${JSON.stringify(join(stateDir(repo.root), 'inflight-'))} + pid + '.json';
+if (hook === 'pre-commit') writeFileSync(record, '{}');
+else rmSync(record, { force: true });
 process.stdout.write('kh-orchestration: allowed\\n');
 `);
 }
 
-test('rule 1: NODE_*, LD_* and DYLD_* on the commit never reach the gate, whatever another variable\'s value holds', () => {
+// What a commit's environment may hold that must neither reach node nor change the outcome.
+const hostileEnv = (marker) => ({
+  ...testEnv(), NODE_OPTIONS: '--require=/nonexistent/x.js', NODE_PATH: '/x', NODE_EXTRA_CA_CERTS: '/x', LD_PRELOAD: '/nonexistent/x.so',
+  LD_LIBRARY_PATH: '/nonexistent', LD_AUDIT: '/nonexistent.so', DYLD_INSERT_LIBRARIES: '/x', BASH_ENV: marker, ENV: marker, TMOUT: '0.000001', IFS: '/',
+  'BASH_FUNC_env%%': `() { : > ${marker}; }`, 'BASH_FUNC_exec%%': `() { : > ${marker}; }`, 'BASH_FUNC_case%%': `() { : > ${marker}; }`,
+  SHELLOPTS: 'xtrace', PS4: `$(: > ${marker})`,
+});
+
+test('rule 1: only the allowlist reaches node, whatever the commit\'s environment holds', () => {
   const repo = installed();
   const log = join(repo.root, '..', 'env-seen.jsonl');
+  const marker = join(repo.root, '..', 'shell-steered');
   envRecordingGate(repo, log);
-  const env = {
-    ...testEnv(), NODE_OPTIONS: '--require=/nonexistent/x.js', NODE_PATH: '/x', NODE_EXTRA_CA_CERTS: '/x', NODE_X: "a\nexport NODE_Y='1'",
-    LD_LIBRARY_PATH: '/nonexistent', LD_AUDIT: '/nonexistent.so', DYLD_INSERT_LIBRARIES: '/x', KO_HOSTILE: "x'\nexport NODE_OPTIONS='--require=/y'\nexport KEEP=1",
-  };
-  const outcome = gitIn(repo.root, ['commit', '-q', '-m', 'env'], env);
+  const outcome = gitIn(repo.root, ['commit', '-q', '-m', 'env'], hostileEnv(marker));
   assert.equal(outcome.status, 0, outcome.stderr);
+  assert.equal(existsSync(marker), false, 'the hook\'s shell ran code from the environment');
   const lines = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   assert.deepEqual(lines.map((line) => line.hook), ['pre-commit', 'reference-transaction']);
-  assert.deepEqual(lines.map((line) => line.seen), [[], []]);
+  for (const line of lines) assert.deepEqual(line.seen.filter((name) => !ALLOWED.includes(name)), [], line.hook);
+  assert.ok(lines[0].seen.includes('GIT_INDEX_FILE'), 'the index git commits reaches the gate');
+});
+
+test('rule 1: the same environment changes no outcome of the real gate: an approved, passing tree lands and a failing one is refused', async () => {
+  const repo = await committedInstall();
+  const marker = join(repo.root, '..', 'shell-steered');
+  const before = head(repo.root);
+  const at = subject(repo.root);
+  // The gate's own text is followed by the dynamic loader's complaints about LD_PRELOAD for git.
+  const failing = gitIn(repo.root, ['commit', '-q', '-m', 'failing'], hostileEnv(marker));
+  assertRefused(repo.root, failing, before);
+  assert.ok(failing.stderr.includes(refusalText(REASONS.noVerdict(at.tree, at.base), COMMANDS.run)), failing.stderr);
+  rmSync(join(repo.root, 'fail.txt'));
+  repo.write('b.txt', 'b\n');
+  stage(repo);
+  await runAndApprove(repo.root);
+  const passing = gitIn(repo.root, ['commit', '-q', '-m', 'passing'], hostileEnv(marker));
+  assert.equal(passing.status, 0, passing.stderr);
+  assert.notEqual(head(repo.root), before);
+  assert.equal(existsSync(marker), false, 'the hook\'s shell ran code from the environment');
+  assert.deepEqual(readdirSync(stateDir(repo.root)).filter((name) => name.startsWith('inflight-')), []);
+});
+
+// The reviewer's one-line attacks on the hook's shell (fourth re-review); each must refuse.
+const SHELL_ATTACKS = [
+  `env 'BASH_FUNC_git%%=() { echo "--eval=process.stdout.write(\\"kh-orchestration: allowed\\\\n\\")//"; }' git commit -q -m forged`,
+  `git() { echo "--eval=process.stdout.write('kh-orchestration: allowed\\\\n')//"; }; export -f git; command git commit -q -m forged`,
+  "export NODE_OPTIONS='--import=data:text/javascript,process.stdout.write(%22kh-orchestration:%20allowed%5Cn%22);process.exit(0)'; TMOUT=0.000001 git commit -q -m forged",
+  "env SHELLOPTS=xtrace PS4='$(echo \"process.stdout.write(\\\"kh-orchestration: allowed\\\\n\\\")\" > \"$(git rev-parse --git-common-dir)/kh-orchestration/bin/gate.mjs\")' git commit -q -m forged",
+];
+
+test('rule 1: a shell steered by the commit\'s environment (an imported git function, TMOUT, SHELLOPTS and PS4) cannot forge the token', async () => {
+  for (const attack of SHELL_ATTACKS) {
+    const repo = await committedInstall();
+    const gate = readFileSync(join(stateDir(repo.root), 'bin', 'gate.mjs'), 'utf8');
+    const before = head(repo.root);
+    assertRefused(repo.root, spawnSync('bash', ['-c', attack], { cwd: repo.root, env: testEnv(), encoding: 'utf8' }), before);
+    assert.equal(gitIn(repo.root, ['cat-file', '-e', 'HEAD:fail.txt']).status === 0, false, attack);
+    assert.equal(readFileSync(join(stateDir(repo.root), 'bin', 'gate.mjs'), 'utf8'), gate, `bin/gate.mjs rewritten by: ${attack}`);
+  }
+});
+
+// The hooks as another POSIX shell runs them: the same text with only the shebang replaced.
+// zsh runs in sh emulation when started as `sh`, so a link named sh stands in for it.
+function otherShells() {
+  const found = (name) => spawnSync('sh', ['-c', `command -v ${name}`], { env: testEnv(), encoding: 'utf8' }).stdout.trim();
+  const shells = [];
+  const bash = found('bash');
+  if (bash !== '') shells.push(['bash as bash', bash]);
+  const zsh = found('zsh');
+  if (zsh !== '') {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ko-zsh-as-sh-')));
+    symlinkSync(zsh, join(dir, 'sh'));
+    shells.push(['zsh as sh', join(dir, 'sh')]);
+  }
+  return shells;
+}
+const withShell = (root, shell) => {
+  for (const name of ['pre-commit', 'pre-merge-commit', 'reference-transaction']) {
+    const path = join(root, '.git', 'hooks', name);
+    writeFileSync(path, readFileSync(path, 'utf8').replace('#!/bin/sh -p\n', `#!${shell} -p\n`));
+  }
+};
+
+test('under bash as bash and zsh as sh (where installed) the attacks refuse, a hostile environment changes nothing, and the fast path holds', async () => {
+  const shells = otherShells();
+  try {
+    for (const [label, shell] of shells) {
+      for (const attack of SHELL_ATTACKS) {
+        const repo = await committedInstall();
+        withShell(repo.root, shell);
+        const before = head(repo.root);
+        assertRefused(repo.root, spawnSync('bash', ['-c', attack], { cwd: repo.root, env: testEnv(), encoding: 'utf8' }), before);
+      }
+      const repo = installed();
+      withShell(repo.root, shell);
+      await runAndApprove(repo.root);
+      const marker = join(repo.root, '..', 'shell-steered');
+      const landed = gitIn(repo.root, ['commit', '-q', '-m', 'work'], hostileEnv(marker));
+      assert.equal(landed.status, 0, `${label}: ${landed.stderr}`);
+      assert.equal(existsSync(marker), false, label);
+      const line = `${NULL_ID} ${head(repo.root)} refs/heads/main\n`;
+      assert.deepEqual([runReferenceHook(repo.root, 'prepared', line).status], [0], label);
+      symlinkSync('/nonexistent', join(stateDir(repo.root), `inflight-${PID}.json`));
+      assert.equal(runReferenceHook(repo.root, 'prepared', line).status, 1, label);
+    }
+  } finally {
+    for (const [, shell] of shells) if (shell.endsWith('/sh')) rmSync(dirname(shell), { recursive: true, force: true });
+  }
+});
+
+test('legitimate flows land under the final hooks: commit -a, a partial commit, GIT_DIR and GIT_WORK_TREE from the caller, TMPDIR elsewhere', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  assert.equal(commit(repo.root).status, 0);
+  repo.write('a.txt', 'changed\n');
+  assert.equal(gitIn(repo.root, ['add', 'a.txt']).status, 0);
+  await runAndApprove(repo.root);
+  assert.equal(gitIn(repo.root, ['reset', '-q', '--', 'a.txt']).status, 0);
+  assert.equal(commit(repo.root, '-a').status, 0, 'commit -a');
+  repo.write('a.txt', 'partial\n');
+  repo.write('b.txt', 'left staged\n');
+  assert.equal(gitIn(repo.root, ['add', 'a.txt']).status, 0);
+  await runAndApprove(repo.root);
+  assert.equal(gitIn(repo.root, ['reset', '-q', '--', 'a.txt']).status, 0);
+  assert.equal(gitIn(repo.root, ['add', 'b.txt']).status, 0);
+  const partial = commit(repo.root, '--', 'a.txt');
+  assert.equal(partial.status, 0, partial.stderr);
+  assert.equal(gitIn(repo.root, ['show', 'HEAD:a.txt']).stdout, 'partial\n');
+  assert.equal(gitIn(repo.root, ['reset', '-q', '--', 'b.txt']).status, 0);
+  rmSync(join(repo.root, 'b.txt'));
+  repo.write('c.txt', 'c\n');
+  stage(repo);
+  await runAndApprove(repo.root);
+  // /dev/shm is its own filesystem (tmpfs) on Linux; elsewhere the system temporary directory stands in.
+  const tmp = realpathSync(mkdtempSync(join(existsSync('/dev/shm') ? '/dev/shm' : tmpdir(), 'ko-tmp-')));
+  try {
+    const byGitDir = spawnSync('git', ['commit', '-q', '-m', 'from outside'], {
+      cwd: tmpdir(), env: { ...testEnv(), GIT_DIR: join(repo.root, '.git'), GIT_WORK_TREE: repo.root, TMPDIR: tmp }, encoding: 'utf8',
+    });
+    assert.deepEqual([byGitDir.status, byGitDir.stderr], [0, '']);
+    assert.deepEqual(readdirSync(tmp), []);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('a repository path and a node path holding spaces and quotes still work', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  const odd = join(repo.root, '..', "no de's dir");
+  mkdirSync(odd);
+  symlinkSync(process.execPath, join(odd, "no'de"));
+  installGate(repo.root, { node: join(odd, "no'de") });
+  assert.equal(commit(repo.root).status, 0);
+  const moved = join(repo.root, '..', "re po's");
+  renameSync(repo.root, moved);
+  try {
+    writeFileSync(join(moved, 'z.txt'), 'z\n');
+    assert.equal(gitIn(moved, ['add', 'z.txt']).status, 0);
+    await runAndApprove(moved);
+    const outcome = gitIn(moved, ['commit', '-q', '-m', 'odd path']);
+    assert.deepEqual([outcome.status, outcome.stderr], [0, '']);
+  } finally {
+    renameSync(moved, repo.root);
+  }
 });
 
 test('rule 1 (L3): NODE_OPTIONS that prints the token itself does not land a failing, unverdicted tree', async () => {
@@ -1125,7 +1304,14 @@ test('rule 3: bytes are compared, so a CRLF working copy of a live file differs;
   const settings = join(repo.root, '.claude/settings.json');
   const original = readFileSync(settings);
   writeFileSync(settings, original.toString('utf8').replaceAll('\n', '\r\n'));
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveLineEndings('.claude/settings.json'), 'rm -- .claude/settings.json && git restore -- .claude/settings.json'));
+  writeFileSync(settings, `${original.toString('utf8').replaceAll('\n', '\r\n')}x`);
   assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/settings.json'), 'git restore -- .claude/settings.json'));
+  writeFileSync(settings, original);
+  chmodSync(settings, 0o755);
+  assert.deepEqual(judge(repo.root, at), refused(REASONS.liveMode('.claude/settings.json'), 'chmod -x -- .claude/settings.json'));
+  assert.equal(REASONS.liveLineEndings('x'), 'The working copy of x differs from the tree being committed only in its line endings: this checkout converts them (core.autocrlf or a text attribute), and the working copy is what this session\'s hooks run. Add the line .claude/** -text to .gitattributes, check the file out again as below, then commit again.');
+  assert.equal(REASONS.liveMode('x'), 'The working copy of x differs from the tree being committed only in its executable bit: this checkout does not keep file modes (core.fileMode false, or a filesystem without them), and the working copy is what this session\'s hooks run. Set the bit as the tree has it, as below, then commit again.');
   rmSync(settings);
   assert.deepEqual(judge(repo.root, at), refused(REASONS.liveDiffers('.claude/settings.json'), 'git restore -- .claude/settings.json'));
   symlinkSync('../a.txt', settings);
@@ -1189,6 +1375,30 @@ test('rule 4: a temporary directory inside the repository is refused for the pri
   const outcome = spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: { ...testEnv(), TMPDIR: inside }, encoding: 'utf8' });
   assert.deepEqual([outcome.status, outcome.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirInside), COMMANDS.status)]);
   assert.deepEqual(readdirSync(inside), []);
+});
+
+test('rule 4: a relative or missing temporary directory is refused with what to set, and the private copy is removed when reading the tree fails', async () => {
+  const repo = installed();
+  await runAndApprove(repo.root);
+  const gate = join(stateDir(repo.root), 'bin', 'gate.mjs');
+  const runWith = (tmp) => spawnSync(process.execPath, [gate, 'pre-commit', PID], { cwd: repo.root, env: { ...testEnv(), TMPDIR: tmp }, encoding: 'utf8' });
+  const relative = runWith('tmp-relative');
+  assert.deepEqual([relative.status, relative.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirRelative), COMMANDS.status)]);
+  const missing = runWith('/nonexistent/ko-tmp');
+  assert.deepEqual([missing.status, missing.stderr], [1, gateText(REASONS.couldNotDecide(REASONS.probeDirUnusable), COMMANDS.status)]);
+  assert.equal(REASONS.probeDirRelative, 'TMPDIR names a relative path, so the place of the private copy of the approved tree depends on the directory git runs in; set TMPDIR to an absolute directory outside the repository');
+  assert.equal(REASONS.probeDirUnusable, 'the temporary directory for the private copy of the approved tree (TMPDIR, or /tmp when it is not set) does not exist or cannot be written; set TMPDIR to a directory outside the repository that can');
+  // The loose object of a live file goes: the copy cannot be read from the object store.
+  const oid = gitIn(repo.root, ['rev-parse', ':.claude/settings.json']).stdout.trim();
+  rmSync(join(repo.root, '.git', 'objects', oid.slice(0, 2), oid.slice(2)));
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'ko-gate-tmp-')));
+  try {
+    const unreadable = runWith(scratch);
+    assert.deepEqual([unreadable.status, unreadable.stderr], [1, gateText(REASONS.couldNotDecide(gitFailedMessage('read the file')), COMMANDS.status)]);
+    assert.deepEqual(readdirSync(scratch), [], 'the private copy is removed');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 test('rule 5 (L5): an env in settings.local.json or settings.json that sets NODE_*, LD_* or DYLD_* is refused, naming the file and the key', async () => {

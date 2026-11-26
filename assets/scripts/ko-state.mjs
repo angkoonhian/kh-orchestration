@@ -31,9 +31,9 @@ export const shapeMessage = (name) =>
 // through readExemptions.
 // inflight-<pid>.json is `{ tree }`: the tree the gate allowed for the git commit or git merge
 // process <pid> (decision 18, further amended). The reference-transaction hook refuses that
-// process's branch update unless its commit holds this tree. Written by the gate on an allow,
-// removed by the hook once the update is committed or aborted; a record whose process is gone is
-// stale (removeStaleInflight).
+// process's branch update unless its commit holds this tree. Written by the gate on an allow of
+// the index, removed by the gate once it has judged that process's branch or HEAD update; a record
+// whose process is gone is stale (removeStaleInflight).
 // off is a file whose presence is the owner's switch (isOff); its content means nothing.
 // proposals.json is `{ worktrees: [<absolute real path of a worktree root>...] }`, the worktrees
 // open for proposals. The hook extension reads it itself (it cannot import this file): absent,
